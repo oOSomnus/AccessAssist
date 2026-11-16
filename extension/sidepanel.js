@@ -92,7 +92,6 @@ const state = {
   setupTabOpened: false,
   commands: [],
   ready: false,
-  launcherPosition: 'br',
   config: { ...DEFAULT_API_CONFIG },
   apiKey: null,
   keyStale: false,
@@ -2511,11 +2510,10 @@ function fillSettings() {
   $('protocol').value = state.config.protocol;
   $('base-url').value = state.config.baseUrl;
   $('model').value = state.config.model;
+  $('effort').value = state.config.effort ?? 'default';
   $('anthropic-version').value = state.config.anthropicVersion ?? '2026-10-21';
   toggleAnthropicFields();
   $('api-key').value = '';
-  const radio = document.querySelector(`input[name="launcher"][value="${state.launcherPosition}"]`);
-  if (radio) radio.checked = true;
 }
 
 function toggleAnthropicFields() {
@@ -2529,6 +2527,7 @@ function firstInvalidField(errors) {
   if (/Protocol/u.test(text)) return $('protocol');
   if (/URL|HTTPS|HTTP|query|fragment|username|password/u.test(text)) return $('base-url');
   if (/model/u.test(text)) return $('model');
+  if (/Effort/u.test(text)) return $('effort');
   if (/Anthropic/u.test(text)) return $('anthropic-version');
   return $('api-key');
 }
@@ -2539,6 +2538,7 @@ async function saveSettings(event) {
     protocol: $('protocol').value,
     baseUrl: $('base-url').value.trim(),
     model: $('model').value.trim(),
+    effort: $('effort').value,
     anthropicVersion: $('anthropic-version').value.trim(),
   };
   const normalized = normalizeConfig(raw);
@@ -2584,14 +2584,6 @@ async function saveSettings(event) {
   }
   await say(keyValue ? `Settings saved. ${listenSentence()}.` : 'Settings saved.');
   if (!state.apiKey) openSettingsForKey();
-}
-
-async function changeLauncherPosition(position) {
-  state.launcherPosition = position;
-  await send('SET_LAUNCHER_POSITION', { position }).catch(() => {});
-  await chrome.storage.local.set({ launcherPosition: position });
-  await speech.play('choose');
-  speech.writeStatus('Assistant button position updated.');
 }
 
 const SHORTCUT_COMMAND_IDS = ['open-assistant', 'listen-once', 'close-assistant', 'replay-introduction'];
@@ -2680,11 +2672,6 @@ function bindEvents() {
   });
   $('settings-form').addEventListener('submit', (event) => void saveSettings(event));
   $('protocol').addEventListener('change', toggleAnthropicFields);
-  for (const radio of document.querySelectorAll('input[name="launcher"]')) {
-    radio.addEventListener('change', (event) => {
-      if (event.target.checked) void changeLauncherPosition(event.target.value);
-    });
-  }
   document.addEventListener('keydown', handleNumberShortcut);
   document.addEventListener('keydown', (event) => {
     if ((event.ctrlKey || event.metaKey) && event.key === 'Enter') {
@@ -2885,10 +2872,9 @@ async function closePanel() {
 }
 
 async function loadPreferences() {
-  const stored = await chrome.storage.local.get(['apiConfig', 'launcherPosition', 'outputMode']);
+  const stored = await chrome.storage.local.get(['apiConfig', 'outputMode']);
   if ('outputMode' in stored) await chrome.storage.local.remove('outputMode');
   state.config = stored.apiConfig ?? { ...DEFAULT_API_CONFIG };
-  state.launcherPosition = ['br', 'bl', 'tr', 'tl'].includes(stored.launcherPosition) ? stored.launcherPosition : 'br';
   const session = await chrome.storage.session.get(['apiKey', 'allowNetwork']);
   state.apiKey = keyForBinding(session.apiKey, state.config);
   if (session.apiKey?.value && !state.apiKey) {

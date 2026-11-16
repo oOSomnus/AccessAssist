@@ -669,19 +669,24 @@ test('appearance: setup and launcher remain usable across display modes', async 
 
     const page = await openFixture(context, '/article');
     await expect.poll(() => page.evaluate(() => Boolean(
-      document.getElementById('accessassist-launcher-host')?.shadowRoot?.querySelector('button'),
+      document.getElementById('accessassist-launcher-host')?.shadowRoot?.querySelector('#launcher-open'),
     ))).toBe(true);
-    const launcher = page.locator('#accessassist-launcher-host button');
+    const launcher = page.locator('#accessassist-launcher-host #launcher-open');
+    const moveControl = page.locator('#accessassist-launcher-host #launcher-move');
     await expect(launcher).toHaveAccessibleName(/AccessAssist assistant/);
+    await expect(moveControl).toHaveAccessibleName('Move Assistant button');
     const box = await launcher.boundingBox();
     expect(box.width).toBeGreaterThanOrEqual(56);
     expect(box.height).toBeGreaterThanOrEqual(56);
+    const moveBox = await moveControl.boundingBox();
+    expect(moveBox.width).toBeGreaterThanOrEqual(44);
+    expect(moveBox.height).toBeGreaterThanOrEqual(44);
 
     await page.keyboard.press('Tab');
     await launcher.focus();
     await expect.poll(() => page.evaluate(() => {
       const host = document.getElementById('accessassist-launcher-host');
-      const button = host.shadowRoot.querySelector('button');
+      const button = host.shadowRoot.querySelector('#launcher-open');
       const style = getComputedStyle(button);
       return {
         focused: host.shadowRoot.activeElement === button,
@@ -694,12 +699,12 @@ test('appearance: setup and launcher remain usable across display modes', async 
 
     const launcherColors = await page.evaluate(() => {
       const host = document.getElementById('accessassist-launcher-host');
-      return getComputedStyle(host.shadowRoot.querySelector('button')).backgroundColor;
+      return getComputedStyle(host.shadowRoot.querySelector('#launcher-open')).backgroundColor;
     });
     await page.emulateMedia({ colorScheme: 'dark' });
     const darkColor = await page.evaluate(() => {
       const host = document.getElementById('accessassist-launcher-host');
-      return getComputedStyle(host.shadowRoot.querySelector('button')).backgroundColor;
+      return getComputedStyle(host.shadowRoot.querySelector('#launcher-open')).backgroundColor;
     });
     expect(darkColor).not.toBe(launcherColors);
     await attachScreenshot(page, testInfo, 'launcher-dark');
@@ -708,7 +713,7 @@ test('appearance: setup and launcher remain usable across display modes', async 
     await page.emulateMedia({ forcedColors: 'active', reducedMotion: 'reduce' });
     const forced = await page.evaluate(() => {
       const host = document.getElementById('accessassist-launcher-host');
-      const button = host.shadowRoot.querySelector('button');
+      const button = host.shadowRoot.querySelector('#launcher-open');
       const style = getComputedStyle(button);
       return {
         shadow: style.boxShadow,
@@ -722,14 +727,80 @@ test('appearance: setup and launcher remain usable across display modes', async 
     await attachScreenshot(page, testInfo, 'launcher-forced');
     await page.emulateMedia({ forcedColors: 'none', reducedMotion: 'no-preference' });
 
+    await page.setViewportSize({ width: 391, height: 904 });
+    await moveControl.click();
+    await expect(page.locator('#accessassist-launcher-host #launcher-move-controls')).toBeVisible();
+    const moveLayout = await page.evaluate(() => {
+      const host = document.getElementById('accessassist-launcher-host');
+      const root = host.shadowRoot;
+      const panel = root.querySelector('#launcher-move-controls').getBoundingClientRect();
+      const buttons = [...root.querySelectorAll('#launcher-move-controls button')].map((button) => {
+        const rect = button.getBoundingClientRect();
+        return { width: rect.width, height: rect.height, left: rect.left, right: rect.right };
+      });
+      return { panel, buttons, viewport: innerWidth };
+    });
+    expect(moveLayout.panel.left).toBeGreaterThanOrEqual(15);
+    expect(moveLayout.panel.right).toBeLessThanOrEqual(moveLayout.viewport - 15);
+    expect(moveLayout.buttons).toHaveLength(6);
+    for (const button of moveLayout.buttons) {
+      expect(button.width).toBeGreaterThanOrEqual(44);
+      expect(button.height).toBeGreaterThanOrEqual(44);
+      expect(button.left).toBeGreaterThanOrEqual(0);
+      expect(button.right).toBeLessThanOrEqual(moveLayout.viewport);
+    }
+    await attachScreenshot(page, testInfo, 'launcher-move-391x904');
+    await page.emulateMedia({ forcedColors: 'active', reducedMotion: 'reduce' });
+    const forcedMove = await page.evaluate(() => {
+      const root = document.getElementById('accessassist-launcher-host').shadowRoot;
+      const panel = root.querySelector('#launcher-move-controls');
+      const button = root.querySelector('#launcher-move-controls button');
+      return {
+        panelShadow: getComputedStyle(panel).boxShadow,
+        panelBorder: parseFloat(getComputedStyle(panel).borderTopWidth),
+        buttonBorder: parseFloat(getComputedStyle(button).borderTopWidth),
+      };
+    });
+    expect(forcedMove.panelShadow).toBe('none');
+    expect(forcedMove.panelBorder).toBeGreaterThanOrEqual(2);
+    expect(forcedMove.buttonBorder).toBeGreaterThanOrEqual(2);
+    await attachScreenshot(page, testInfo, 'launcher-move-forced');
+    await page.emulateMedia({ forcedColors: 'none', reducedMotion: 'no-preference' });
+    await page.keyboard.press('Escape');
+    await expect(page.locator('#accessassist-launcher-host #launcher-move-controls')).toBeHidden();
+
     await page.setViewportSize({ width: 160, height: 640 });
-    const narrow = await launcher.boundingBox();
+    const narrowBar = page.locator('#accessassist-launcher-host .launcher-bar');
+    const narrow = await narrowBar.boundingBox();
     expect(narrow.x).toBeGreaterThanOrEqual(0);
     expect(narrow.x + narrow.width).toBeLessThanOrEqual(160);
     expect(narrow.width).toBeLessThanOrEqual(128);
-    expect(narrow.height).toBeGreaterThanOrEqual(56);
+    expect(narrow.height).toBeGreaterThanOrEqual(100);
+    expect((await moveControl.boundingBox()).height).toBeGreaterThanOrEqual(44);
     expect(await page.evaluate(() => document.querySelectorAll('#accessassist-launcher-host').length)).toBe(1);
     await attachScreenshot(page, testInfo, 'launcher-160x640');
+    await moveControl.click();
+    const narrowMove = await page.evaluate(() => {
+      const root = document.getElementById('accessassist-launcher-host').shadowRoot;
+      const panel = root.querySelector('#launcher-move-controls').getBoundingClientRect();
+      const buttons = [...root.querySelectorAll('#launcher-move-controls button')].map((button) => {
+        const rect = button.getBoundingClientRect();
+        return { width: rect.width, height: rect.height, left: rect.left, right: rect.right };
+      });
+      return { panel, buttons, viewport: innerWidth };
+    });
+    expect(narrowMove.panel.left).toBeGreaterThanOrEqual(15);
+    expect(narrowMove.panel.right).toBeLessThanOrEqual(narrowMove.viewport - 15);
+    expect(narrowMove.panel.width).toBeLessThanOrEqual(narrowMove.viewport - 32);
+    for (const button of narrowMove.buttons) {
+      expect(button.width).toBeGreaterThanOrEqual(44);
+      expect(button.height).toBeGreaterThanOrEqual(44);
+      expect(button.left).toBeGreaterThanOrEqual(0);
+      expect(button.right).toBeLessThanOrEqual(narrowMove.viewport);
+    }
+    await attachScreenshot(page, testInfo, 'launcher-move-160x640');
+    await page.keyboard.press('Escape');
+    await expect(page.locator('#accessassist-launcher-host #launcher-move-controls')).toBeHidden();
 
     await page.setViewportSize({ width: 1000, height: 760 });
     const target = await worker.evaluate(async () => {
@@ -747,6 +818,56 @@ test('appearance: setup and launcher remain usable across display modes', async 
       tabId: target.tabId,
       windowId: target.windowId,
     });
+  } finally {
+    await context.close();
+  }
+});
+
+test('appearance: reasoning effort settings remain reachable across modes', async ({}, testInfo) => {
+  const { context, extensionId } = await launch();
+  try {
+    await openFixture(context, '/article');
+    const panel = await openPanel(context, extensionId);
+    await panel.locator('#settings > summary').click();
+    await panel.locator('#advanced-api > summary').click();
+    await expect(panel.locator('#effort')).toBeVisible();
+    await expect(panel.locator('#effort')).toHaveAccessibleName('Reasoning effort');
+    await expect(panel.locator('#effort')).toHaveValue('default');
+    expect(await panel.locator('#effort option').evaluateAll((options) => options.map((option) => [option.value, option.textContent]))).toEqual([
+      ['default', 'Provider default'],
+      ['low', 'Low'],
+      ['medium', 'Medium'],
+      ['high', 'High'],
+      ['max', 'Maximum'],
+    ]);
+    await expect(panel.locator('#effort')).toHaveAttribute('aria-describedby', 'effort-hint');
+    await expect(panel.locator('#effort-hint')).toContainText('Provider default sends no effort parameter.');
+
+    const modes = [
+      { name: 'effort-1000x760-light', size: { width: 1000, height: 760 }, media: { colorScheme: 'light' } },
+      { name: 'effort-391x904-dark', size: { width: 391, height: 904 }, media: { colorScheme: 'dark' } },
+      { name: 'effort-160x640-forced', size: { width: 160, height: 640 }, media: { colorScheme: 'light', forcedColors: 'active', reducedMotion: 'reduce' } },
+    ];
+    for (const mode of modes) {
+      await panel.setViewportSize(mode.size);
+      await panel.emulateMedia(mode.media);
+      await expect(panel.locator('#effort')).toBeVisible();
+      await panel.locator('#effort').scrollIntoViewIfNeeded();
+      const layout = await panel.evaluate(() => {
+        const select = document.getElementById('effort').getBoundingClientRect();
+        return {
+          left: select.left,
+          right: select.right,
+          width: select.width,
+          viewport: window.innerWidth,
+        };
+      });
+      expect(layout.left).toBeGreaterThanOrEqual(0);
+      expect(layout.right).toBeLessThanOrEqual(layout.viewport);
+      expect(layout.width).toBeGreaterThan(100);
+      await attachScreenshot(panel, testInfo, mode.name);
+    }
+    await panel.emulateMedia({ colorScheme: 'light', forcedColors: 'none', reducedMotion: 'no-preference' });
   } finally {
     await context.close();
   }

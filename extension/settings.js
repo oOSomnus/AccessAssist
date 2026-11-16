@@ -3,6 +3,7 @@ export const DEFAULT_API_CONFIG = Object.freeze({
   baseUrl: 'https://opencode.ai/inference/go/openai/v1',
   model: 'deepseek-v4.1-flash',
   anthropicVersion: '2026-10-21',
+  effort: 'default',
 });
 
 export function configOrigin(config) {

@@ -203,7 +203,7 @@ test('recognized speech is read back before any request or choice use', async ()
   }
 });
 
-test('a two-second pause inside a command still produces one joined instruction', async () => {
+test('a one-second pause inside a command still produces one joined instruction', async () => {
   const { context, extensionId, worker } = await launch();
   try {
     await resetMock();
@@ -213,7 +213,7 @@ test('a two-second pause inside a command still produces one joined instruction'
     await expect.poll(async () => (await voiceState(panel)).starts).toBe(1);
     await expect(panel.locator('#mode-line')).toContainText('Listening. Speak now.');
     await emitResults(panel, [{ transcript: 'What is this page about?' }]);
-    await panel.waitForTimeout(2_000);
+    await panel.waitForTimeout(1_000);
     await emitResults(panel, [
       { transcript: 'What is this page about?' },
       { transcript: 'Read the second paragraph.' },

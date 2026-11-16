@@ -320,7 +320,6 @@ label { display: block; margin-top: 12px; font-weight: 600; }
 
 #settings > label,
 #settings > select,
-#settings > fieldset,
 #settings > button { margin-top: 12px; }
 
 .shortcut-help {
@@ -344,41 +343,6 @@ label { display: block; margin-top: 12px; font-weight: 600; }
 .shortcut-help li + li { margin-top: 8px; }
 .shortcut-help p { margin-top: 12px; }
 .shortcut-help code { font-size: 0.95rem; overflow-wrap: anywhere; }
-
-fieldset {
-  margin-top: 12px;
-  padding: 12px;
-  border: 1px solid var(--border);
-  border-radius: 12px;
-}
-
-legend { padding: 0 4px; font-weight: 600; }
-
-fieldset label {
-  display: flex;
-  align-items: center;
-  gap: 8px;
-  min-height: 44px;
-  margin: 0;
-  padding: 0 4px;
-  border-radius: 8px;
-  font-weight: 400;
-}
-
-fieldset label:has(input:focus-visible) {
-  outline: 3px solid var(--focus);
-  outline-offset: 2px;
-}
-
-input[type="radio"] {
-  flex: none;
-  width: auto;
-  min-height: auto;
-  margin: 0;
-  accent-color: var(--accent);
-}
-
-input[type="radio"]:focus-visible { outline: none; }
 
 /* Controls */
 
@@ -508,7 +472,7 @@ body.setup-page #mode-line { display: none; }
 
 @media (prefers-contrast: more) {
   :root { --border: var(--fg); --control-border: var(--fg); }
-  button, input[type="text"], input[type="url"], input[type="password"], select, textarea, summary, fieldset {
+  button, input[type="text"], input[type="url"], input[type="password"], select, textarea, summary {
     border-width: 2px;
   }
   .hint { color: var(--fg); }
@@ -531,7 +495,7 @@ body.setup-page #mode-line { display: none; }
     --focus: Highlight;
   }
 
-  button, input, select, textarea, summary, fieldset, .ask, .voice-setup, .conversation-empty, #composer {
+  button, input, select, textarea, summary, .ask, .voice-setup, .conversation-empty, #composer {
     border-color: CanvasText;
   }
 

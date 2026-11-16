@@ -1,4 +1,5 @@
 import { test, expect } from '@playwright/test';
+import fs from 'node:fs';
 import {
   announcementEntries,
   announcements,
@@ -13,6 +14,85 @@ import {
   sendText,
   voiceState,
 } from './helpers.js';
+
+const launcherOpen = (page) => page.locator('#accessassist-launcher-host #launcher-open');
+const launcherMove = (page) => page.locator('#accessassist-launcher-host #launcher-move');
+const launcherPanel = (page) => page.locator('#accessassist-launcher-host #launcher-move-controls');
+
+async function waitForLauncher(page) {
+  await expect(launcherOpen(page)).toHaveCount(1);
+  await expect(launcherMove(page)).toBeEnabled();
+}
+
+async function launcherState(page) {
+  return page.evaluate(() => {
+    const host = document.getElementById('accessassist-launcher-host');
+    const root = host.shadowRoot;
+    const style = getComputedStyle(host);
+    const rect = root.querySelector('.launcher-bar').getBoundingClientRect();
+    return {
+      left: Number.parseFloat(style.left),
+      top: Number.parseFloat(style.top),
+      bar: { x: rect.x, y: rect.y, width: rect.width, height: rect.height },
+      viewport: { width: innerWidth, height: innerHeight },
+      active: root.activeElement?.id || root.activeElement?.getAttribute('aria-label') || '',
+      moveOpen: !root.querySelector('#launcher-move-controls').hidden,
+      status: root.querySelector('[role="status"]').textContent,
+    };
+  });
+}
+
+async function storedLauncher(worker) {
+  return worker.evaluate(async () => (await chrome.storage.local.get('launcherPosition')).launcherPosition);
+}
+
+async function sessionIntents(worker) {
+  return worker.evaluate(async () => Object.keys(await chrome.storage.session.get(null))
+    .filter((key) => key.startsWith('intent:')));
+}
+
+async function clearIntents(worker) {
+  await worker.evaluate(async () => {
+    const keys = Object.keys(await chrome.storage.session.get(null)).filter((key) => key.startsWith('intent:'));
+    if (keys.length) await chrome.storage.session.remove(keys);
+  });
+}
+
+async function watchIntentEvents(worker) {
+  await worker.evaluate(() => {
+    globalThis.__aaIntentEvents = [];
+    chrome.storage.onChanged.addListener((changes, area) => {
+      if (area !== 'session') return;
+      for (const [key, change] of Object.entries(changes)) {
+        if (key.startsWith('intent:')) globalThis.__aaIntentEvents.push(change.newValue ? 'set' : 'clear');
+      }
+    });
+  });
+}
+
+async function intentEvents(worker) {
+  return worker.evaluate(() => globalThis.__aaIntentEvents ?? []);
+}
+
+async function dragLauncher(page, { dx, dy, escape = false, release = true } = {}) {
+  const box = await launcherOpen(page).boundingBox();
+  const startX = box.x + box.width / 2;
+  const startY = box.y + box.height / 2;
+  await page.mouse.move(startX, startY);
+  await page.mouse.down();
+  await page.mouse.move(startX + dx, startY + dy, { steps: 8 });
+  if (escape) await page.keyboard.press('Escape');
+  if (release) await page.mouse.up();
+  return { startX, startY };
+}
+
+async function dragLauncherTo(page, x, y) {
+  const box = await launcherOpen(page).boundingBox();
+  await page.mouse.move(box.x + box.width / 2, box.y + box.height / 2);
+  await page.mouse.down();
+  await page.mouse.move(x, y, { steps: 8 });
+  await page.mouse.up();
+}
 
 test('read flow speaks the real paragraph and does not submit the form', async () => {
   const { context, extensionId } = await launch();
@@ -773,47 +853,416 @@ test('shadow DOM content is observed and offered to the model', async () => {
   }
 });
 
-test('launcher position is keyboard-selectable and follows the saved corner', async () => {
+test('reasoning effort saves without clearing the key and reaches each protocol', async () => {
   const { context, extensionId } = await launch();
   try {
-    const page = await openFixture(context, '/article');
-    const panel = await openPanel(context, extensionId);
-    await panel.evaluate(() => {
-      document.getElementById('settings').open = true;
-      document.querySelector('input[name="launcher"][value="br"]').focus();
-    });
-    // A launcher combination stays in its group and never reaches the settings
-    // link. Shift makes event.key a symbol, so event.code must pick the digit.
-    const openTabs = context.pages().length;
-    await panel.keyboard.press('Control+Shift+1');
-    await panel.waitForTimeout(200);
-    await expect(panel.locator('input[name="launcher"][value="br"]')).toBeChecked();
-    expect(context.pages().length).toBe(openTabs);
+    await resetMock();
+    await openFixture(context, '/article');
+    let panel = await openPanel(context, extensionId);
+    const keyBefore = await panel.evaluate(() => chrome.storage.session.get('apiKey'));
+    expect(keyBefore.apiKey.value).toBe('test-key');
 
-    await panel.keyboard.press('Control+Shift+2');
-    await expect(panel.locator('input[name="launcher"][value="bl"]')).toBeChecked();
-    // Bare, extra-modifier, repeated, and composing digits do nothing.
-    // Synthetic events keep browser shortcuts out of the harness.
-    await panel.locator('input[name="launcher"][value="bl"]').evaluate((radio) => {
-      const cases = [
-        { key: '3', code: 'Digit3' },
-        { key: '3', code: 'Digit3', altKey: true, ctrlKey: true, shiftKey: true },
-        { key: '3', code: 'Digit3', metaKey: true, ctrlKey: true, shiftKey: true },
-        { key: '3', code: 'Digit3', ctrlKey: true, shiftKey: true, repeat: true },
-        { key: '3', code: 'Digit3', ctrlKey: true, shiftKey: true, isComposing: true },
-        { key: '3', code: 'Numpad3', ctrlKey: true, shiftKey: true },
-      ];
-      for (const init of cases) radio.dispatchEvent(new KeyboardEvent('keydown', { ...init, bubbles: true }));
-    });
-    await expect(panel.locator('input[name="launcher"][value="bl"]')).toBeChecked();
-    await expect.poll(() => page.evaluate(() => {
-      const host = document.getElementById('accessassist-launcher-host');
-      return getComputedStyle(host).left;
-    })).toBe('16px');
+    const openAdvanced = async () => {
+      if (!(await panel.locator('#settings').evaluate((details) => details.open))) {
+        await panel.locator('#settings > summary').click();
+      }
+      if (!(await panel.locator('#advanced-api').evaluate((details) => details.open))) {
+        await panel.locator('#advanced-api > summary').click();
+      }
+    };
+
+    await openAdvanced();
+    await panel.locator('#effort').selectOption('high');
+    await panel.locator('#save-settings').click();
+    await expect(panel.locator('#settings-status')).toContainText('Saved');
+    expect((await panel.evaluate(() => chrome.storage.local.get('apiConfig'))).apiConfig.effort).toBe('high');
+    expect((await panel.evaluate(() => chrome.storage.session.get('apiKey'))).apiKey).toEqual(keyBefore.apiKey);
+
+    await panel.close();
+    panel = await openPanel(context, extensionId, { seed: false });
+    await expect(panel.locator('#effort')).toHaveValue('high');
+    let count = (await mockRequests()).length;
+    await sendText(panel, 'What is this page about?');
+    await answerWhen(panel, 'page text', 0);
+    await expect(panel.locator('#transcript')).toContainText('Event schedule', { timeout: 30_000 });
+    await expect.poll(async () => (await mockRequests()).length).toBeGreaterThan(count);
+    let requests = (await mockRequests()).slice(count);
+    expect(requests.length).toBeGreaterThan(0);
+    expect(requests.every((request) => request.path === '/v1/chat/completions')).toBe(true);
+    expect(requests.every((request) => request.body.reasoning_effort === 'high')).toBe(true);
+    expect((await panel.evaluate(() => chrome.storage.session.get('apiKey'))).apiKey).toEqual(keyBefore.apiKey);
+
+    await openAdvanced();
+    await panel.locator('#protocol').selectOption('anthropic');
+    await panel.locator('#effort').selectOption('max');
+    await panel.locator('#save-settings').click();
+    await expect(panel.locator('#settings-status')).toContainText('Saved');
+    expect(await panel.evaluate(async () => (await chrome.storage.local.get('apiConfig')).apiConfig))
+      .toMatchObject({ protocol: 'anthropic', effort: 'max' });
+    expect((await panel.evaluate(() => chrome.storage.session.get('apiKey'))).apiKey).toEqual(keyBefore.apiKey);
+    count = (await mockRequests()).length;
+    await sendText(panel, 'What does the second paragraph say?');
+    await answerWhen(panel, 'page text', 0);
+    await expect(panel.locator('#transcript')).toContainText('Second paragraph', { timeout: 30_000 });
+    await expect.poll(async () => (await mockRequests()).length).toBeGreaterThan(count);
+    requests = (await mockRequests()).slice(count);
+    expect(requests.every((request) => request.path === '/v1/messages')).toBe(true);
+    expect(requests.every((request) => request.body.output_config?.effort === 'max')).toBe(true);
+    expect(requests.every((request) => request.body.reasoning_effort === undefined)).toBe(true);
+
+    await openAdvanced();
+    await panel.locator('#protocol').selectOption('openai');
+    await panel.locator('#effort').selectOption('default');
+    await panel.locator('#save-settings').click();
+    await expect(panel.locator('#settings-status')).toContainText('Saved');
+    expect((await panel.evaluate(() => chrome.storage.session.get('apiKey'))).apiKey).toEqual(keyBefore.apiKey);
+    count = (await mockRequests()).length;
+    await sendText(panel, 'What is this page about?');
+    await answerWhen(panel, 'page text', 0);
+    await expect(panel.locator('#transcript')).toContainText('Event schedule', { timeout: 30_000 });
+    await expect.poll(async () => (await mockRequests()).length).toBeGreaterThan(count);
+    requests = (await mockRequests()).slice(count);
+    expect(requests.every((request) => request.body.reasoning_effort === undefined)).toBe(true);
+    expect(requests.every((request) => request.body.output_config === undefined)).toBe(true);
   } finally {
     await context.close();
   }
 });
+
+test('the Assistant launcher drags, persists, and never opens the panel', async () => {
+  const { context, extensionId, worker } = await launch();
+  try {
+    await resetMock();
+    const page = await openFixture(context, '/article');
+    await waitForLauncher(page);
+    const initial = await launcherState(page);
+    expect(initial.bar.x + initial.bar.width).toBeLessThanOrEqual(initial.viewport.width);
+    expect(initial.bar.y + initial.bar.height).toBeLessThanOrEqual(initial.viewport.height);
+    expect(await storedLauncher(worker)).toEqual({ x: 1, y: 1 });
+    const pagesBefore = context.pages().length;
+    await worker.evaluate(() => {
+      globalThis.__launcherPositionWrites = 0;
+      chrome.storage.onChanged.addListener((changes, area) => {
+        if (area === 'local' && changes.launcherPosition) {
+          globalThis.__launcherPositionWrites = (globalThis.__launcherPositionWrites ?? 0) + 1;
+        }
+      });
+    });
+
+    const box = await launcherOpen(page).boundingBox();
+    const startX = box.x + box.width / 2;
+    const startY = box.y + box.height / 2;
+    await page.mouse.move(startX, startY);
+    await page.mouse.down();
+    await page.mouse.move(startX - 260, startY - 180, { steps: 8 });
+    const during = await launcherState(page);
+    expect(during.left).toBeLessThan(initial.left);
+    expect(await storedLauncher(worker)).toEqual({ x: 1, y: 1 });
+    await page.mouse.up();
+    await expect.poll(async () => (await launcherState(page)).status).toContain('saved');
+    const saved = await storedLauncher(worker);
+    expect(saved).not.toBe('br');
+    expect(saved.x).toBeGreaterThan(0);
+    expect(saved.x).toBeLessThan(1);
+    expect(saved.y).toBeGreaterThan(0);
+    expect(saved.y).toBeLessThan(1);
+    await expect.poll(() => sessionIntents(worker)).toEqual([]);
+    expect(context.pages().length).toBe(pagesBefore);
+    await expect.poll(() => worker.evaluate(() => globalThis.__launcherPositionWrites)).toBe(1);
+
+    const expectedLeft = (state) => 16 + saved.x * Math.max(0, state.viewport.width - state.bar.width - 32);
+    const expectedTop = (state) => 16 + saved.y * Math.max(0, state.viewport.height - state.bar.height - 32);
+    const placed = await launcherState(page);
+    expect(Math.abs(placed.left - expectedLeft(placed))).toBeLessThan(1.5);
+    expect(Math.abs(placed.top - expectedTop(placed))).toBeLessThan(1.5);
+
+    await page.setViewportSize({ width: 391, height: 904 });
+    await expect.poll(async () => {
+      const state = await launcherState(page);
+      return state.viewport.width === 391 ? Math.abs(state.left - expectedLeft(state)) : Infinity;
+    }).toBeLessThan(1.5);
+    const narrowPlaced = await launcherState(page);
+    expect(Math.abs(narrowPlaced.left - expectedLeft(narrowPlaced))).toBeLessThan(1.5);
+    expect(Math.abs(narrowPlaced.top - expectedTop(narrowPlaced))).toBeLessThan(1.5);
+    expect(narrowPlaced.bar.x + narrowPlaced.bar.width).toBeLessThanOrEqual(391 + 1);
+    expect(await storedLauncher(worker)).toEqual(saved);
+    await page.setViewportSize({ width: 1000, height: 760 });
+    await expect.poll(async () => {
+      const state = await launcherState(page);
+      return state.viewport.width === 1000 ? Math.abs(state.left - expectedLeft(state)) : Infinity;
+    }).toBeLessThan(1.5);
+    expect(await storedLauncher(worker)).toEqual(saved);
+
+    await page.reload();
+    await waitForLauncher(page);
+    const reloaded = await launcherState(page);
+    expect(Math.abs(reloaded.left - expectedLeft(reloaded))).toBeLessThan(1.5);
+    expect(Math.abs(reloaded.top - expectedTop(reloaded))).toBeLessThan(1.5);
+
+    const other = await openFixture(context, '/untitled');
+    await waitForLauncher(other);
+    const otherState = await launcherState(other);
+    expect(Math.abs(otherState.left - expectedLeft(otherState))).toBeLessThan(1.5);
+    expect(Math.abs(otherState.top - expectedTop(otherState))).toBeLessThan(1.5);
+
+    const panel = await openPanel(context, extensionId);
+    expect(await storedLauncher(worker)).toEqual(saved);
+    await panel.close();
+    await page.bringToFront();
+
+    await dragLauncherTo(page, 1, 1);
+    await expect.poll(async () => (await storedLauncher(worker)).x).toBe(0);
+    expect((await storedLauncher(worker)).y).toBe(0);
+    const topLeft = await launcherState(page);
+    expect(topLeft.bar.x).toBeGreaterThanOrEqual(0);
+    expect(topLeft.bar.y).toBeGreaterThanOrEqual(0);
+
+    await dragLauncherTo(page, 999, 759);
+    await expect.poll(async () => (await storedLauncher(worker)).x).toBe(1);
+    expect((await storedLauncher(worker)).y).toBe(1);
+    const bottomRight = await launcherState(page);
+    expect(bottomRight.bar.x + bottomRight.bar.width).toBeLessThanOrEqual(bottomRight.viewport.width + 1);
+    expect(bottomRight.bar.y + bottomRight.bar.height).toBeLessThanOrEqual(bottomRight.viewport.height + 1);
+    expect(await sessionIntents(worker)).toEqual([]);
+  } finally {
+    await context.close();
+  }
+});
+
+test('launcher movement has non-drag controls and drag cannot click through', async () => {
+  const { context, extensionId, worker } = await launch();
+  try {
+    await resetMock();
+    const page = await openFixture(context, '/article');
+    await waitForLauncher(page);
+    let savedStart = await storedLauncher(worker);
+
+    const box = await launcherOpen(page).boundingBox();
+    const startX = box.x + box.width / 2;
+    const startY = box.y + box.height / 2;
+    await watchIntentEvents(worker);
+    await page.mouse.move(startX, startY);
+    await page.mouse.down();
+    await page.mouse.move(startX + 2, startY + 1);
+    await page.mouse.up();
+    await expect.poll(() => intentEvents(worker)).toContain('set');
+    await clearIntents(worker);
+    expect(await storedLauncher(worker)).toEqual(savedStart);
+
+    await page.mouse.move(startX, startY);
+    await page.mouse.down();
+    await page.mouse.move(startX - 120, startY - 80, { steps: 6 });
+    await page.mouse.move(startX, startY, { steps: 6 });
+    await page.mouse.up();
+    await expect.poll(() => sessionIntents(worker)).toEqual([]);
+    const returned = await launcherState(page);
+    expect(Math.abs(returned.bar.x - box.x)).toBeLessThan(1.5);
+    expect(Math.abs(returned.bar.y - box.y)).toBeLessThan(1.5);
+
+    const beforeEscape = await launcherState(page);
+    await dragLauncher(page, { dx: -140, dy: -100, escape: true });
+    expect(await storedLauncher(worker)).toEqual(savedStart);
+    const escaped = await launcherState(page);
+    expect(Math.abs(escaped.left - beforeEscape.left)).toBeLessThan(1);
+    expect(escaped.status).toContain('cancelled');
+
+    const cdp = await context.newCDPSession(page);
+    const touchBox = await launcherOpen(page).boundingBox();
+    const touchX = touchBox.x + touchBox.width / 2;
+    const touchY = touchBox.y + touchBox.height / 2;
+    const touchBefore = await storedLauncher(worker);
+    await cdp.send('Input.dispatchTouchEvent', {
+      type: 'touchStart', touchPoints: [{ x: touchX, y: touchY, id: 1 }],
+    });
+    await cdp.send('Input.dispatchTouchEvent', {
+      type: 'touchMove', touchPoints: [{ x: touchX - 90, y: touchY - 70, id: 1 }],
+    });
+    await cdp.send('Input.dispatchTouchEvent', { type: 'touchEnd', touchPoints: [] });
+    await expect.poll(() => storedLauncher(worker)).not.toEqual(touchBefore);
+    savedStart = await storedLauncher(worker);
+    expect(await sessionIntents(worker)).toEqual([]);
+
+    const touchSaved = await storedLauncher(worker);
+    const cancelBox = await launcherOpen(page).boundingBox();
+    await cdp.send('Input.dispatchTouchEvent', {
+      type: 'touchStart',
+      touchPoints: [{ x: cancelBox.x + cancelBox.width / 2, y: cancelBox.y + cancelBox.height / 2, id: 2 }],
+    });
+    await cdp.send('Input.dispatchTouchEvent', {
+      type: 'touchMove',
+      touchPoints: [{ x: cancelBox.x + cancelBox.width / 2 + 80, y: cancelBox.y + cancelBox.height / 2 + 50, id: 2 }],
+    });
+    await cdp.send('Input.dispatchTouchEvent', { type: 'touchCancel', touchPoints: [] });
+    expect(await storedLauncher(worker)).toEqual(touchSaved);
+    const canceledTouch = await launcherState(page);
+    expect(Math.abs(canceledTouch.bar.x - cancelBox.x)).toBeLessThan(1.5);
+    expect(Math.abs(canceledTouch.bar.y - cancelBox.y)).toBeLessThan(1.5);
+
+    await page.evaluate(() => {
+      const open = document.getElementById('accessassist-launcher-host').shadowRoot.querySelector('#launcher-open');
+      const rect = open.getBoundingClientRect();
+      const base = {
+        bubbles: true, composed: true, pointerId: 1, pointerType: 'mouse', isPrimary: true,
+        clientX: rect.left + 20, clientY: rect.top + 20,
+      };
+      open.dispatchEvent(new PointerEvent('pointerdown', { ...base, button: 0, buttons: 1 }));
+      open.dispatchEvent(new PointerEvent('pointermove', { ...base, button: -1, buttons: 1, clientX: rect.left - 100 }));
+      open.dispatchEvent(new PointerEvent('pointerup', { ...base, button: 0, buttons: 0, clientX: rect.left - 100 }));
+      document.getElementById('accessassist-launcher-host').shadowRoot.querySelector('#launcher-move').click();
+    });
+    expect(await storedLauncher(worker)).toEqual(savedStart);
+    expect((await launcherState(page)).moveOpen).toBe(false);
+
+    await launcherMove(page).click();
+    await expect(launcherPanel(page)).toBeVisible();
+    await expect(page.locator('#accessassist-launcher-host button[aria-label="Move up"]')).toBeFocused();
+    const beforeMove = await launcherState(page);
+    await page.locator('#accessassist-launcher-host button[aria-label="Move left"]').click();
+    const afterMove = await launcherState(page);
+    expect(beforeMove.left - afterMove.left).toBeGreaterThan(15);
+    expect(await storedLauncher(worker)).toEqual(savedStart);
+    await launcherMove(page).click();
+    await expect(launcherPanel(page)).toBeHidden();
+    await expect(launcherMove(page)).toBeFocused();
+    const afterDone = await storedLauncher(worker);
+    expect(afterDone.x).toBeLessThan(savedStart.x);
+
+    await launcherMove(page).click();
+    await page.locator('#accessassist-launcher-host button[aria-label="Move right"]').click();
+    await page.locator('#accessassist-launcher-host #launcher-move-controls button', { hasText: 'Cancel' }).click();
+    await expect(launcherPanel(page)).toBeHidden();
+    await expect(launcherMove(page)).toBeFocused();
+    expect(await storedLauncher(worker)).toEqual(afterDone);
+
+    await launcherMove(page).click();
+    const beforeArrow = await launcherState(page);
+    await page.keyboard.press('ArrowLeft');
+    const afterArrow = await launcherState(page);
+    expect(beforeArrow.left - afterArrow.left).toBeGreaterThan(15);
+    expect(await storedLauncher(worker)).toEqual(afterDone);
+    await page.keyboard.press('Escape');
+    await expect(launcherPanel(page)).toBeHidden();
+    await expect(launcherMove(page)).toBeFocused();
+    expect(await storedLauncher(worker)).toEqual(afterDone);
+
+    await launcherMove(page).click();
+    await page.keyboard.press('ArrowUp');
+    await page.locator('#accessassist-launcher-host #launcher-move-controls button', { hasText: 'Done' }).click();
+    await expect(launcherPanel(page)).toBeHidden();
+    await expect(launcherMove(page)).toBeFocused();
+    const afterDoneButton = await storedLauncher(worker);
+    expect(afterDoneButton.y).toBeLessThan(afterDone.y);
+
+    await page.evaluate(() => {
+      window.__aaPageKeys = [];
+      window.addEventListener('keydown', (event) => window.__aaPageKeys.push(event.key));
+    });
+    await launcherMove(page).click();
+    await page.locator('#name').click();
+    await expect(launcherPanel(page)).toBeHidden();
+    await expect(page.locator('#name')).toBeFocused();
+    await page.keyboard.press('ArrowRight');
+    await page.keyboard.press('1');
+    expect(await page.evaluate(() => window.__aaPageKeys)).toEqual(['ArrowRight', '1']);
+    expect(await storedLauncher(worker)).toEqual(afterDoneButton);
+
+    const tabId = await worker.evaluate(async () => {
+      const tabs = await chrome.tabs.query({});
+      return tabs.find((candidate) => candidate.url?.includes('/article')).id;
+    });
+    await worker.evaluate((id) => chrome.tabs.sendMessage(id, { type: 'FOCUS_LAUNCHER' }), tabId);
+    await expect.poll(async () => (await launcherState(page)).active).toBe('launcher-open');
+    await clearIntents(worker);
+    await watchIntentEvents(worker);
+    await page.keyboard.press('Enter');
+    await expect.poll(() => intentEvents(worker)).toContain('set');
+  } finally {
+    await context.close();
+  }
+});
+
+test('launcher broadcasts and hides its controls from page observation', async ({}, testInfo) => {
+  const { context, extensionId, worker } = await launch();
+  try {
+    await resetMock();
+    const page = await openFixture(context, '/article');
+    const other = await openFixture(context, '/untitled');
+    await waitForLauncher(page);
+    await waitForLauncher(other);
+    const panel = await openPanel(context, extensionId);
+
+    await other.bringToFront();
+    await launcherMove(other).click();
+    await other.locator('#accessassist-launcher-host button[aria-label="Move left"]').click();
+    await other.locator('#accessassist-launcher-host button[aria-label="Move up"]').click();
+    await other.locator('#accessassist-launcher-host #launcher-move-controls button', { hasText: 'Done' }).click();
+    await expect.poll(async () => (await launcherState(other)).moveOpen).toBe(false);
+    const saved = await storedLauncher(worker);
+    expect(saved.x).toBeLessThan(1);
+    expect(saved.y).toBeLessThan(1);
+
+    await page.bringToFront();
+    await expect.poll(async () => (await launcherState(page)).left).toBeCloseTo(16 + saved.x * (
+      (await launcherState(page)).viewport.width - (await launcherState(page)).bar.width - 32
+    ), 0);
+
+    await launcherMove(page).click();
+    await page.keyboard.press('ArrowLeft');
+    expect((await launcherState(page)).moveOpen).toBe(true);
+    const beforeBroadcast = await storedLauncher(worker);
+    const otherTabId = await worker.evaluate(async () => {
+      const tabs = await chrome.tabs.query({});
+      return tabs.find((candidate) => candidate.url?.includes('/untitled')).id;
+    });
+    const broadcast = { x: 0.15, y: 0.25 };
+    await worker.evaluate(async ({ tabId, position }) => {
+      await chrome.scripting.executeScript({
+        target: { tabId },
+        func: (next) => chrome.runtime.sendMessage({ type: 'SET_LAUNCHER_POSITION', position: next }),
+        args: [position],
+      });
+    }, { tabId: otherTabId, position: broadcast });
+    await expect.poll(async () => (await launcherState(page)).moveOpen).toBe(false);
+    await expect.poll(() => storedLauncher(worker)).toEqual(broadcast);
+    expect(await storedLauncher(worker)).not.toEqual(beforeBroadcast);
+    await expect.poll(async () => (await launcherState(page)).active).toBe('launcher-move');
+
+    await launcherMove(page).click();
+    await page.keyboard.press('ArrowRight');
+    await testInfo.attach('launcher-move-open', {
+      body: await page.screenshot({ path: testInfo.outputPath('launcher-move-open.png') }),
+      contentType: 'image/png',
+    });
+    const observation = await panel.evaluate(async () => {
+      const tabs = await chrome.tabs.query({});
+      const tab = tabs.find((candidate) => candidate.url?.includes('/article'));
+      const info = await chrome.runtime.sendMessage({ type: 'GET_TAB_INFO', tabId: tab.id });
+      return chrome.runtime.sendMessage({
+        type: 'OBSERVE_PAGE',
+        tabId: tab.id,
+        expectedDocumentId: info.documentId,
+        visual: true,
+      });
+    });
+    expect(observation.visual?.allowed).toBe(true);
+    expect(observation.visual?.dataUrl).toMatch(/^data:image\/png;base64,/u);
+    const serialized = JSON.stringify(observation);
+    expect(serialized).not.toContain('Open the AccessAssist assistant');
+    expect(serialized).not.toContain('Move Assistant button');
+    expect(serialized).not.toContain('Choose Done to save or Cancel to restore');
+    const observationPng = Buffer.from(observation.visual.dataUrl.split(',')[1], 'base64');
+    fs.writeFileSync(testInfo.outputPath('launcher-observation.png'), observationPng);
+    await testInfo.attach('launcher-observation', {
+      path: testInfo.outputPath('launcher-observation.png'),
+      contentType: 'image/png',
+    });
+    await expect(launcherOpen(page)).toBeVisible();
+    expect((await launcherState(page)).bar.width).toBeGreaterThan(0);
+  } finally {
+    await context.close();
+  }
+});
+
 
 test('composer number keys send, prepare, pause, repeat, cancel, and open settings', async () => {
   const { context, extensionId } = await launch({

@@ -1049,7 +1049,7 @@ test('an early native no-speech restarts the same command without another prompt
   }
 });
 
-test('final segments join across a three-second pause and interim text never executes', async (t) => {
+test('final segments join across a two-second pause and interim text never executes', async (t) => {
   const control = fakeBrowser({ audio: 'running' });
   t.mock.timers.enable({ apis: ['setTimeout'] });
   const flush = async () => {
@@ -1068,7 +1068,7 @@ test('final segments join across a three-second pause and interim text never exe
     await pending;
 
     control.recognition.onresult(cumulativeEvent([{ transcript: 'Read the first' }]));
-    t.mock.timers.tick(2_000);
+    t.mock.timers.tick(1_500);
     await flush();
     assert.deepEqual(results, []);
 
@@ -1076,7 +1076,7 @@ test('final segments join across a three-second pause and interim text never exe
       { transcript: 'Read the first' },
       { transcript: 'paragraph', final: false },
     ]));
-    t.mock.timers.tick(2_999);
+    t.mock.timers.tick(1_999);
     await flush();
     assert.deepEqual(results, []);
 
@@ -1088,7 +1088,7 @@ test('final segments join across a three-second pause and interim text never exe
       { transcript: 'Read the first' },
       { transcript: 'paragraph' },
     ]));
-    t.mock.timers.tick(2_999);
+    t.mock.timers.tick(1_999);
     await flush();
     assert.deepEqual(results, []);
 
@@ -1122,7 +1122,7 @@ test('identical words at different finalized indexes are kept', async (t) => {
       { transcript: 'very' },
       { transcript: 'very' },
     ]));
-    t.mock.timers.tick(3_000);
+    t.mock.timers.tick(2_000);
     await flush();
     assert.deepEqual(results, ['very very']);
   } finally {
@@ -1150,7 +1150,7 @@ test('a final result after stop is included once before native end', async (t) =
     await pending;
 
     control.recognition.onresult(resultEvent('Read the first'));
-    t.mock.timers.tick(3_000);
+    t.mock.timers.tick(2_000);
     await flush();
     assert.deepEqual(results, []);
     control.recognition.onresult(cumulativeEvent([
@@ -1184,7 +1184,7 @@ test('a missing native end after stop delivers only finalized text', async (t) =
     await pending;
 
     control.recognition.onresult(resultEvent('Read this'));
-    t.mock.timers.tick(3_000);
+    t.mock.timers.tick(2_000);
     await flush();
     t.mock.timers.tick(2_000);
     await flush();
@@ -1218,7 +1218,7 @@ test('only interim text finishes with no request instead of an instruction', asy
     control.recognition.onresult(resultEvent('unfinished thought', false));
     control.releaseEnd();
     await flush();
-    t.mock.timers.tick(3_000);
+    t.mock.timers.tick(2_000);
     await flush();
     assert.deepEqual(results, []);
     assert.equal(ends.length, 1);
@@ -1278,7 +1278,7 @@ test('cancelling during final flush drops the pending result', async (t) => {
     await pending;
 
     control.recognition.onresult(resultEvent('Do not use this'));
-    t.mock.timers.tick(3_000);
+    t.mock.timers.tick(2_000);
     await flush();
     speech.stopListening();
     control.releaseEnd();

@@ -15,8 +15,11 @@ export const DEFAULT_CONFIG = Object.freeze({
   baseUrl: 'https://opencode.ai/inference/go/openai/v1',
   model: 'deepseek-v4.1-flash',
   anthropicVersion: '2026-10-21',
+  effort: 'default',
 });
 
+const EFFORT_LEVELS = new Set(['default', 'low', 'medium', 'high', 'max']);
+const EFFORT_ERROR = 'Effort must be default, low, medium, high, or max';
 export const LOCAL_HOSTS = new Set(['localhost', '127.0.0.1', '[::1]', '::1']);
 const VERSION_PATTERN = /^\d{4}-\d{2}-\d{2}$/u;
 const ENDPOINT_SUFFIX = /(?:\/chat\/completions|\/messages)\/?$/u;
@@ -55,6 +58,10 @@ export function normalizeConfig(raw = {}) {
     if (!anthropicVersion) errors.push('Missing Anthropic API version');
     else if (!VERSION_PATTERN.test(anthropicVersion)) errors.push('Anthropic API version must be YYYY-MM-DD');
   }
+  let effort = 'default';
+  if (typeof raw.effort === 'string') effort = raw.effort.trim().toLowerCase() || 'default';
+  else if (raw.effort != null) effort = '';
+  if (!EFFORT_LEVELS.has(effort)) errors.push(EFFORT_ERROR);
   if (errors.length) return { errors };
   return {
     errors: [],
@@ -62,6 +69,7 @@ export function normalizeConfig(raw = {}) {
       protocol,
       baseUrl,
       model,
+      effort,
       ...(protocol === 'anthropic' ? { anthropicVersion } : {}),
     },
   };
@@ -194,6 +202,7 @@ export function buildBody(config, { system, messages, tools = TOOLS, maxTokens =
         input_schema: tool.parameters,
       })),
       stream: false,
+      ...(config.effort && config.effort !== 'default' ? { output_config: { effort: config.effort } } : {}),
     };
   }
   return {
@@ -205,6 +214,7 @@ export function buildBody(config, { system, messages, tools = TOOLS, maxTokens =
     })),
     max_tokens: maxTokens,
     stream: false,
+    ...(config.effort && config.effort !== 'default' ? { reasoning_effort: config.effort } : {}),
   };
 }
 

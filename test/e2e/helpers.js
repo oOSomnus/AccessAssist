@@ -349,7 +349,7 @@ async function seedPanel(context, { protocol, baseUrl, apiKey = 'test-key' }) {
   };
   const binding = { value: apiKey, origin: new URL(baseUrl).origin, at: Date.now() };
   await worker.evaluate(async ({ apiConfig, key }) => {
-    const keys = ['apiConfig', 'launcherPosition'];
+    const keys = ['apiConfig'];
     // Let the worker's own startup defaults settle before replacing them.
     for (let attempt = 0; attempt < 150; attempt += 1) {
       const stored = await chrome.storage.local.get(keys);
@@ -360,7 +360,6 @@ async function seedPanel(context, { protocol, baseUrl, apiKey = 'test-key' }) {
     await chrome.storage.local.set({
       apiConfig,
       introSeen: true,
-      launcherPosition: 'br',
     });
     await chrome.storage.session.set({ apiKey: key });
     const stored = await chrome.storage.local.get(['apiConfig']);

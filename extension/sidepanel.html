@@ -71,6 +71,16 @@
               <label for="model">Model</label>
               <input id="model" name="model" type="text" autocomplete="off" spellcheck="false">
 
+              <label for="effort">Reasoning effort</label>
+              <select id="effort" name="effort" aria-describedby="effort-hint">
+                <option value="default">Provider default</option>
+                <option value="low">Low</option>
+                <option value="medium">Medium</option>
+                <option value="high">High</option>
+                <option value="max">Maximum</option>
+              </select>
+              <p id="effort-hint" class="hint">Provider default sends no effort parameter. Supported levels depend on the model; some models map levels to the same behavior.</p>
+
               <label for="anthropic-version" id="anthropic-version-label">Anthropic API version</label>
               <input id="anthropic-version" name="anthropicVersion" type="text" autocomplete="off" spellcheck="false">
             </details>
@@ -78,14 +88,6 @@
             <button id="save-settings" type="submit" data-number="4">4 Save settings</button>
             <p id="settings-status" class="hint" role="status"></p>
           </form>
-
-          <fieldset data-number-scope="launcher">
-            <legend>Assistant button position</legend>
-            <label><input type="radio" name="launcher" value="br" data-number="1" checked> 1 Bottom right</label>
-            <label><input type="radio" name="launcher" value="bl" data-number="2"> 2 Bottom left</label>
-            <label><input type="radio" name="launcher" value="tr" data-number="3"> 3 Top right</label>
-            <label><input type="radio" name="launcher" value="tl" data-number="4"> 4 Top left</label>
-          </fieldset>
 
           <button id="replay-intro" type="button" data-number="5">5 Replay introduction</button>
           <section class="shortcut-help" aria-labelledby="shortcut-heading">

@@ -58,6 +58,91 @@ test('endpoints and headers follow each protocol', () => {
   assert.equal(buildHeaders({ ...goOpenAI, protocol: 'openai', baseUrl: 'https://example.test/v1' }, 'k', 's').authorization, 'Bearer k');
 });
 
+test('effort is normalized and only explicit levels reach each wire format', async () => {
+  assert.equal(normalizeConfig(goOpenAI).config.effort, 'default');
+  assert.equal(normalizeConfig(goAnthropic).config.effort, 'default');
+  assert.equal(normalizeConfig({ ...goOpenAI, effort: ' HIGH ' }).config.effort, 'high');
+  assert.equal(normalizeConfig({ ...goOpenAI, effort: undefined }).config.effort, 'default');
+  assert.equal(normalizeConfig({ ...goOpenAI, effort: '' }).config.effort, 'default');
+  for (const effort of ['xhigh', 1, true]) {
+    assert.match(normalizeConfig({ ...goOpenAI, effort }).errors[0], /^Effort must be default, low, medium, high, or max$/u);
+  }
+
+  const openaiBase = { ...DEFAULT_CONFIG, baseUrl: 'https://example.test/v1' };
+  const anthropicBase = { ...goAnthropic, baseUrl: 'https://example.test/anthropic/v1' };
+  const bodies = [];
+  const send = async (config) => {
+    await requestTurn({
+      config,
+      apiKey: 'k',
+      sessionId: 's',
+      system: 'sys',
+      maxTokens: 777,
+      messages: [
+        { role: 'user', content: 'read' },
+        { role: 'assistant', text: '', toolCalls: [{ id: 'call_1', name: 'observe_page', args: {} }], raw: { reasoning_content: 'Think' } },
+        { role: 'tool', results: [{ id: 'call_1', content: 'result', isError: false }] },
+      ],
+      fetchImpl: async (url, init) => {
+        bodies.push({ url, body: JSON.parse(init.body), headers: init.headers });
+        return json(config.protocol === 'anthropic'
+          ? { content: [{ type: 'text', text: 'ok' }], stop_reason: 'end_turn', usage: { opencode: { billing_source: 'go' } } }
+          : { choices: [{ message: { content: 'ok' } }] });
+      },
+    });
+  };
+
+  await send({ ...openaiBase, effort: 'default' });
+  await send({ ...openaiBase, effort: 'high' });
+  await send({ ...anthropicBase, effort: 'default' });
+  await send({ ...anthropicBase, effort: 'max' });
+
+  assert.equal('reasoning_effort' in bodies[0].body, false);
+  assert.equal('output_config' in bodies[0].body, false);
+  assert.equal(bodies[1].body.reasoning_effort, 'high');
+  assert.equal('output_config' in bodies[1].body, false);
+  assert.equal('reasoning_effort' in bodies[2].body, false);
+  assert.equal('output_config' in bodies[2].body, false);
+  assert.deepEqual(bodies[3].body.output_config, { effort: 'max' });
+  assert.equal('reasoning_effort' in bodies[3].body, false);
+  assert.equal(bodies[1].body.max_tokens, 777);
+  assert.equal(bodies[1].body.messages[2].reasoning_content, 'Think');
+  assert.equal(bodies[1].body.messages[3].tool_call_id, 'call_1');
+  assert.equal(bodies[1].headers.authorization, 'Bearer k');
+
+  let fetches = 0;
+  await assert.rejects(
+    requestTurn({
+      config: { ...openaiBase, effort: 'nope' },
+      apiKey: 'k',
+      sessionId: 's',
+      system: 'x',
+      messages: [{ role: 'user', content: 'x' }],
+      fetchImpl: async () => { fetches += 1; return json({}); },
+    }),
+    (error) => error.code === 'config' && /^Effort must be/u.test(error.message),
+  );
+  assert.equal(fetches, 0);
+
+  let attempts = 0;
+  await assert.rejects(
+    requestTurn({
+      config: { ...openaiBase, effort: 'high' },
+      apiKey: 'k',
+      sessionId: 's',
+      system: 'x',
+      messages: [{ role: 'user', content: 'x' }],
+      fetchImpl: async (url, init) => {
+        attempts += 1;
+        assert.equal(JSON.parse(init.body).reasoning_effort, 'high');
+        return json({ error: 'unsupported effort' }, 400);
+      },
+    }),
+    (error) => error.code === 'bad_request',
+  );
+  assert.equal(attempts, 1);
+});
+
 test('OpenAI body keeps tool results, reasoning and images', async () => {
   const config = normalizeConfig({ ...DEFAULT_CONFIG, baseUrl: 'https://example.test/v1' }).config;
   let sent;

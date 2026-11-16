@@ -7,12 +7,12 @@ test('extension loads, injects one launcher and opens the panel document', async
     const page = await openFixture(context, '/article');
     await expect.poll(() => page.evaluate(() => {
       const host = document.getElementById('accessassist-launcher-host');
-      return Boolean(host?.shadowRoot?.querySelector('button'));
+      return Boolean(host?.shadowRoot?.querySelector('#launcher-open'));
     })).toBe(true);
 
     const launcher = await page.evaluate(() => {
       const host = document.getElementById('accessassist-launcher-host');
-      const button = host.shadowRoot.querySelector('button');
+      const button = host.shadowRoot.querySelector('#launcher-open');
       return {
         count: document.querySelectorAll('#accessassist-launcher-host').length,
         label: button.getAttribute('aria-label'),
@@ -58,7 +58,7 @@ test('the injected launcher reports a voice intent for its own page', async () =
     const page = await openFixture(context, '/article');
     await expect.poll(() => page.evaluate(() => {
       const host = document.getElementById('accessassist-launcher-host');
-      return Boolean(host?.shadowRoot?.querySelector('button'));
+      return Boolean(host?.shadowRoot?.querySelector('#launcher-open'));
     })).toBe(true);
     const target = await worker.evaluate(async () => {
       const tabs = await chrome.tabs.query({});
@@ -66,7 +66,7 @@ test('the injected launcher reports a voice intent for its own page', async () =
       return { tabId: tab.id, windowId: tab.windowId };
     });
 
-    await page.locator('#accessassist-launcher-host button').click();
+    await page.locator('#accessassist-launcher-host #launcher-open').click();
     await expect.poll(() => worker.evaluate(async (windowId) => {
       const key = `intent:${windowId}`;
       return (await chrome.storage.session.get(key))[key] ?? null;

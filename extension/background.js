@@ -13,7 +13,14 @@ import {
 } from './policy.js';
 
 const PANEL_URL = chrome.runtime.getURL('sidepanel.html');
-const LAUNCHER_POSITIONS = new Set(['br', 'bl', 'tr', 'tl']);
+const LAUNCHER_ID = 'accessassist-launcher-host';
+const LAUNCHER_DEFAULT_POSITION = Object.freeze({ x: 1, y: 1 });
+const LEGACY_LAUNCHER_POSITIONS = new Map([
+  ['tl', { x: 0, y: 0 }],
+  ['tr', { x: 1, y: 0 }],
+  ['bl', { x: 0, y: 1 }],
+  ['br', { x: 1, y: 1 }],
+]);
 const DEBUGGER_VERSION = '1.3';
 const SETTLE_MS = 150;
 const MAX_FIELD_VALUE = 65_536;
@@ -43,6 +50,45 @@ function panelSender(sender) {
 
 function httpUrl(value) {
   return typeof value === 'string' && /^https?:\/\//iu.test(value);
+}
+
+let launcherPositionQueue = Promise.resolve();
+
+function launcherSender(sender) {
+  return sender?.id === chrome.runtime.id
+    && sender.frameId === 0
+    && Number.isInteger(sender.tab?.id)
+    && httpUrl(sender.url)
+    && httpUrl(sender.tab?.url);
+}
+
+function isLauncherPosition(value) {
+  return Boolean(value)
+    && typeof value === 'object'
+    && !Array.isArray(value)
+    && Number.isFinite(value.x) && value.x >= 0 && value.x <= 1
+    && Number.isFinite(value.y) && value.y >= 0 && value.y <= 1;
+}
+
+function launcherPositionFrom(stored) {
+  if (isLauncherPosition(stored)) return { position: { x: stored.x, y: stored.y }, current: true };
+  return {
+    position: LEGACY_LAUNCHER_POSITIONS.get(stored) ?? { ...LAUNCHER_DEFAULT_POSITION },
+    current: false,
+  };
+}
+
+async function migrateLauncherPosition() {
+  const stored = await chrome.storage.local.get('launcherPosition');
+  const { position, current } = launcherPositionFrom(stored.launcherPosition);
+  if (!current) await chrome.storage.local.set({ launcherPosition: position });
+  return position;
+}
+
+function queueLauncher(operation) {
+  const run = launcherPositionQueue.then(operation, operation);
+  launcherPositionQueue = run.catch(() => {});
+  return run;
 }
 
 function modelUrl(value) {
@@ -178,15 +224,16 @@ async function initialize() {
   await migrateIntroState();
   // Text output is system-reader-only now; old profiles must not revive TTS.
   await chrome.storage.local.remove('outputMode').catch(() => {});
-  const stored = await chrome.storage.local.get(['launcherPosition', 'apiConfig']).catch(() => ({}));
+  await queueLauncher(migrateLauncherPosition).catch(() => {});
+  const stored = await chrome.storage.local.get('apiConfig').catch(() => ({}));
   const defaults = {};
-  if (!LAUNCHER_POSITIONS.has(stored.launcherPosition)) defaults.launcherPosition = 'br';
   if (!stored.apiConfig) {
     defaults.apiConfig = {
       protocol: 'openai',
       baseUrl: 'https://opencode.ai/inference/go/openai/v1',
       model: 'deepseek-v4.1-flash',
       anthropicVersion: '2026-10-21',
+      effort: 'default',
     };
   }
   if (Object.keys(defaults).length) await chrome.storage.local.set(defaults).catch(() => {});
@@ -346,9 +393,23 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     return true;
   }
   if (message?.type === 'GET_LAUNCHER_STATE') {
-    chrome.storage.local.get('launcherPosition').then(({ launcherPosition }) => {
-      sendResponse({ position: LAUNCHER_POSITIONS.has(launcherPosition) ? launcherPosition : 'br' });
-    }).catch(() => sendResponse({ position: 'br' }));
+    if (!launcherSender(sender)) {
+      sendResponse({ error: 'Unauthorized launcher message' });
+      return false;
+    }
+    queueLauncher(migrateLauncherPosition)
+      .then((position) => sendResponse({ position }))
+      .catch(() => sendResponse({ error: 'Could not load the Assistant button position.' }));
+    return true;
+  }
+  if (message?.type === 'SET_LAUNCHER_POSITION') {
+    if (!launcherSender(sender)) {
+      sendResponse({ error: 'Unauthorized launcher message' });
+      return false;
+    }
+    queueLauncher(() => setLauncherPosition(message.position, sender.tab.id))
+      .then(sendResponse)
+      .catch(() => sendResponse({ error: 'Could not save the Assistant button position. Try again.' }));
     return true;
   }
   if (!panelSender(sender)) {
@@ -421,7 +482,6 @@ async function route(message) {
     case 'CONFIRM_RESULT': return confirmResult(message);
     case 'UNDO_REQUEST': return requestUndo(requireTab(await targetTab(message.tabId)));
     case 'CAPTURE_TARGET': return captureTarget(requireTab(await targetTab(message.tabId)), message);
-    case 'SET_LAUNCHER_POSITION': return setLauncherPosition(message.position);
     case 'ACTIVATE_TAB': return activateTab(message);
     case 'RESET_SESSION': return resetSession(message.tabId, { clearSnapshots: message.clearSnapshots === true });
     case 'GET_COMMANDS': return { commands: await chrome.commands.getAll() };
@@ -1774,14 +1834,19 @@ async function activateTab(message) {
   };
 }
 
-async function setLauncherPosition(position) {
-  if (!LAUNCHER_POSITIONS.has(position)) return { error: 'Unknown position' };
-  await chrome.storage.local.set({ launcherPosition: position });
-  const tabs = await chrome.tabs.query({});
-  await Promise.all(tabs.filter((tab) => httpUrl(tab.url)).map((tab) => (
-    chrome.tabs.sendMessage(tab.id, { type: 'SET_LAUNCHER_POSITION', position }).catch(() => {})
-  )));
-  return { ok: true };
+async function setLauncherPosition(position, sourceTabId) {
+  if (!isLauncherPosition(position)) return { error: 'Invalid launcher position' };
+  const next = { x: position.x, y: position.y };
+  try {
+    await chrome.storage.local.set({ launcherPosition: next });
+  } catch {
+    return { error: 'Could not save the Assistant button position. Try again.' };
+  }
+  const tabs = await chrome.tabs.query({}).catch(() => []);
+  await Promise.all(tabs
+    .filter((tab) => tab.id !== sourceTabId && Number.isInteger(tab.id) && httpUrl(tab.url))
+    .map((tab) => chrome.tabs.sendMessage(tab.id, { type: 'SET_LAUNCHER_POSITION', position: next }).catch(() => {})));
+  return { ok: true, position: next };
 }
 
 function waitForUrl(tabId, previousDocumentId = null, timeoutMs = 8000) {
@@ -2310,8 +2375,6 @@ async function withPausedRenderer(tab, expectedDocumentId, { prepare = null, res
   }
   return value;
 }
-
-const LAUNCHER_ID = 'accessassist-launcher-host';
 
 async function setLauncherHidden(cdp, hidden) {
   await cdp.send('Runtime.evaluate', {
