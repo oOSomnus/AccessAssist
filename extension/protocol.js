@@ -195,7 +195,7 @@ export function createChoiceSet({ id, question, options, expiresAt = null }) {
 export function formatChoices(choiceSet) {
   if (!choiceSet) return '';
   return choiceSet.options
-    .map((option) => `${option.number} ${option.label}`)
+    .map((option) => `Choice ${option.number}. ${option.label}`)
     .join('. ');
 }
 

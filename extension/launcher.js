@@ -84,7 +84,7 @@
   label.className = 'label';
   label.textContent = 'Assistant';
   button.append(mark, label);
-  button.setAttribute('aria-label', 'Open the AccessAssist voice assistant, shortcut Alt+Z');
+  button.setAttribute('aria-label', 'Open the AccessAssist assistant');
   const status = document.createElement('p');
   status.className = 'sr';
   status.setAttribute('role', 'status');
@@ -93,7 +93,7 @@
     chrome.runtime.sendMessage({ type: 'OPEN_ASSISTANT' }).then((response) => {
       if (response?.error) status.textContent = response.error;
     }).catch(() => {
-      status.textContent = 'Could not open the assistant. Press Alt+Z or use the toolbar button.';
+      status.textContent = 'Could not open the assistant. Use the toolbar button or try again.';
     });
   });
   root.append(style, button, status);

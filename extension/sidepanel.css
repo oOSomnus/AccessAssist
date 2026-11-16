@@ -88,6 +88,8 @@ a:hover { color: var(--accent-hover); }
 
 .bar-heading { display: flex; align-items: center; gap: 8px; min-width: 0; }
 
+#close-panel { margin-left: auto; flex: none; padding: 8px 12px; }
+
 .brand-mark {
   flex: none;
   display: grid;
@@ -271,8 +273,6 @@ main {
   border-top: 1px solid var(--border);
 }
 
-.settings h2 { margin-bottom: 12px; }
-
 #settings > summary {
   min-height: 44px;
   padding: 8px 12px;
@@ -301,7 +301,8 @@ label { display: block; margin-top: 12px; font-weight: 600; }
   border-top: 1px solid var(--border);
 }
 
-#advanced-api > summary {
+#advanced-api > summary,
+#voice-help > summary {
   min-height: 44px;
   padding: 8px 12px;
   border: 1px solid var(--border);
@@ -311,7 +312,8 @@ label { display: block; margin-top: 12px; font-weight: 600; }
   cursor: pointer;
 }
 
-#advanced-api[open] > summary { margin-bottom: 12px; }
+#advanced-api[open] > summary,
+#voice-help[open] > summary { margin-bottom: 12px; }
 #advanced-api > input, #advanced-api > select { margin-top: 8px; }
 
 #save-settings { margin-top: 12px; }
@@ -462,6 +464,7 @@ body.setup-page #ask,
 body.setup-page #composer,
 body.setup-page .settings,
 body.setup-page #open-setup,
+body.setup-page #close-panel,
 body.setup-page #page-line,
 body.setup-page #mode-line { display: none; }
 

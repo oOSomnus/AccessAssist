@@ -20,11 +20,18 @@ function recordAnnouncements() {
       const element = document.getElementById(id);
       if (!element) continue;
       seen.add(id);
-      const record = () => {
-        if (element.textContent) window.__aaAnnouncements.push(element.textContent);
+      const record = (node) => {
+        const text = node?.textContent;
+        if (text) window.__aaAnnouncements.push(text);
       };
-      new MutationObserver(record).observe(element, { childList: true, subtree: true, characterData: true });
-      record();
+      // Each append is one message; ignore removals and never re-read the
+      // accumulated log, which would replay every earlier message.
+      new MutationObserver((records) => {
+        for (const mutation of records) {
+          for (const node of mutation.addedNodes) record(node);
+        }
+      }).observe(element, { childList: true });
+      record(element);
       attached += 1;
     }
     return attached === 2;
@@ -45,16 +52,11 @@ function voiceStubs(options) {
     audioRunning: options.audioRunning !== false,
     autoCue: options.autoCue !== false,
     cueMs: options.cueMs ?? 5,
-    ttsHold: options.ttsHold ?? false,
-    ttsStopSilent: options.ttsStopSilent ?? false,
-    ttsFail: options.ttsFail ?? false,
     holdStart: options.holdStart ?? false,
     holdEnd: options.holdEnd ?? false,
     dropEnd: options.dropEnd ?? false,
     failStart: options.failStart ?? 0,
     echo: options.echo ?? 'all',
-    heldSpeech: [],
-    speechLog: [],
     installCalls: [],
     recognitions: [],
     nativeBusy: false,
@@ -68,8 +70,6 @@ function voiceStubs(options) {
     speechStarts: 0,
     startArgs: [],
     lastTrack: null,
-    stopCalls: 0,
-    spoken: [],
     events: [],
     cueNodes: [],
     tones: [],
@@ -220,13 +220,18 @@ function voiceStubs(options) {
     item.isFinal = final;
     control.recognition?.onresult?.({ results: [item], resultIndex: 0 });
   };
+  control.emitResults = (items) => {
+    const results = items.map(({ transcript, final = true }) => {
+      const item = [{ transcript, confidence: 1 }];
+      item.isFinal = final;
+      return item;
+    });
+    control.recognition?.onresult?.({ results, resultIndex: 0 });
+  };
   control.emitSpeechStart = () => {
     control.speechStarts += 1;
     control.events.push('speechstart');
     control.recognition?.onspeechstart?.();
-  };
-  control.emitSpeechEvent = (index, type) => {
-    control.speechLog[index]?.options?.onEvent?.({ type });
   };
   control.emitNoSpeech = () => {
     const recognition = control.activeRecognition ?? control.recognition;
@@ -300,49 +305,6 @@ function voiceStubs(options) {
       Object.defineProperty(navigator.permissions, 'query', { configurable: true, value: query });
     } catch {}
   }
-  if (globalThis.chrome?.tts) {
-    try {
-      const finishSpeech = (text, speechOptions, type) => {
-        control.events.push(`${type}:${text}`);
-        speechOptions?.onEvent?.({ type, charIndex: String(text).length });
-      };
-      chrome.tts.speak = (text, speechOptions) => {
-        control.spoken.push(String(text));
-        control.events.push(`tts:${text}`);
-        control.speechLog.push({ text: String(text), options: speechOptions });
-        if (control.ttsFail) {
-          queueMicrotask(() => speechOptions?.onEvent?.({ type: 'error' }));
-          return;
-        }
-        if (control.ttsHold) {
-          control.heldSpeech.push({ text: String(text), options: speechOptions });
-          return;
-        }
-        queueMicrotask(() => finishSpeech(String(text), speechOptions, 'end'));
-      };
-      chrome.tts.stop = () => {
-        control.stopCalls += 1;
-        const held = control.heldSpeech.splice(0);
-        if (control.ttsStopSilent) return;
-        for (const { text, options: speechOptions } of held) {
-          queueMicrotask(() => finishSpeech(text, speechOptions, 'interrupted'));
-        }
-      };
-      chrome.tts.getVoices = async () => [];
-    } catch {}
-    control.holdSpeech = () => {
-      control.ttsHold = true;
-    };
-    control.releaseSpeech = () => {
-      control.ttsHold = false;
-      for (const { text, options: speechOptions } of control.heldSpeech.splice(0)) {
-        queueMicrotask(() => {
-          control.events.push(`end:${text}`);
-          speechOptions?.onEvent?.({ type: 'end', charIndex: text.length });
-        });
-      }
-    };
-  }
 }
 
 export async function launch({ voice = null, deviceScaleFactor = 1, locale = 'en-US' } = {}) {
@@ -359,8 +321,7 @@ export async function launch({ voice = null, deviceScaleFactor = 1, locale = 'en
   if (!worker) worker = await context.waitForEvent('serviceworker');
   const extensionId = new URL(worker.url()).host;
   await context.addInitScript(recordAnnouncements);
-  // Status words are spoken in both output modes, so every page that loads the
-  // panel needs a deterministic TTS boundary, not only voice-focused tests.
+  // Every panel page gets the same deterministic microphone and cue stubs.
   await context.addInitScript(voiceStubs, voice ?? {});
   return { context, worker, extensionId, dir };
 }
@@ -378,7 +339,7 @@ async function workerFor(context) {
   return worker;
 }
 
-async function seedPanel(context, { protocol, baseUrl, outputMode, apiKey = 'test-key' }) {
+async function seedPanel(context, { protocol, baseUrl, apiKey = 'test-key' }) {
   const worker = await workerFor(context);
   const config = {
     protocol,
@@ -387,8 +348,8 @@ async function seedPanel(context, { protocol, baseUrl, outputMode, apiKey = 'tes
     anthropicVersion: '2026-10-21',
   };
   const binding = { value: apiKey, origin: new URL(baseUrl).origin, at: Date.now() };
-  await worker.evaluate(async ({ apiConfig, key, mode }) => {
-    const keys = ['apiConfig', 'outputMode', 'launcherPosition'];
+  await worker.evaluate(async ({ apiConfig, key }) => {
+    const keys = ['apiConfig', 'launcherPosition'];
     // Let the worker's own startup defaults settle before replacing them.
     for (let attempt = 0; attempt < 150; attempt += 1) {
       const stored = await chrome.storage.local.get(keys);
@@ -398,29 +359,26 @@ async function seedPanel(context, { protocol, baseUrl, outputMode, apiKey = 'tes
     }
     await chrome.storage.local.set({
       apiConfig,
-      outputMode: mode,
       introSeen: true,
       launcherPosition: 'br',
     });
     await chrome.storage.session.set({ apiKey: key });
-    const stored = await chrome.storage.local.get(['apiConfig', 'outputMode']);
+    const stored = await chrome.storage.local.get(['apiConfig']);
     const session = await chrome.storage.session.get('apiKey');
     if (stored.apiConfig?.baseUrl !== apiConfig.baseUrl || stored.apiConfig?.protocol !== apiConfig.protocol) {
       throw new Error('Stored API configuration did not match the fixture');
     }
-    if (stored.outputMode !== mode) throw new Error('Stored output mode did not match the fixture');
     if (session.apiKey?.origin !== key.origin) throw new Error('Stored key binding did not match the fixture');
-  }, { apiConfig: config, key: binding, mode: outputMode });
+  }, { apiConfig: config, key: binding });
 }
 
 export async function openPanel(context, extensionId, {
   protocol = 'openai',
   baseUrl = `${MOCK_BASE}/v1`,
-  outputMode = 'screen-reader',
   apiKey = 'test-key',
   seed = true,
 } = {}) {
-  if (seed) await seedPanel(context, { protocol, baseUrl, outputMode, apiKey });
+  if (seed) await seedPanel(context, { protocol, baseUrl, apiKey });
   const panel = await context.newPage();
   await panel.goto(`chrome-extension://${extensionId}/sidepanel.html`);
   await panel.waitForSelector('#page-line');
@@ -428,6 +386,14 @@ export async function openPanel(context, extensionId, {
 }
 
 export async function openFirstUsePanel(context, extensionId) {
+  const worker = await workerFor(context);
+  await worker.evaluate(async () => {
+    for (let attempt = 0; attempt < 150; attempt += 1) {
+      const stored = await chrome.storage.local.get('launcherPosition');
+      if (stored.launcherPosition !== undefined) break;
+      await new Promise((resolve) => setTimeout(resolve, 20));
+    }
+  });
   const panel = await context.newPage();
   await panel.goto(`chrome-extension://${extensionId}/sidepanel.html`);
   await panel.waitForSelector('#voice-setup', { state: 'attached' });
@@ -438,8 +404,8 @@ export async function announcements(panel) {
   return panel.evaluate(() => (window.__aaAnnouncements ?? []).join(' '));
 }
 
-export async function spoken(panel) {
-  return panel.evaluate(() => (window.__aaVoice?.spoken ?? []).join(' '));
+export async function announcementEntries(panel) {
+  return panel.evaluate(() => window.__aaAnnouncements ?? []);
 }
 
 export async function voiceState(panel) {
@@ -457,20 +423,16 @@ export async function voiceState(panel) {
       nativeBusy: voice.nativeBusy,
       gumCalls: voice.gumCalls,
       tracksStopped: voice.tracksStopped,
-      spoken: voice.spoken,
       events: voice.events,
       active: Boolean(voice.recognition?.active),
       processLocally: voice.recognition?.processLocally,
       permission: voice.permission,
       speechStarts: voice.speechStarts,
       tones: voice.tones,
-      stopCalls: voice.stopCalls,
-      heldSpeech: voice.heldSpeech.length,
       activeElement: document.activeElement?.id || document.activeElement?.tagName || null,
       startTrackKinds: voice.startArgs.map((track) => track?.kind ?? null),
       lastEcho: voice.lastTrack?.getSettings?.().echoCancellation ?? null,
       gumOptions: voice.gumOptions,
-      speechLog: voice.speechLog.map((entry) => entry.text),
     };
   });
 }
@@ -479,16 +441,16 @@ export async function emitFinal(panel, text) {
   await panel.evaluate((value) => window.__aaVoice.emit(value), text);
 }
 
+export async function emitResults(panel, items) {
+  await panel.evaluate((value) => window.__aaVoice.emitResults(value), items);
+}
+
 export async function emitInterim(panel, text) {
   await panel.evaluate((value) => window.__aaVoice.emit(value, { final: false }), text);
 }
 
 export async function emitSpeechStart(panel) {
   await panel.evaluate(() => window.__aaVoice.emitSpeechStart());
-}
-
-export async function emitSpeechEvent(panel, index, type) {
-  await panel.evaluate(({ at, kind }) => window.__aaVoice.emitSpeechEvent(at, kind), { at: index, kind: type });
 }
 
 export async function emitNoSpeech(panel) {
@@ -509,14 +471,6 @@ export async function emitEnd(panel) {
 
 export async function emitVoiceError(panel, error) {
   await panel.evaluate((value) => window.__aaVoice.emitError(value), error);
-}
-
-export async function holdSpeech(panel) {
-  await panel.evaluate(() => window.__aaVoice.holdSpeech());
-}
-
-export async function releaseSpeech(panel) {
-  await panel.evaluate(() => window.__aaVoice.releaseSpeech());
 }
 
 export async function endCue(panel) {

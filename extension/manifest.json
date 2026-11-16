@@ -7,7 +7,7 @@
   "background": { "service_worker": "background.js", "type": "module" },
   "side_panel": { "default_path": "sidepanel.html" },
   "action": { "default_title": "Open AccessAssist voice assistant" },
-  "permissions": ["sidePanel", "scripting", "storage", "tts", "debugger", "webNavigation"],
+  "permissions": ["sidePanel", "scripting", "storage", "debugger", "webNavigation"],
   "host_permissions": ["http://*/*", "https://*/*"],
   "content_scripts": [{
     "matches": ["http://*/*", "https://*/*"],
@@ -17,15 +17,18 @@
   }],
   "commands": {
     "open-assistant": {
-      "suggested_key": { "default": "Alt+Z" },
-      "description": "Open the assistant, interrupt speech, and listen to one command"
+      "suggested_key": { "default": "Ctrl+Shift+Space", "mac": "MacCtrl+Shift+Space" },
+      "description": "Open or focus the assistant without listening"
     },
-    "start-typing": {
-      "suggested_key": { "default": "Alt+Shift+Y" },
-      "description": "Open the assistant and start typing"
+    "listen-once": {
+      "suggested_key": { "default": "Ctrl+Shift+Y", "mac": "MacCtrl+Shift+Y" },
+      "description": "Listen once for a voice command"
+    },
+    "close-assistant": {
+      "suggested_key": { "default": "Ctrl+Shift+Period", "mac": "MacCtrl+Shift+Period" },
+      "description": "Close the AccessAssist side panel"
     },
     "replay-introduction": {
-      "suggested_key": { "default": "Alt+Shift+H" },
       "description": "Replay the AccessAssist introduction"
     }
   }

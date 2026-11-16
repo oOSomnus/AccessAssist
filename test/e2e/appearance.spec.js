@@ -30,6 +30,19 @@ test('appearance: conversation scroll keeps the composer reachable', async ({}, 
     const panel = await openPanel(context, extensionId);
     await panel.setViewportSize({ width: 391, height: 904 });
     await expect(panel.locator('.conversation-empty')).toBeVisible();
+    await expect(panel.locator('.conversation-empty')).toHaveText('Ask about this page, an image, or a task.');
+    await expect(panel.locator('#settings')).not.toHaveJSProperty('open', true);
+    await expect(panel.locator('#voice-help')).not.toHaveJSProperty('open', true);
+    await expect(panel.locator('#close-panel')).toHaveCount(1);
+    await expect(panel.locator('#close-panel')).toHaveAccessibleName('Close panel');
+    await expect(panel.locator('#close-panel')).toHaveText('Close');
+    await expect(panel.locator('#composer-hint')).toHaveText('Control or Command plus Enter sends.');
+    await expect(panel.locator('#pause')).toHaveText('3 Stop listening');
+    expect(await panel.evaluate(() => {
+      const ask = document.getElementById('ask');
+      const conversation = document.getElementById('conversation');
+      return Boolean(ask.compareDocumentPosition(conversation) & Node.DOCUMENT_POSITION_FOLLOWING);
+    })).toBe(true);
     await attachScreenshot(panel, testInfo, 'conversation-empty-391x904');
 
     await panel.locator('#message').fill('UI layout sample');
@@ -187,10 +200,15 @@ test('appearance: narrow source consent preserves complete origins and keyboard 
     await panel.locator('#message').press('Control+Enter');
     await expect(panel.locator('#ask-sites')).toBeVisible({ timeout: 30_000 });
     await expect(panel.locator('#ask-sites li')).toHaveCount(2);
-    await expect(panel.locator('#ask-sites li').first()).toHaveText('http://127.0.0.1:4173');
-    await expect(panel.locator('#ask-sites li').nth(1)).toHaveText(longOrigin);
+    await expect(panel.locator('#ask-sites li').first().locator('span[aria-hidden="true"]'))
+      .toHaveText('http://127.0.0.1:4173');
+    await expect(panel.locator('#ask-sites li').nth(1).locator('span[aria-hidden="true"]'))
+      .toHaveText(longOrigin);
     await expect(panel.locator('#ask-question')).toContainText('Allow these sources');
     await expect(panel.locator('#ask-options button')).toHaveCount(3);
+    // An asynchronous question is announced but does not move the user's focus.
+    await expect(panel.locator('#ask-options button').first()).not.toBeFocused();
+    await panel.locator('#ask-options button').first().focus();
     await expect(panel.locator('#ask-options button').first()).toBeFocused();
     expect(await panel.locator('#ask-options button').allTextContents())
       .toEqual(['1 Allow listed sites', '2 Current site only', '3 Cancel']);
@@ -203,7 +221,8 @@ test('appearance: narrow source consent preserves complete origins and keyboard 
       { width: 160, height: 640 },
     ]) {
       await panel.setViewportSize(size);
-      await expect(panel.locator('#ask-sites li').nth(1)).toHaveText(longOrigin);
+      await expect(panel.locator('#ask-sites li').nth(1).locator('span[aria-hidden="true"]'))
+        .toHaveText(longOrigin);
       const check = await panel.evaluate(() => {
         const sites = [...document.querySelectorAll('#ask-sites li')];
         const siteList = document.getElementById('ask-sites');
@@ -213,7 +232,7 @@ test('appearance: narrow source consent preserves complete origins and keyboard 
           scrollWidth: document.documentElement.scrollWidth,
           siteListOverflow: siteList.scrollWidth - siteList.clientWidth,
           sites: sites.map((site) => ({
-            text: site.textContent,
+            text: site.querySelector('span[aria-hidden="true"]')?.textContent ?? site.textContent,
             overflow: site.scrollWidth - site.clientWidth,
             textOverflow: getComputedStyle(site).textOverflow,
           })),
@@ -303,7 +322,10 @@ test('appearance: setup and launcher remain usable across display modes', async 
     await setup.goto(`chrome-extension://${extensionId}/sidepanel.html?setup=1`);
     await expect(setup.locator('body')).toHaveClass(/setup-page/);
     await expect(setup.locator('#composer')).toBeHidden();
-    await expect(setup.locator('.settings')).toBeHidden();
+    await expect(setup.locator('#settings')).toBeHidden();
+    await expect(setup.locator('#voice-help')).not.toHaveJSProperty('open', true);
+    await expect(setup.locator('#close-panel')).toBeHidden();
+    await expect(setup.locator('[data-number-scope="output"]')).toHaveCount(0);
     await expect(setup.locator('#start-using')).toBeVisible();
     await expect(setup.locator('#start-using')).toHaveText('1 Prepare voice');
     await expect(setup.locator('#return-assistant')).toBeHidden();
@@ -407,7 +429,7 @@ test('appearance: setup and launcher remain usable across display modes', async 
       document.getElementById('accessassist-launcher-host')?.shadowRoot?.querySelector('button'),
     ))).toBe(true);
     const launcher = page.locator('#accessassist-launcher-host button');
-    await expect(launcher).toHaveAccessibleName(/Alt\+Z/);
+    await expect(launcher).toHaveAccessibleName(/AccessAssist assistant/);
     const box = await launcher.boundingBox();
     expect(box.width).toBeGreaterThanOrEqual(56);
     expect(box.height).toBeGreaterThanOrEqual(56);

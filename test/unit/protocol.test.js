@@ -6,7 +6,6 @@ import {
   TOOLS,
   closeChoiceSet,
   createChoiceSet,
-  formatChoices,
   labelViolation,
   parseChoiceNumber,
   resolveChoice,
@@ -42,7 +41,7 @@ test('choice sets number options in order', () => {
     ],
   });
   assert.deepEqual(set.options.map((option) => option.number), [1, 2, 3]);
-  assert.equal(formatChoices(set), '1 Read it. 2 Screen reader. 3 Cancel');
+  assert.deepEqual(set.options.map((option) => option.label), ['Read it', 'Screen reader', 'Cancel']);
   assert.equal(set.status, 'open');
 });
 

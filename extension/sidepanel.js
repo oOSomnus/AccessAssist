@@ -1,7 +1,7 @@
 import { normalizeConfig, requestTurn } from './ai.js';
 import { closeChoiceSet, createChoiceSet, formatChoices, parseChoiceNumber, resolveChoice } from './protocol.js';
 import { keyBinding, keyForBinding, configFingerprint, configOrigin, DEFAULT_API_CONFIG, grantUpload, needsUpload, uploadConsentFor } from './settings.js';
-import { Speech } from './speech.js';
+import { Speech, spokenSites } from './speech.js';
 import { detectPlatform, guideFor } from './screen-reader-guide.js';
 
 const $ = (id) => document.getElementById(id);
@@ -9,23 +9,53 @@ const uid = () => crypto.randomUUID();
 const SETUP_PAGE = location.search.includes('setup=1');
 const START_ACTIVATION_TIMEOUT_MS = 10_000;
 
-const INTRO_TEXT = [
-  'Hi, I am AccessAssist. I can read pages, describe images, and operate pages for you.',
-  'I only navigate by default and ask before changing anything.',
-  'Press Alt+Z to open me and speak one command. I listen only when you press Alt+Z, and I do not start listening again after an answer.',
-  'Press Alt+Shift+Y to start typing.',
-  'Voice needs microphone access and a one-time English speech pack. Press Alt+Z to prepare it; Chrome asks once for the microphone.',
-  'Hear "Listening", then say your command. I say "working" before I start. Choices are numbered: say one, two, or press a number key.',
-  'You can say help, repeat choices, cancel, or undo at any time.',
-  'Speech is recognized on this device. Spoken commands and page content you allow are sent only to the AI service you configure.',
-].join('');
+function openSentence() {
+  const shortcut = shortcutFor('open-assistant');
+  return shortcut
+    ? `Press ${spokenShortcut(shortcut)} to open or focus me`
+    : 'Use the Assistant button or the toolbar action to open me';
+}
 
-const HELP_TEXT = [
-  'You can ask what this page is about, have me read a section, or ask me to operate the page.',
-  'When there are choices, say one or press a number key; in the message box numbers only type text, and Control plus Enter sends.',
-  'Press Alt+Z to interrupt speech and start one new command; I listen only then. Press Alt+Shift+Y to type.',
-  'Say cancel to drop the current question, or undo to undo your last change.',
-];
+function listenAction() {
+  const shortcut = shortcutFor('listen-once');
+  return shortcut ? `Press ${spokenShortcut(shortcut)}` : 'Choose Listen';
+}
+
+function listenSentence() {
+  return `${listenAction()} to listen`;
+}
+
+function closeSentence() {
+  const shortcut = shortcutFor('close-assistant');
+  return shortcut
+    ? `Press ${spokenShortcut(shortcut)} to close me`
+    : 'Choose Close panel to close me';
+}
+
+function introText() {
+  return [
+    'Hi, I am AccessAssist. I can read pages, describe images, and operate pages for you.',
+    'I only navigate by default and ask before changing anything.',
+    `${openSentence()}. It never starts listening.`,
+    `${listenSentence()} for one command. I listen once and do not start again after an answer.`,
+    `${closeSentence()}.`,
+    'Voice needs microphone access and a one-time English speech pack. Choose Prepare voice to set it up; Chrome asks once for the microphone.',
+    'A double tone means the microphone is ready; say your command. I say "working" before I start. Choices are numbered: say one, two, or press Control plus Shift plus a number key.',
+    'You can say help, repeat choices, cancel, or undo at any time.',
+    'Speech is recognized on this device. Spoken commands and page content you allow are sent only to the AI service you configure.',
+    replaySentence(),
+  ].join(' ');
+}
+
+function helpText() {
+  return [
+    'You can ask what this page is about, have me read a section, or ask me to operate the page.',
+    'When there are choices, say one or press Control plus Shift plus a number key. In the message box numbers only type text, and Control plus Enter sends.',
+    `${listenSentence()} for one new command; I listen only then.`,
+    'Say cancel to drop the current question, or undo to undo your last change.',
+    replaySentence(),
+  ].join(' ');
+}
 
 const SYSTEM_PROMPT = [
   'You are AccessAssist, an English-language web assistant for blind users.',
@@ -51,7 +81,6 @@ const SYSTEM_PROMPT = [
 const state = {
   tab: null,
   mode: 'voice',
-  speechOutput: 'tts',
   voiceReady: false,
   voiceRetry: false,
   micState: 'unknown',
@@ -91,6 +120,7 @@ const state = {
   consumedIntents: new Set(),
   requestedIntents: new Set(),
   choiceTrigger: null,
+  deferChoiceFocus: false,
   setupTabId: null,
   setupWindowId: null,
   turnEpoch: 0,
@@ -110,7 +140,15 @@ function shortcutFor(name) {
 }
 
 function spokenShortcut(value) {
-  return String(value ?? '').split('+').map((part) => part.trim()).filter(Boolean).join(' plus ');
+  const words = {
+    macctrl: 'Control', ctrl: 'Control', control: 'Control', '⌃': 'Control',
+    shift: 'Shift', '⇧': 'Shift',
+    command: 'Command', cmd: 'Command', '⌘': 'Command',
+    alt: 'Alt', option: 'Option', '⌥': 'Option',
+    '.': 'period', period: 'period',
+  };
+  return String(value ?? '').split('+').map((part) => part.trim()).filter(Boolean)
+    .map((part) => words[part.toLowerCase()] ?? part).join(' plus ');
 }
 
 function replaySentence() {
@@ -120,14 +158,10 @@ function replaySentence() {
     : 'Use Replay introduction in Settings to hear the introduction again.';
 }
 
-function introText() {
-  return `${INTRO_TEXT} ${replaySentence()}`;
-}
-
 function updateModeLine() {
   const input = state.mode === 'voice' ? 'voice' : 'typing';
-  const suffix = state.voiceReady ? ', voice ready' : '';
-  $('mode-line').textContent = `Guide mode; input: ${input}${suffix}`;
+  $('mode-line').textContent = `Guide mode; input: ${input}`;
+  $('listen').textContent = state.voiceReady ? '2 Listen' : '2 Prepare voice';
 }
 
 function setVoiceStatus(text) {
@@ -156,7 +190,7 @@ async function send(type, payload = {}) {
 }
 
 // Cancels the current listening session, playback cue, and the single-use
-// Alt+Z authorization. Any older async continuation becomes stale.
+// listen authorization. Any older async continuation becomes stale.
 function cancelVoice() {
   state.voiceGeneration += 1;
   state.listenRequest = null;
@@ -168,7 +202,7 @@ function cancelVoice() {
 }
 
 // The utterance was delivered (or the session ended); no further listening is
-// authorized until another Alt+Z intent is claimed.
+// authorized until another listen intent or button request is claimed.
 function consumeListen() {
   state.listenRequest = null;
   state.entrySeq += 1;
@@ -182,10 +216,9 @@ let initialTabBind = Promise.resolve();
 
 // Preempts only output ownership: it never consumes a ChoiceSet, clears the
 // draft, or resets history.
-function interruptOutput({ stopSpeech = true } = {}) {
+function interruptOutput() {
   sayToken += 1;
   state.sayPending = false;
-  if (stopSpeech) speech.stopSpeaking('user');
   speech.cancelCue();
   syncWorking();
 }
@@ -195,6 +228,8 @@ function syncWorking() {
   $('transcript').setAttribute('aria-busy', state.busy ? 'true' : 'false');
   speech.setWorking(
     state.ready
+    && !state.listening
+    && !speech.listening
     && state.busy
     && !state.choice
     && !state.pendingInput
@@ -205,25 +240,26 @@ function syncWorking() {
   );
 }
 
-async function say(text, { alert = false, forceSpeech = false } = {}) {
+async function say(text, { alert = false } = {}) {
   const token = ++sayToken;
   state.sayPending = true;
   syncWorking();
-  const outcome = await speech.announce(text, { alert, forceSpeech });
+  const outcome = await speech.announce(text, { alert });
   const current = token === sayToken;
   if (current) {
     state.sayPending = false;
     syncWorking();
   }
   return {
-    completed: current && outcome.spoken,
+    delivered: current && outcome.delivered === true,
     interrupted: !current || outcome.interrupted === true,
     reason: outcome.reason ?? null,
   };
 }
 
-// One Alt+Z authorizes exactly one microphone session. Only the entry
-// controller calls this, and every await above it is re-validated here.
+// One listen request authorizes exactly one microphone session. Only the entry
+// controller and the ready Listen action call this, and every await above it
+// is re-validated here.
 async function listenOnce(requestId, seq) {
   if (!state.ready || SETUP_PAGE) return false;
   if (state.listenRequest !== requestId || state.entrySeq !== seq) return false;
@@ -232,34 +268,82 @@ async function listenOnce(requestId, seq) {
   if (!state.apiKey) return false;
   if (state.listening) return false;
   const choiceSetId = state.choice?.set?.id ?? null;
+  // Every callback carries the authorization it was created under; a stale
+  // event must not read back, consume, or answer a newer request.
+  const owned = () => state.listenRequest === requestId && state.entrySeq === seq;
+  const usableNow = () => state.ready && !SETUP_PAGE && document.visibilityState === 'visible'
+    && state.mode === 'voice' && state.voiceReady && state.apiKey;
   const task = (async () => {
     try {
+      // Keep the activation-gated resume request ahead of every await; the
+      // spoken prompt must still finish before the microphone opens.
+      const audioReady = speech.resumeAudio();
+      const prompt = await say('Listening.');
+      if (!owned()) return;
+      if (!usableNow() || prompt.interrupted) {
+        consumeListen();
+        return;
+      }
+      if (!prompt.delivered) {
+        throw Object.assign(
+          new Error('The Listening prompt could not be delivered.'),
+          { code: 'listening-prompt' },
+        );
+      }
+      if (!(await audioReady)) {
+        throw Object.assign(new Error('Audio output is not running.'), { code: 'listening' });
+      }
+      if (!owned()) return;
+      if (!usableNow()) {
+        consumeListen();
+        return;
+      }
       await speech.startListening({
-        onReady: (info) => {
-          if (state.listenRequest !== requestId || state.entrySeq !== seq) return;
-          const message = info?.cuePlayed === false
-            ? 'Listening. Speak now. The start sound is unavailable.'
-            : 'Listening. Speak now.';
-          $('mode-line').textContent = message;
-          speech.writeStatus(message);
+        onReady: () => {
+          if (!owned()) return;
+          $('mode-line').textContent = 'Listening. Speak now.';
           syncWorking();
         },
-        onResult: (text, info) => { void onVoiceResult(text, info, choiceSetId); },
-        onError: (error) => { void onVoiceError(error); },
-        onEnd: (info) => { void onVoiceEnd(info); },
+        onResult: (text, info) => {
+          if (!owned()) return;
+          consumeListen();
+          void onVoiceResult(text, info, choiceSetId);
+        },
+        onError: (error) => {
+          if (!owned()) return;
+          consumeListen();
+          void onVoiceError(error);
+        },
+        onEnd: (info) => {
+          if (!owned()) return;
+          consumeListen();
+          void onVoiceEnd(info);
+        },
       });
     } catch (error) {
-      if (state.listenRequest !== requestId || state.entrySeq !== seq) return;
+      if (!owned()) return;
       consumeListen();
-      state.voiceReady = false;
-      state.voiceRetry = true;
-      updateModeLine();
-      updateVoiceSetup({ local: speech.localStatus, mic: state.micState, ready: false });
+      // A prepared pack stays usable after a device or cue failure; only a
+      // recognition capability failure needs preparation again.
+      const transient = ['audio-capture', 'mic', 'listening', 'listening-prompt', 'start', 'start-timeout']
+        .includes(error?.code);
+      if (!transient) {
+        state.voiceReady = false;
+        state.voiceRetry = true;
+        if (error?.code === 'not-allowed' || error?.code === 'service-not-allowed') {
+          state.micState = 'denied';
+          state.micDenied = true;
+        }
+        updateVoiceSetup({ local: speech.localStatus, mic: state.micState, ready: false });
+        focusVoiceSetup();
+      }
       await speech.play('fail');
       await say(voiceStartError(error), { alert: true });
-      focusVoiceSetup();
+      updateModeLine();
+      syncWorking();
     } finally {
       if (state.listening === task) state.listening = null;
+      syncWorking();
     }
   })();
   state.listening = task;
@@ -268,7 +352,6 @@ async function listenOnce(requestId, seq) {
 }
 
 async function onVoiceResult(text, info, choiceSetId) {
-  consumeListen();
   if (state.choice && choiceSetId !== state.choice.set.id) {
     speech.writeStatus('The question changed. Please choose again.');
     return;
@@ -276,15 +359,18 @@ async function onVoiceResult(text, info, choiceSetId) {
   if (!state.choice && choiceSetId) return;
   const generation = state.voiceGeneration;
   const epoch = state.epoch;
-  const readback = await say(`I heard: ${text}`, { forceSpeech: true });
+  // Automatic follow-up must not move focus away while the confirmation is
+  // being spoken; a real user action clears this flag.
+  state.deferChoiceFocus = true;
+  const readback = await say(`I heard: ${text}`);
   const unchanged = generation === state.voiceGeneration
     && epoch === state.epoch
     && (state.choice?.set.id ?? null) === choiceSetId;
   if (!unchanged) return;
-  if (!readback.completed) {
+  if (!readback.delivered) {
     if (!readback.interrupted) {
       speech.writeStatus(
-        'Your spoken input was not used because its readback could not finish. Check speech output, then press Alt+Z or type instead.',
+        `Your spoken input was not used because its readback could not finish. Check that your screen reader is working. ${listenAction()} to try again, or type instead.`,
         true,
       );
     }
@@ -298,10 +384,11 @@ async function onVoiceResult(text, info, choiceSetId) {
 }
 
 function onVoiceEnd(info) {
-  consumeListen();
   if (info.reason === 'final' || info.reason === 'cancelled' || info.reason === 'error') return;
   updateModeLine();
-  speech.writeStatus('Press Alt+Z to listen.');
+  if (info.reason === 'no-speech') speech.writeStatus('No speech was heard.');
+  else if (info.reason === 'timeout') speech.writeStatus('Listening timed out. Choose Listen to try again.');
+  else speech.writeStatus('Listening ended.');
   syncWorking();
 }
 
@@ -313,7 +400,7 @@ async function onVoiceError(error) {
     state.micState = 'denied';
     updateModeLine();
     updateVoiceSetup({ local: speech.localStatus, mic: 'denied', ready: false });
-    await say('Microphone permission was denied. Allow it in Chrome and system settings, then press Alt+Z to try again.', { alert: true });
+    await say(`Microphone permission was denied. Allow it in Chrome and system settings. ${listenAction()} to try again.`, { alert: true });
     focusVoiceSetup();
     return;
   }
@@ -322,7 +409,7 @@ async function onVoiceError(error) {
     state.voiceReady = false;
     state.voiceRetry = true;
     updateVoiceSetup({ local: speech.localStatus, mic: state.micState, ready: false });
-    await say('No microphone is available. Connect one, then press Alt+Z to try again.', { alert: true });
+    await say(`No microphone is available. Connect one. ${listenAction()} to try again.`, { alert: true });
   } else if (error === 'language-not-supported') {
     state.voiceReady = false;
     state.voiceRetry = true;
@@ -332,7 +419,7 @@ async function onVoiceError(error) {
     state.voiceReady = false;
     state.voiceRetry = true;
     updateVoiceSetup({ local: speech.localStatus, mic: state.micState, ready: false });
-    await say(`Speech recognition stopped: ${error}. Press Alt+Z to try again, or type instead.`, { alert: true });
+    await say(`Speech recognition stopped: ${error}. ${listenAction()} to try again, or type instead.`, { alert: true });
   }
   updateModeLine();
 }
@@ -345,11 +432,20 @@ function voiceStartError(error) {
     case 'unavailable':
     case 'install':
       return 'The English speech pack is not ready yet. Choose Retry, or type instead.';
+    case 'audio-capture':
+      return 'System audio cancellation is unavailable for this recording. Speech did not start. You can type instead.';
+    case 'unsupported-input':
+      return 'This system cannot isolate the microphone for local recognition. You can type instead.';
+    case 'not-allowed':
+    case 'service-not-allowed':
+      return `Microphone permission was denied. Allow it in Chrome and system settings. ${listenAction()} to try again.`;
     case 'listening':
-      return 'Listening did not start because its spoken prompt could not finish. Check the speech output, then press Alt+Z.';
+      return `Listening did not start because its start sound could not play. Check the system sound. Activate Listen in the panel to enable sound, then try the shortcut again. ${listenAction()} to try again.`;
+    case 'listening-prompt':
+      return `Listening did not start because its prompt could not be delivered. Check that your screen reader is working. ${listenAction()} to try again.`;
     case 'start':
     case 'start-timeout':
-      return 'Chrome could not start speech recognition. Press Alt+Z to try again, or type instead.';
+      return `Chrome could not start speech recognition. ${listenAction()} to try again, or type instead.`;
     default:
       return `Voice unavailable: ${error?.message ?? 'try again'}`;
   }
@@ -358,11 +454,11 @@ function voiceStartError(error) {
 function voiceBlockedMessage({ local, mic }) {
   if (local === 'unavailable') return 'Local speech recognition is not available in this Chrome. You can type instead.';
   if (local === 'error') return 'Chrome could not check the English speech pack. Choose Retry, or type instead.';
-  if (mic === 'denied') return 'Microphone access is denied. Allow it in Chrome and system settings, then press Alt+Z to try again.';
+  if (mic === 'denied') return `Microphone access is denied. Allow it in Chrome and system settings. ${listenAction()} to try again.`;
   if (local === 'available' && mic === 'granted') {
-    return 'Press Alt+Z to listen, or type instead.';
+    return `${listenSentence()}, or type instead.`;
   }
-  return 'Microphone access is required before voice can start. Press Alt+Z or choose Prepare voice and allow Chrome to use the microphone.';
+  return 'Microphone access is required before voice can start. Choose Prepare voice and allow Chrome to use the microphone.';
 }
 
 function updateVoiceSetup({ local, mic, ready, preparing = Boolean(state.preparing) }) {
@@ -373,7 +469,7 @@ function updateVoiceSetup({ local, mic, ready, preparing = Boolean(state.prepari
     section.hidden = false;
     $('return-assistant').hidden = !ready;
     // Keep the preparation entry visible whenever it is not already running,
-    // so a first-time user can start the pack download without Alt+Z.
+    // so a first-time user can start the pack download without a shortcut.
     $('start-using').hidden = ready || preparing || local === 'downloading';
     $('start-using').textContent = retry ? '1 Retry' : '1 Prepare voice';
     if (ready) setVoiceStatus('Microphone access is granted. Speech is ready on this device.');
@@ -394,7 +490,7 @@ function updateVoiceSetup({ local, mic, ready, preparing = Boolean(state.prepari
   }
   section.hidden = false;
   $('return-assistant').hidden = true;
-  $('start-using').hidden = downloading && !retry;
+  $('start-using').hidden = (preparing || local === 'downloading') && !retry;
   $('start-using').textContent = retry ? '1 Retry' : '1 Prepare voice';
   if (local === 'unavailable') {
     setVoiceStatus('This Chrome cannot recognize speech on this device. Choose Retry after enabling local speech, or type instead.');
@@ -405,15 +501,15 @@ function updateVoiceSetup({ local, mic, ready, preparing = Boolean(state.prepari
   } else if (preparing) {
     setVoiceStatus('Chrome is preparing the English speech pack and will ask for the microphone. You can type while it finishes.');
   } else if (local === 'downloadable' || local === 'downloading') {
-    setVoiceStatus('The English speech pack is not ready. Choose Prepare voice, or press Alt+Z.');
+    setVoiceStatus('The English speech pack is not ready. Choose Prepare voice to start.');
   } else if (mic === 'granted') {
     setVoiceStatus(retry
-      ? 'Voice is not ready. Press Alt+Z or choose Retry to try again, or type instead.'
-      : 'Speech is ready. Press Alt+Z to listen.');
+      ? 'Voice is not ready. Choose Retry to try again, or type instead.'
+      : `Speech is ready. ${listenSentence()}.`);
   } else {
     setVoiceStatus(retry
-      ? 'Voice is not ready. Choose Retry or press Alt+Z to try again, or type instead.'
-      : 'Voice needs microphone permission. Choose Prepare voice or press Alt+Z to start.');
+      ? 'Voice is not ready. Choose Retry to try again, or type instead.'
+      : 'Voice needs microphone permission. Choose Prepare voice to start.');
   }
 }
 
@@ -441,7 +537,7 @@ async function refreshVoiceStatus() {
   speech.localAvailable = local === 'available';
   state.micState = mic;
   // Capability alone decides readiness; a session failure is retried by the
-  // next Alt+Z instead of locking voice until a reload.
+  // next listen request instead of locking voice until a reload.
   const ready = local === 'available' && mic === 'granted';
   state.voiceReady = ready;
   if (ready) state.voiceRetry = false;
@@ -551,7 +647,6 @@ async function stopPreparation({ generation, message, local, mic }) {
   state.voiceRetry = true;
   updateVoiceSetup({ local, mic, ready: false, preparing: false });
   setVoiceStatus(message);
-  await say(message, { alert: true });
   focusVoiceSetup();
   return false;
 }
@@ -658,7 +753,7 @@ async function finishPreparation({ generation, install, local, microphone, waitT
         if (generation !== state.voiceGeneration) return false;
         const message = opened
           ? 'Chrome needs microphone permission. I opened a setup tab. Allow the microphone there and continue.'
-          : 'Chrome needs microphone permission, but the setup tab could not be opened. Open a web page, then press Alt+Z.';
+          : 'Chrome needs microphone permission, but the setup tab could not be opened. Open a web page, then open the assistant again.';
         return stopPreparation({ generation, message, local: speech.localStatus, mic: 'prompt' });
       }
     }
@@ -735,18 +830,27 @@ function enterVoice() {
   syncWorking();
 }
 
-// Retry and the numbered Prepare button prepare only; they never create
-// dictation authorization.
+// An unready Listen/Prepare button only prepares. A ready Listen button
+// creates its own single-use authorization after the last await.
 async function requestVoice() {
   cancelVoice();
   interruptOutput();
   if (!state.ready) return false;
+  if (state.voiceReady) {
+    if (!(await apiReady())) return false;
+    enterVoice();
+    if (state.busy && !state.choice) preemptTurn();
+    const seq = ++state.entrySeq;
+    state.listenRequest = uid();
+    await listenOnce(state.listenRequest, seq);
+    return true;
+  }
   const prepared = await prepareVoice({ force: true });
   if (!prepared) return false;
   // Missing API key switches to typing and already explains what to paste.
   if (state.mode !== 'voice') return true;
   enterVoice();
-  await say('Voice ready. Press Alt+Z to listen.');
+  await say(`Voice ready. ${listenSentence()}.`);
   return true;
 }
 
@@ -772,14 +876,55 @@ async function openSetupTab() {
   }
 }
 
+function choiceKeyboardHint() {
+  const base = 'Press Control plus Shift plus a number to choose';
+  if (document.hasFocus()) return `${base}, or choose Listen to answer by voice. Press Escape to cancel.`;
+  const cycle = detectPlatform() === 'narrator'
+    ? 'Press F6 or Shift plus F6 to cycle regions'
+    : detectPlatform() === 'voiceover'
+      ? 'Press Command plus Option plus Up or Down Arrow to cycle Chrome regions'
+      : 'Use your browser region navigation to reach the assistant';
+  return `${base} once the assistant has keyboard focus. ${cycle}, then Tab into the assistant. Press Escape to cancel.`;
+}
+
+// Programmatic focus is safe only when the user is not typing or changing
+// settings and no voice recovery button needs the keyboard.
+function choiceFocusAllowed() {
+  if (state.deferChoiceFocus || !document.hasFocus()) return false;
+  const active = document.activeElement;
+  if (active instanceof HTMLElement && (
+    active.matches('textarea, select, input, [contenteditable="true"]')
+    || active.isContentEditable
+    || $('settings').contains(active)
+  )) return false;
+  return !(!$('voice-setup').hidden && usableNumberTarget($('start-using')));
+}
+
+function focusChoiceOption() {
+  if (!state.choice || $('ask').hidden || !choiceFocusAllowed()) return false;
+  const first = $('ask-options').querySelector('button');
+  if (!(first instanceof HTMLElement)) return false;
+  first.focus();
+  return true;
+}
+
 function showChoice(set, sourceSites = []) {
   $('ask').hidden = false;
   $('ask-question').textContent = set.question;
+  $('choice-shortcut-hint').textContent = choiceKeyboardHint();
   const sites = $('ask-sites');
   sites.replaceChildren();
   for (const origin of sourceSites) {
     const item = document.createElement('li');
-    item.textContent = origin;
+    // The full origin stays visible and copyable; the screen reader hears the
+    // same spoken projection used by the automatic announcement.
+    const full = document.createElement('span');
+    full.textContent = origin;
+    full.setAttribute('aria-hidden', 'true');
+    const spoken = document.createElement('span');
+    spoken.className = 'visually-hidden';
+    spoken.textContent = spokenSites([origin])[0] ?? origin;
+    item.append(full, spoken);
     sites.append(item);
   }
   sites.hidden = sourceSites.length === 0;
@@ -800,7 +945,6 @@ function showChoice(set, sourceSites = []) {
     button.addEventListener('click', () => selectOption(set.id, String(option.number)));
     container.append(button);
   }
-  container.querySelector('button')?.focus();
 }
 
 function hideChoice() {
@@ -814,7 +958,7 @@ function hideChoice() {
   $('ask-options').replaceChildren();
   const trigger = state.choiceTrigger;
   state.choiceTrigger = null;
-  if (restore && trigger?.isConnected) trigger.focus();
+  if (restore && trigger?.isConnected && !state.deferChoiceFocus) trigger.focus();
 }
 
 // Number keys act within the nearest data-number-scope group. Without one,
@@ -857,27 +1001,46 @@ function defaultNumberScope(key) {
   return null;
 }
 
+const PURE_MODIFIER_KEYS = new Set(['Shift', 'Control', 'Alt', 'Meta', 'AltGraph', 'CapsLock', 'OS']);
+
 function handleNumberShortcut(event) {
+  // Captured before clearing: the first valid number after a readback may
+  // still be aimed at the old composer group while the answer is the choice.
+  const deferred = state.deferChoiceFocus;
+  if (!PURE_MODIFIER_KEYS.has(event.key)) state.deferChoiceFocus = false;
   if (event.defaultPrevented || event.repeat || event.isComposing) return;
-  if (event.ctrlKey || event.metaKey || event.altKey || event.shiftKey) return;
-  if (!/^[1-9]$/u.test(event.key)) return;
+  // Only the explicit master combination is ours. Bare digits keep every
+  // native screen-reader and text-editing behavior.
+  if (!event.ctrlKey || !event.shiftKey || event.altKey || event.metaKey) return;
+  // event.key turns into !, @, ... while Shift is held; the physical code
+  // still names the top-row digit. Numpad stays native.
+  const match = /^Digit([1-9])$/u.exec(event.code ?? '');
+  if (!match) return;
+  const key = match[1];
   const target = event.target;
-  if (target instanceof HTMLElement) {
-    // Native selects keep their own type-ahead, and form controls that accept
-    // text keep the digit as typed input.
-    if (target.matches('select, textarea, [contenteditable="true"]')) return;
-    if (target.matches('input') && !target.matches('input[type="radio"], input[type="checkbox"], input[type="button"], input[type="submit"]')) return;
-    if (target.isContentEditable) return;
+  // Native selects keep their own type-ahead.
+  if (target instanceof HTMLElement && target.matches('select')) return;
+  // A text field has no own number group, so an open question stays answerable
+  // from the message box; other focused groups keep their own numbers.
+  const editable = target instanceof HTMLElement && (
+    target.matches('textarea, [contenteditable="true"]')
+    || (target.matches('input') && !target.matches('input[type="radio"], input[type="checkbox"], input[type="button"], input[type="submit"]'))
+    || target.isContentEditable
+  );
+  let scope = editable && choiceNumberAvailable(key)
+    ? 'choice'
+    : numberScopeFor(target) ?? defaultNumberScope(key);
+  if (deferred && scope === 'composer' && choiceNumberAvailable(key) && !numberTarget('voice', key)) {
+    scope = 'choice';
   }
-  const scope = numberScopeFor(target) ?? defaultNumberScope(event.key);
   if (!scope) return;
   if (scope === 'choice') {
-    if (!state.choice) return;
+    if (!choiceNumberAvailable(key)) return;
     event.preventDefault();
-    if (!selectOption(state.choice.set.id, event.key)) void say('There is no such choice.');
+    if (!selectOption(state.choice.set.id, key)) void say('There is no such choice.');
     return;
   }
-  const element = numberTarget(scope, event.key);
+  const element = numberTarget(scope, key);
   if (!element) return;
   event.preventDefault();
   element.click();
@@ -906,7 +1069,7 @@ function finishChoice(choiceSetId, option, reason = 'answered') {
       if (sayToken !== ownerToken || state.voiceGeneration !== ownerGeneration) return;
       await say(option.value === 'cancel'
         ? 'Cancelled.'
-        : `Selected option ${option.number}: ${option.label}.`, { keepListening: false });
+        : `Selected option ${option.number}: ${option.label}.`);
     })();
   } else if (reason === 'cancelled') {
     interruptOutput();
@@ -915,7 +1078,7 @@ function finishChoice(choiceSetId, option, reason = 'answered') {
     feedback = (async () => {
       await speech.play('cancel');
       if (sayToken !== ownerToken || state.voiceGeneration !== ownerGeneration) return;
-      await say('Cancelled.', { keepListening: false });
+      await say('Cancelled.');
     })();
   }
   syncWorking();
@@ -944,24 +1107,17 @@ function selectOption(choiceSetId, rawInput) {
   return finishChoice(choiceSetId, outcome.option);
 }
 
-// Reads the current question, its source snapshot, and the choices. A long
-// source list is split for speech but sent once when the live region owns it.
+// Reads the question, every numbered choice, then the speech-only source
+// names. A long list is split for TTS but sent once to the live region.
 async function announceChoice(current) {
   const { set, sourceSites = [] } = current;
-  if (!sourceSites.length) {
-    return say(`${set.question} ${formatChoices(set)}. Press Alt+Z to answer by voice, or press a number key.`);
-  }
+  const sites = spokenSites(sourceSites);
   const parts = [
-    set.question,
-    ...sourceSites.map((origin, index) => `Source site ${index + 1}: ${origin}.`),
-    `Choices. ${formatChoices(set)}. Press Alt+Z to answer by voice, or press a number key.`,
+    `${set.question} ${formatChoices(set)}.`,
+    ...(sites.length ? [`Sites included: ${sites.join(', ')}.`] : []),
+    choiceKeyboardHint(),
   ];
-  const pieces = speech.outputMode === 'screen-reader' ? [parts.join(' ')] : parts;
-  let outcome = { completed: true, interrupted: false, reason: null };
-  for (const piece of pieces) {
-    outcome = await say(piece);
-    if (state.choice !== current || !outcome.completed) return outcome;
-  }
+  const outcome = await say(parts.join(' '));
   return outcome;
 }
 
@@ -987,10 +1143,15 @@ function presentSet(set, { timeoutMs = 0, recordChoice = true, sourceSites = [] 
     state.choice = current;
     state.choiceTrigger = document.activeElement instanceof HTMLElement ? document.activeElement : null;
     state.audioPaused = false;
+    // A screen-reader announcement is not finished when the DOM write returns;
+    // moving focus into the new group would cut it off. Number shortcuts still
+    // answer this choice from the current control.
+    state.deferChoiceFocus = true;
     showChoice(current.set, current.sourceSites);
+    focusChoiceOption();
     syncWorking();
     void announceChoice(current).then((outcome) => {
-      if (state.choice !== current || !outcome.completed || !timeoutMs) return;
+      if (state.choice !== current || !outcome.delivered || !timeoutMs) return;
       current.set = { ...current.set, expiresAt: Date.now() + timeoutMs };
       current.timer = setTimeout(() => {
         if (state.choice !== current) return;
@@ -1068,7 +1229,7 @@ async function announcePage() {
     await say('There is no readable page right now.');
     return;
   }
-  const title = state.tab.title || state.tab.url || 'Unknown page';
+  const title = spokenSites([state.tab.title || state.tab.url || 'Unknown page'])[0];
   let layoutSide = null;
   try {
     const layout = await chrome.sidePanel.getLayout({ windowId: state.tab.windowId });
@@ -1082,7 +1243,7 @@ let introGeneration = 0;
 async function runIntro({ page = true } = {}) {
   const token = ++introGeneration;
   const outcome = await say(introText());
-  if (!outcome.completed) {
+  if (!outcome.delivered) {
     if (token === introGeneration) {
       speech.writeStatus('The introduction was interrupted. Use Replay introduction to hear it again.');
     }
@@ -1152,7 +1313,6 @@ const MAX_MODEL_CALLS_PER_TURN = 16;
 async function requestModel(epoch, { retried = false } = {}) {
   if (!(await apiReady())) return null;
   if (epoch !== state.epoch) return null;
-  speech.writeStatus('Working.');
   syncWorking();
   const controller = new AbortController();
   state.abort = controller;
@@ -1174,7 +1334,7 @@ async function requestModel(epoch, { retried = false } = {}) {
     if (error?.code === 'image_rejected' && !retried) {
       state.visionLimited = true;
       stripImages();
-      await say('The model service did not accept the screenshot. I will continue with page text.', { alert: true });
+      await say('The model service did not accept the screenshot. I will continue with page text.');
       if (epoch !== state.epoch) return null;
       return requestModel(epoch, { retried: true });
     }
@@ -1243,7 +1403,7 @@ async function advance(epoch) {
         state.pendingMessages = [];
         return;
       }
-      if (!spoken.completed) {
+      if (!spoken.delivered) {
         blockedBySpeech = !spoken.interrupted;
         recordResults();
         toolBatch.signal.removeEventListener('abort', onAbort);
@@ -1314,14 +1474,12 @@ async function runTurn(text) {
     if (!(await apiReady())) return;
     if (epoch !== state.epoch) return;
     // The word must finish before any model request or page action starts.
-    const spoken = await say('working', { forceSpeech: true });
+    const spoken = await say('working');
     if (epoch !== state.epoch) return;
-    if (!spoken.completed) {
+    if (!spoken.delivered) {
       if (!spoken.interrupted) announceWorkingFailed();
       return;
     }
-    speech.writeStatus('Working.');
-    syncWorking();
     await advance(epoch);
   } catch (error) {
     if (epoch === state.epoch) await announceFailure(error);
@@ -1335,7 +1493,7 @@ async function runTurn(text) {
 
 function announceWorkingFailed() {
   void speech.play('fail');
-  speech.writeStatus('The working prompt could not be spoken, so this request did not run. Check the speech output, then press Alt+Z.', true);
+  speech.writeStatus(`The working announcement could not be delivered, so this request did not run. Check that your screen reader is working. ${listenAction()} to try again.`, true);
 }
 
 // Serial turn queue: a newer instruction replaces the pending one and preempts
@@ -1383,7 +1541,7 @@ async function submitMessage(raw) {
     return;
   }
   if (/^help[.!?]?$/iu.test(text)) {
-    await say(`${HELP_TEXT.join(' ')} ${replaySentence()}`);
+    await say(helpText());
     return;
   }
   if (/^(repeat|repeat choices)[.!?]?$/iu.test(text)) {
@@ -1399,9 +1557,9 @@ async function submitMessage(raw) {
     state.busy = true;
     syncWorking();
     try {
-      const spoken = await say('working', { forceSpeech: true });
+      const spoken = await say('working');
       if (epoch !== state.epoch) return;
-      if (!spoken.completed) {
+      if (!spoken.delivered) {
         if (!spoken.interrupted) announceWorkingFailed();
         return;
       }
@@ -1426,7 +1584,7 @@ async function pauseAssistant() {
   cancelVoice();
   syncWorking();
   await speech.play('cancel');
-  speech.writeStatus('Paused. Press Alt+Z to speak.');
+  speech.writeStatus(`Paused. ${listenSentence()}.`);
 }
 
 async function discoverPageOrigins(context) {
@@ -1480,10 +1638,11 @@ async function ensureUploadConsent(part, question, epoch, signal = null) {
     }
   }
   const consent = uploadConsentFor(state.uploadConsent, context.origin, context.fingerprint);
+  const receiver = spokenSites([configOrigin(state.config)])[0];
   if (part === 'image') {
     if (!needsUpload(consent, 'image')) return true;
     const choice = await askChoice({
-      question: `${question} The receiver is ${configOrigin(state.config)}.`,
+      question: `${question} The receiver is ${receiver}.`,
       options: [{ label: 'Allow', value: 'allow' }, { label: 'Cancel', value: 'cancel' }],
     });
     if (!samePage()) return false;
@@ -1508,7 +1667,7 @@ async function ensureUploadConsent(part, question, epoch, signal = null) {
       ]
       : [{ label: 'Allow', value: 'allow' }, { label: 'Cancel', value: 'cancel' }];
   const choice = await askChoice({
-    question: `Reading page text from the listed sites sends it to ${configOrigin(state.config)}. Allow these sources for this page?`,
+    question: `Reading page text from the listed sites sends it to ${receiver}. Allow these sources for this page?`,
     options,
     sourceSites,
   });
@@ -1909,9 +2068,11 @@ async function followOpenedPages(report, epoch, signal) {
   if (report.openedTabsOverflow) {
     return 'More than eight pages opened; choose one yourself and tell me when you are there.';
   }
+  const sites = spokenSites(opened.map((tab) => tab.origin || tab.url || ''));
   const lines = opened.map((tab, index) => {
-    const title = (tab.title || tab.origin || tab.url || 'Untitled').slice(0, 80);
-    return `${index + 1}. ${title} (${tab.origin})`;
+    const site = sites[index] || tab.origin || tab.url || '';
+    const title = spokenSites([tab.title || site || 'Untitled'])[0].slice(0, 80);
+    return `${index + 1}. ${title} (${site})`;
   });
   const options = opened.map((tab, index) => ({ label: `Page ${index + 1}`, value: `tab:${tab.tabId}` }));
   options.push({ label: 'Stay here', value: 'cancel' });
@@ -1995,7 +2156,7 @@ async function followOpenedPages(report, epoch, signal) {
     return 'That page changed before it could be used; stay on the current page.';
   }
   state.tab = adopted;
-  $('page-line').textContent = `Current page: ${adopted.title || adopted.url || 'Unknown'}`;
+  $('page-line').textContent = `Current page: ${spokenSites([adopted.title || adopted.url || 'Unknown'])[0]}`;
   state.pendingMessages = [];
   state.confirmedChoices = [];
   state.frameConsent = new Set();
@@ -2097,11 +2258,11 @@ async function runGuide() {
   const guide = guideFor(platform);
   if (!guide) return;
   const intro = await say(guide.intro);
-  if (!alive() || !intro.completed) return;
+  if (!alive() || !intro.delivered) return;
   let index = 0;
   while (index < guide.steps.length) {
     const step = await say(guide.steps[index]);
-    if (!alive() || !step.completed) return;
+    if (!alive() || !step.delivered) return;
     const choice = await askChoice({
       question: 'Continue?',
       options: [
@@ -2116,7 +2277,7 @@ async function runGuide() {
     else if (choice.value === 'back') index = Math.max(0, index - 1);
   }
   if (!alive()) return;
-  await say('The guide has ended. Press Alt+Z to return to voice.');
+  await say(`The guide has ended. ${listenAction()} to return to voice.`);
 }
 
 async function refreshTab({ announce = false, reason = '', windowId = null } = {}) {
@@ -2148,13 +2309,14 @@ async function refreshTab({ announce = false, reason = '', windowId = null } = {
     cancelVoice();
   }
   state.tab = info;
-  $('page-line').textContent = `Current page: ${info.title || info.url || 'Unknown'}${info.readable ? '' : ' (unreadable)'}`;
+  const pageName = spokenSites([info.title || info.url || 'Unknown'])[0];
+  $('page-line').textContent = `Current page: ${pageName}${info.readable ? '' : ' (unreadable)'}`;
   if (changed) {
     cancelVoice();
     if (previous?.tabId) await send('RESET_SESSION', { tabId: previous.tabId }).catch(() => {});
     resetConversation();
     if (announce) {
-      await say(`${reason ? `${reason}. ` : ''}Current page: ${info.title || info.url}.`);
+      await say(`${reason ? `${reason}. ` : ''}Current page: ${pageName}.`);
     }
   }
   return true;
@@ -2162,6 +2324,7 @@ async function refreshTab({ announce = false, reason = '', windowId = null } = {
 
 function resetConversation() {
   interruptOutput();
+  state.deferChoiceFocus = false;
   state.epoch += 1;
   state.pendingInput = null;
   state.actionContext = null;
@@ -2180,20 +2343,39 @@ function resetConversation() {
   state.frameSkipped = new Set();
   state.visionLimited = false;
   state.audioPaused = false;
+  speech.clearStatus();
   syncWorking();
+}
+
+// An unanswered question wins focus; otherwise the composer does. This never
+// prepares voice or opens the microphone.
+function focusEntryTarget() {
+  // An explicit open shortcut is the one request allowed to take keyboard focus
+  // from the page; automatic replies keep deferring to the current control.
+  window.focus();
+  state.deferChoiceFocus = false;
+  if (!$('ask').hidden) {
+    const first = $('ask-options').querySelector('button');
+    if (first) {
+      state.mode = 'typing';
+      updateModeLine();
+      first.focus();
+      return;
+    }
+  }
+  focusComposer();
 }
 
 async function handleEntryIntent(intent) {
   // A new entry owns the panel; any older preparation, output, or await is
   // stale from here on.
+  state.deferChoiceFocus = false;
   interruptOutput();
   cancelVoice();
+  focusEntryTarget();
   state.audioPaused = false;
   state.voiceRetry = false;
   if (intent.mode === 'typing') {
-    await speech.play('typing');
-    focusComposer();
-    await say('Typing. Control plus Enter sends; on macOS use Command plus Enter.');
     return;
   }
   if (intent.mode === 'intro') {
@@ -2202,18 +2384,17 @@ async function handleEntryIntent(intent) {
     await runIntro({ page: false });
     return;
   }
-  state.mode = 'voice';
-  updateModeLine();
   // The launcher and setup completion open or focus the panel only; they never
   // authorize a microphone session.
   if (intent.source !== 'command') {
-    const status = await refreshVoiceStatus().catch(() => null);
-    const ready = status?.ready ?? state.voiceReady;
-    await say(ready
-      ? 'Voice is ready. Press Alt+Z to listen.'
-      : 'Voice is not ready. Press Alt+Z to set up voice.');
+    // Read-only readiness refresh keeps the Listen label accurate after setup;
+    // it never installs the pack or opens the microphone.
+    await refreshVoiceStatus().catch(() => {});
+    focusEntryTarget();
     return;
   }
+  state.mode = 'voice';
+  updateModeLine();
   if (state.busy && !state.choice) preemptTurn();
   const seq = ++state.entrySeq;
   state.listenRequest = intent.id;
@@ -2221,8 +2402,8 @@ async function handleEntryIntent(intent) {
   await listenOnce(intent.id, seq);
 }
 
-// Entry-driven preparation keeps the Alt+Z authorization alive only while the
-// panel is still on this entry, visible, and in voice mode.
+// Entry-driven preparation keeps the single-use listen authorization alive only
+// while the panel is still on this entry, visible, and in voice mode.
 async function prepareEntry(seq) {
   if (seq !== state.entrySeq) return false;
   if (!(await prepareVoice())) return false;
@@ -2239,7 +2420,6 @@ function fillSettings() {
   $('anthropic-version').value = state.config.anthropicVersion ?? '2026-10-21';
   toggleAnthropicFields();
   $('api-key').value = '';
-  $('output-mode').value = state.speechOutput;
   const radio = document.querySelector(`input[name="launcher"][value="${state.launcherPosition}"]`);
   if (radio) radio.checked = true;
 }
@@ -2308,20 +2488,8 @@ async function saveSettings(event) {
     openSettingsForKey();
     return;
   }
-  await say(keyValue ? 'Settings saved. Press Alt+Z to start talking.' : 'Settings saved.');
+  await say(keyValue ? `Settings saved. ${listenSentence()}.` : 'Settings saved.');
   if (!state.apiKey) openSettingsForKey();
-}
-
-async function setSpeechOutput(value) {
-  interruptOutput();
-  cancelVoice();
-  state.speechOutput = value === 'screen-reader' ? 'screen-reader' : 'tts';
-  speech.setOutputMode(state.speechOutput);
-  await chrome.storage.local.set({ outputMode: state.speechOutput });
-  updateModeLine();
-  syncWorking();
-  await speech.play('choose');
-  speech.writeStatus(state.speechOutput === 'screen-reader' ? 'Switched to system screen-reader output.' : 'Switched to extension speech.');
 }
 
 async function changeLauncherPosition(position) {
@@ -2338,10 +2506,12 @@ async function updateShortcutStatus() {
     state.commands = commands ?? [];
     const lines = state.commands.map((command) => `${command.description}: ${command.shortcut || 'not set'}`);
     const unbound = state.commands.some((command) => !command.shortcut);
-    $('shortcut-status').textContent = `${lines.join('. ')}${unbound ? '. You can set shortcuts at chrome://extensions/shortcuts.' : ''}`;
+    const numbers = 'Choices in the panel always use Control plus Shift plus a top-row number, even when the entry shortcuts change. Plain digits type text or stay with the screen reader. Use your screen reader to stop speech already being read.';
+    $('shortcut-status').textContent = `${lines.join('. ')}. ${numbers}${unbound ? ' You can set shortcuts at chrome://extensions/shortcuts.' : ''}`;
   } catch {
-    state.commands = [];
-    $('shortcut-status').textContent = '';
+    // Keep the last known bindings; a transient worker failure must not turn
+    // real shortcuts into fallback wording.
+    if (!state.commands.length) $('shortcut-status').textContent = '';
   }
 }
 
@@ -2349,6 +2519,7 @@ function bindEvents() {
   // Real interaction inside the assistant preempts speech; the original page
   // is deliberately not watched.
   const interruptFrom = (event) => {
+    if (event.type === 'pointerdown') state.deferChoiceFocus = false;
     const target = event.target;
     if (!(target instanceof Element)) return;
     if (event.type === 'keydown' && /^(Control|Shift|Alt|Meta)$/u.test(event.key)) return;
@@ -2381,10 +2552,16 @@ function bindEvents() {
     updateModeLine();
   });
   $('listen').addEventListener('click', () => {
+    // Every user activation may resume output; a shortcut start can inherit
+    // this running context before its own prompt.
+    void speech.resumeAudio();
     interruptOutput();
     void requestVoice();
   });
-  $('start-using').addEventListener('click', () => void requestVoice());
+  $('start-using').addEventListener('click', () => {
+    void speech.resumeAudio();
+    void requestVoice();
+  });
   $('open-setup').addEventListener('click', () => void openSetupTab());
   $('pause').addEventListener('click', () => void pauseAssistant());
   $('repeat').addEventListener('click', () => repeatChoice());
@@ -2397,7 +2574,6 @@ function bindEvents() {
   });
   $('settings-form').addEventListener('submit', (event) => void saveSettings(event));
   $('protocol').addEventListener('change', toggleAnthropicFields);
-  $('output-mode').addEventListener('change', (event) => void setSpeechOutput(event.target.value));
   for (const radio of document.querySelectorAll('input[name="launcher"]')) {
     radio.addEventListener('change', (event) => {
       if (event.target.checked) void changeLauncherPosition(event.target.value);
@@ -2454,6 +2630,12 @@ function bindEvents() {
     }
     // A restored panel only refreshes readiness; it never starts listening.
     void refreshVoiceStatus().catch(() => {});
+    void updateShortcutStatus();
+  });
+  window.addEventListener('focus', () => {
+    state.deferChoiceFocus = false;
+    if (state.choice) focusChoiceOption();
+    void updateShortcutStatus();
   });
   if (navigator.permissions?.query) {
     navigator.permissions.query({ name: 'microphone' }).then((status) => {
@@ -2467,7 +2649,7 @@ function bindEvents() {
           state.micDenied = true;
           updateModeLine();
           updateVoiceSetup({ local: speech.localStatus, mic: 'denied', ready: false });
-          speech.writeStatus('Microphone permission was revoked. Restore it in browser and system settings, then press Alt+Z to try again.', true);
+          speech.writeStatus(`Microphone permission was revoked. Restore it in browser and system settings. ${listenAction()} to try again.`, true);
         } else if (status.state === 'granted') {
           state.micState = 'granted';
           state.micDenied = false;
@@ -2510,9 +2692,9 @@ async function undoFromButton() {
   state.busy = true;
   syncWorking();
   try {
-    const spoken = await say('working', { forceSpeech: true });
+    const spoken = await say('working');
     if (epoch !== state.epoch) return;
-    if (!spoken.completed) {
+    if (!spoken.delivered) {
       if (!spoken.interrupted) announceWorkingFailed();
       return;
     }
@@ -2551,33 +2733,56 @@ function returnToVoice() {
   state.mode = 'voice';
   state.audioPaused = false;
   updateModeLine();
-  speech.writeStatus('Voice mode. Press Alt+Z to listen.');
+  speech.writeStatus(`Voice mode. ${listenSentence()}.`);
+}
+
+// Restores the page entrance only when that page still exists in this window
+// and is its active tab; protected or vanished pages simply keep their focus.
+async function restoreLauncherFocus() {
+  const tabId = state.tab?.tabId;
+  if (!Number.isInteger(tabId) || !Number.isInteger(state.windowId)) return;
+  try {
+    const tab = await chrome.tabs.get(tabId);
+    if (tab.windowId !== state.windowId || !tab.active) return;
+    await chrome.tabs.sendMessage(tabId, { type: 'FOCUS_LAUNCHER' });
+  } catch {}
+}
+
+function preparePanelClose() {
+  interruptOutput();
+  cancelVoice();
+  stopLocalWatch();
+  state.abort?.abort();
+  state.toolAbort?.abort();
+  state.userCancelled = true;
+  state.pendingInput = null;
+  state.busy = false;
+  // Presenting and pending input expire; API settings and undo records do not.
+  resetConversation();
+  if (state.tab?.tabId) {
+    // Page cleanup and focus restoration do not gate the native close; a
+    // hanging page must not keep the panel open.
+    void send('RESET_SESSION', { tabId: state.tab.tabId }).catch(() => {});
+    void restoreLauncherFocus();
+  }
+  speech.stopWorking();
 }
 
 async function closePanel() {
-  interruptOutput();
-  cancelVoice();
-  state.abort?.abort();
-  state.toolAbort?.abort();
-  if (state.tab?.tabId) {
-    await send('RESET_SESSION', { tabId: state.tab.tabId }).catch(() => {});
-    await chrome.tabs.sendMessage(state.tab.tabId, { type: 'FOCUS_LAUNCHER' }).catch(() => {});
-  }
-  speech.stopWorking();
-  const windowId = state.tab?.windowId;
+  preparePanelClose();
   try {
-    await chrome.sidePanel.close({ windowId });
-  } catch {
-    window.close();
+    await chrome.sidePanel.close({ windowId: state.windowId });
+  } catch (error) {
+    // A rejected close is not a closure; report it and keep both documents.
+    void say(`Could not close the assistant. ${error?.message ?? 'The side panel did not close.'}`, { alert: true });
   }
 }
 
 async function loadPreferences() {
-  const stored = await chrome.storage.local.get(['apiConfig', 'outputMode', 'launcherPosition']);
+  const stored = await chrome.storage.local.get(['apiConfig', 'launcherPosition', 'outputMode']);
+  if ('outputMode' in stored) await chrome.storage.local.remove('outputMode');
   state.config = stored.apiConfig ?? { ...DEFAULT_API_CONFIG };
-  state.speechOutput = stored.outputMode === 'screen-reader' ? 'screen-reader' : 'tts';
   state.launcherPosition = ['br', 'bl', 'tr', 'tl'].includes(stored.launcherPosition) ? stored.launcherPosition : 'br';
-  speech.setOutputMode(state.speechOutput);
   const session = await chrome.storage.session.get(['apiKey', 'allowNetwork']);
   state.apiKey = keyForBinding(session.apiKey, state.config);
   if (session.apiKey?.value && !state.apiKey) {
@@ -2624,6 +2829,10 @@ function receiveEntryIntent(intent) {
   if (!isForThisWindow(intent)) return;
   if (state.requestedIntents.has(intent.id) || state.consumedIntents.has(intent.id)) return;
   state.requestedIntents.add(intent.id);
+  // Act on the explicit open before the serialized claim resolves; waiting for
+  // storage would leave keyboard focus on the page. Cold-start handling in
+  // handleEntryIntent still focuses again after initialization.
+  if (intent.mode === 'typing' && intent.source === 'command') focusEntryTarget();
   claimEntry(intent.id);
 }
 
@@ -2637,7 +2846,6 @@ async function initializePanel() {
   bindEvents();
   updateModeLine();
   await loadPreferences();
-  await speech.loadVoice();
   fillSettings();
   initialTabBind = refreshTab();
   await initialTabBind;
@@ -2673,11 +2881,13 @@ async function initializeSetupPage() {
   const tab = await chrome.tabs.getCurrent().catch(() => null);
   state.setupTabId = tab?.id ?? null;
   state.setupWindowId = tab?.windowId ?? null;
+  // The setup page returns before loadPreferences; drop only the obsolete
+  // output preference and leave the rest of the stored configuration alone.
+  await chrome.storage.local.remove('outputMode').catch(() => {});
   speech.attach({ statusEl: $('voice-status'), alertEl: $('sr-alert') });
   $('start-using').addEventListener('click', () => void startPreparation({ setup: true, force: true }));
   $('return-assistant').addEventListener('click', () => void returnToAssistant());
   document.addEventListener('keydown', handleNumberShortcut);
-  await speech.loadVoice();
   const status = await refreshVoiceStatus();
   if (status.local !== 'available') ensureLocalWatch();
   if (state.voiceReady) {
@@ -2689,7 +2899,7 @@ async function initializeSetupPage() {
 
 async function returnToAssistant() {
   if (!state.setupWindowId) {
-    setVoiceStatus('Open a web page, then press Alt+Z.');
+    setVoiceStatus('Open a web page, then open the assistant again.');
     return;
   }
   $('return-assistant').disabled = true;
@@ -2711,7 +2921,25 @@ async function returnToAssistant() {
   window.close();
 }
 
-chrome.runtime.onMessage.addListener((message, sender) => {
+chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
+  if (message?.type === 'CLOSE_PANEL') {
+    if (SETUP_PAGE) return;
+    if (sender?.id !== chrome.runtime.id || sender.tab) return;
+    if (!Number.isInteger(state.windowId) || message.windowId !== state.windowId) return;
+    // The background owns the native close; this only releases panel-local work.
+    preparePanelClose();
+    return;
+  }
+  if (message?.type === 'PANEL_CLOSE_ERROR') {
+    if (SETUP_PAGE) return;
+    if (sender?.id !== chrome.runtime.id || sender.tab) return;
+    if (!Number.isInteger(state.windowId) || message.windowId !== state.windowId) return;
+    const detail = typeof message.error === 'string' && message.error
+      ? message.error
+      : 'The side panel did not close.';
+    void say(`Could not close the assistant. ${detail}`, { alert: true });
+    return;
+  }
   if (message?.type !== 'ENTRY_INTENT') return;
   if (sender?.id !== chrome.runtime.id || sender.tab) return;
   receiveEntryIntent(message.intent);

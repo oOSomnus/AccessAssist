@@ -81,7 +81,6 @@ function setIntent(windowId, intent) {
 }
 
 async function broadcastIntent(intent) {
-  await intentQueue.catch(() => {});
   try {
     await chrome.runtime.sendMessage({ type: 'ENTRY_INTENT', intent });
   } catch {}
@@ -177,10 +176,11 @@ async function initialize() {
   await chrome.storage.local.setAccessLevel({ accessLevel: 'TRUSTED_CONTEXTS' }).catch(() => {});
   await chrome.sidePanel.setPanelBehavior({ openPanelOnActionClick: true }).catch(() => {});
   await migrateIntroState();
-  const stored = await chrome.storage.local.get(['launcherPosition', 'outputMode', 'apiConfig']).catch(() => ({}));
+  // Text output is system-reader-only now; old profiles must not revive TTS.
+  await chrome.storage.local.remove('outputMode').catch(() => {});
+  const stored = await chrome.storage.local.get(['launcherPosition', 'apiConfig']).catch(() => ({}));
   const defaults = {};
   if (!LAUNCHER_POSITIONS.has(stored.launcherPosition)) defaults.launcherPosition = 'br';
-  if (!['tts', 'screen-reader'].includes(stored.outputMode)) defaults.outputMode = 'tts';
   if (!stored.apiConfig) {
     defaults.apiConfig = {
       protocol: 'openai',
@@ -208,20 +208,50 @@ chrome.runtime.onStartup.addListener(() => {
   initialize();
 });
 
+async function commandWindowId(tab) {
+  if (Number.isInteger(tab?.windowId)) return tab.windowId;
+  const [active] = await chrome.tabs.query({ active: true, currentWindow: true }).catch(() => []);
+  if (Number.isInteger(active?.windowId)) return active.windowId;
+  const last = await chrome.windows.getLastFocused().catch(() => null);
+  return Number.isInteger(last?.id) ? last.id : null;
+}
+
 chrome.commands.onCommand.addListener(async (command, tab) => {
-  // Only the declared shortcuts create entries; only Alt+Z may start listening.
-  const mode = command === 'start-typing' ? 'typing'
-    : command === 'replay-introduction' ? 'intro'
-      : command === 'open-assistant' ? 'voice'
+  // Closing is not an entry: it never opens the panel or leaves an intent.
+  if (command === 'close-assistant') {
+    const windowId = await commandWindowId(tab);
+    if (!Number.isInteger(windowId)) return;
+    // Cleanup must not gate the native close: intent storage and the panel
+    // message can hang or have no receiver.
+    void claimIntent(windowId).catch(() => null);
+    void chrome.runtime.sendMessage({ type: 'CLOSE_PANEL', windowId }).catch(() => {});
+    try {
+      await chrome.sidePanel.close({ windowId });
+    } catch (error) {
+      console.warn('AccessAssist could not close the side panel', error);
+      void chrome.runtime.sendMessage({
+        type: 'PANEL_CLOSE_ERROR',
+        windowId,
+        error: error?.message ?? 'The side panel did not close.',
+      }).catch(() => {});
+    }
+    return;
+  }
+  // Only the declared entry shortcuts create intents; only listen-once may
+  // authorize a microphone session.
+  const mode = command === 'open-assistant' ? 'typing'
+    : command === 'listen-once' ? 'voice'
+      : command === 'replay-introduction' ? 'intro'
         : null;
   if (!mode) return;
   const target = tab?.id ? tab : (await chrome.tabs.query({ active: true, currentWindow: true }))[0];
   if (!target) return;
   const intent = setIntent(target.windowId, { mode, source: 'command', tabId: target.id });
-  try {
-    await chrome.sidePanel.open({ windowId: target.windowId });
-  } catch {}
-  await broadcastIntent(intent);
+  // Notification and native opening are independent: a slow storage write or
+  // sidePanel.open() must not delay the focus request the panel can act on.
+  const opening = chrome.sidePanel.open({ windowId: target.windowId });
+  const broadcasting = broadcastIntent(intent);
+  await Promise.allSettled([opening, broadcasting]);
 });
 
 chrome.tabs.onActivated.addListener(({ tabId }) => {
@@ -262,6 +292,8 @@ chrome.webNavigation.onCreatedNavigationTarget.addListener((details) => {
 });
 
 chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
+  // CLOSE_PANEL is addressed to the side-panel document, not to this worker.
+  if (message?.type === 'CLOSE_PANEL') return false;
   if (message?.type === 'OPEN_ASSISTANT') {
     (async () => {
       if (sender.id !== chrome.runtime.id || sender.frameId !== 0 || !sender.tab) {
@@ -273,7 +305,7 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
       try {
         await chrome.sidePanel.open({ windowId: tab.windowId });
       } catch (error) {
-        return { error: `Could not open the side panel: ${error?.message ?? 'try Alt+Z instead'}` };
+        return { error: `Could not open the side panel: ${error?.message ?? 'use the toolbar button instead'}` };
       }
       await broadcastIntent(intent);
       return { ok: true };
@@ -290,20 +322,20 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
       try {
         setupTab = await chrome.tabs.get(sender.tab.id);
       } catch {
-        return { error: 'The setup tab is gone. Open a web page, then press Alt+Z.' };
+        return { error: 'The setup tab is gone. Open a web page, then open the assistant again.' };
       }
       const openerTabId = setupTab?.openerTabId;
       if (!Number.isInteger(openerTabId)) {
-        return { error: 'Open a web page, then press Alt+Z.' };
+        return { error: 'Open a web page, then open the assistant again.' };
       }
       let opener;
       try {
         opener = await chrome.tabs.get(openerTabId);
       } catch {
-        return { error: 'Open a web page, then press Alt+Z.' };
+        return { error: 'Open a web page, then open the assistant again.' };
       }
       if (!httpUrl(opener?.url) || opener.windowId !== setupTab.windowId) {
-        return { error: 'Open a web page, then press Alt+Z.' };
+        return { error: 'Open a web page, then open the assistant again.' };
       }
       const intent = setIntent(setupTab.windowId, { mode: 'voice', source: 'setup', tabId: opener.id });
       await chrome.tabs.update(opener.id, { active: true }).catch(() => {});

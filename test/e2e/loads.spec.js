@@ -21,7 +21,7 @@ test('extension loads, injects one launcher and opens the panel document', async
       };
     });
     expect(launcher.count).toBe(1);
-    expect(launcher.label).toContain('Alt+Z');
+    expect(launcher.label).toContain('AccessAssist');
     expect(launcher.tag).toBe('BUTTON');
     expect(launcher.tabIndex).toBe(0);
 
@@ -29,6 +29,24 @@ test('extension loads, injects one launcher and opens the panel document', async
     await expect(panel.locator('#page-line')).toContainText('Event schedule');
     await expect(panel.locator('#settings')).toBeVisible();
     await expect(panel.locator('#mode-line')).toContainText('Guide');
+  } finally {
+    await context.close();
+  }
+});
+
+test('an old TTS preference is ignored and removed', async () => {
+  const { context, extensionId, worker } = await launch();
+  try {
+    await openFixture(context, '/article');
+    await worker.evaluate(() => chrome.storage.local.set({ outputMode: 'tts' }));
+    const panel = await openPanel(context, extensionId);
+    await expect(panel.locator('#output-mode')).toHaveCount(0);
+    await expect.poll(async () => worker.evaluate(
+      async () => (await chrome.storage.local.get('outputMode')).outputMode,
+    )).toBeUndefined();
+    await expect.poll(async () => (await panel.evaluate(
+      () => window.__aaAnnouncements ?? [],
+    )).join(' ')).toContain('hear the introduction again');
   } finally {
     await context.close();
   }
@@ -71,20 +89,4 @@ test('the injected launcher reports a voice intent for its own page', async () =
   }
 });
 
-test('the replay introduction command is declared with its default shortcut', async () => {
-  const { context, extensionId } = await launch();
-  try {
-    const panel = await openPanel(context, extensionId);
-    const manifest = await panel.evaluate(
-      () => chrome.runtime.getManifest().commands['replay-introduction'],
-    );
-    expect(manifest.suggested_key.default).toBe('Alt+Shift+H');
-    const commands = await panel.evaluate(() => chrome.commands.getAll());
-    const replay = commands.find((command) => command.name === 'replay-introduction');
-    expect(replay?.shortcut).toBe('Alt+Shift+H');
-    await expect(panel.locator('#shortcut-status')).toContainText('Replay the AccessAssist introduction');
-  } finally {
-    await context.close();
-  }
-});
 

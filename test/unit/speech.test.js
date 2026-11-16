@@ -3,9 +3,8 @@ import assert from 'node:assert/strict';
 import {
   SOUND_CUES,
   Speech,
-  chunkText,
   localRecognitionSupported,
-  pickVoice,
+  spokenSites,
 } from '../../extension/speech.js';
 
 const tick = (ms = 0) => new Promise((resolve) => setTimeout(resolve, ms));
@@ -16,28 +15,60 @@ function resultEvent(transcript, final = true) {
   return { results: [item], resultIndex: 0 };
 }
 
+function cumulativeEvent(items) {
+  const results = items.map(({ transcript, final = true }) => {
+    const item = [{ transcript, confidence: 1 }];
+    item.isFinal = final;
+    return item;
+  });
+  return { results, resultIndex: 0 };
+}
+
+function fakeLog() {
+  const entries = [];
+  return {
+    entries,
+    getAttribute(name) { return name === 'role' ? 'log' : null; },
+    append(node) { entries.push(node); },
+    get textContent() { return entries.map((node) => node.textContent).join(''); },
+    set textContent(value) {
+      entries.length = 0;
+      if (value) entries.push({ textContent: String(value) });
+    },
+    ownerDocument: {
+      createElement() { return { textContent: '' }; },
+    },
+  };
+}
+
 function fakeBrowser({
   status = 'available',
   install = true,
-  audio = 'suspended',
+  audio = 'running',
   resume = false,
   holdStart = false,
   holdEnd = false,
   dropEnd = false,
-  holdSpeech = false,
-  failSpeech = false,
   failStart = 0,
   autoCue = true,
+  gum = 'grant',
+  echo = 'all',
+  platform = 'linux',
 } = {}) {
   const control = {
     available: status,
     installCalls: [],
     starts: 0,
     startArgs: [],
-    spoken: [],
-    speechOptions: [],
-    heldSpeech: [],
-    stopCalls: 0,
+    gum,
+    echo,
+    platform,
+    gumCalls: 0,
+    gumOptions: [],
+    gumResolvers: [],
+    tracksStopped: 0,
+    lastEcho: null,
+    lastTrack: null,
     aborts: 0,
     oscillators: [],
     gains: [],
@@ -49,8 +80,6 @@ function fakeBrowser({
     nativeBusy: false,
     activeRecognition: null,
     cueTimers: [],
-    ttsHold: holdSpeech,
-    ttsFail: failSpeech,
     holdStart,
     releaseEnd() {
       const recognition = control.activeRecognition ?? control.recognition;
@@ -59,12 +88,6 @@ function fakeBrowser({
       control.nativeBusy = false;
       control.activeRecognition = null;
       queueMicrotask(() => recognition.onend?.());
-    },
-    releaseSpeech() {
-      control.ttsHold = false;
-      for (const options of control.heldSpeech.splice(0)) {
-        queueMicrotask(() => options.onEvent({ type: 'end' }));
-      }
     },
     releaseStart() {
       if (control.recognition?.active) control.recognition.onstart?.();
@@ -204,8 +227,13 @@ function fakeBrowser({
     }
 
     createGain() {
+      const values = [];
       const gain = {
-        gain: { setValueAtTime() {}, exponentialRampToValueAtTime() {} },
+        gain: {
+          values,
+          setValueAtTime(value) { values.push(value); },
+          exponentialRampToValueAtTime(value) { values.push(value); },
+        },
         disconnected: false,
         connect: (node) => node,
         disconnect() {
@@ -216,30 +244,54 @@ function fakeBrowser({
       return gain;
     }
   }
+  control.makeStream = () => {
+    const track = {
+      kind: 'audio',
+      readyState: 'live',
+      onended: null,
+      stop() {
+        control.tracksStopped += 1;
+        this.readyState = 'ended';
+      },
+      getSettings: () => ({ echoCancellation: control.echo }),
+    };
+    control.lastTrack = track;
+    control.lastEcho = control.echo;
+    return { getTracks: () => [track], getAudioTracks: () => [track] };
+  };
+  control.releaseGum = () => {
+    const resolve = control.gumResolvers.shift();
+    if (resolve) resolve(control.makeStream());
+  };
+  control.getUserMedia = async (constraints) => {
+    control.gumCalls += 1;
+    control.gumOptions.push(constraints);
+    if (control.gum === 'pending') {
+      return new Promise((resolve) => { control.gumResolvers.push(resolve); });
+    }
+    if (control.gum === 'deny') {
+      throw Object.assign(new Error('Permission dismissed'), { name: 'NotAllowedError' });
+    }
+    if (control.gum === 'missing') {
+      throw Object.assign(new Error('No microphone'), { name: 'NotFoundError' });
+    }
+    if (control.gum === 'constraint') {
+      throw Object.assign(new Error('Constraints cannot be satisfied'), { name: 'OverconstrainedError' });
+    }
+    return control.makeStream();
+  };
+  if (!globalThis.navigator) {
+    Object.defineProperty(globalThis, 'navigator', { configurable: true, value: {} });
+  }
+  Object.defineProperty(globalThis.navigator, 'mediaDevices', {
+    configurable: true,
+    value: { getUserMedia: control.getUserMedia },
+  });
   globalThis.SpeechRecognition = FakeRecognition;
   globalThis.AudioContext = FakeAudioContext;
   globalThis.chrome = {
-    tts: {
-      getVoices: async () => [],
-      speak(text, options) {
-        control.spoken.push(String(text));
-        control.speechOptions.push(options);
-        if (control.ttsFail) {
-          queueMicrotask(() => options.onEvent?.({ type: 'error' }));
-          return;
-        }
-        if (control.ttsHold) {
-          control.heldSpeech.push(options);
-          return;
-        }
-        queueMicrotask(() => options.onEvent?.({ type: 'end' }));
-      },
-      stop() {
-        control.stopCalls += 1;
-        for (const options of control.heldSpeech.splice(0)) {
-          queueMicrotask(() => options.onEvent?.({ type: 'interrupted' }));
-        }
-      },
+    runtime: {
+      getPlatformInfo: async () => ({ os: control.platform }),
     },
   };
   return control;
@@ -249,26 +301,42 @@ function clearBrowser() {
   delete globalThis.SpeechRecognition;
   delete globalThis.AudioContext;
   delete globalThis.chrome;
+  if (globalThis.navigator) delete globalThis.navigator.mediaDevices;
 }
 
-test('voice selection prefers exact language and local voices', () => {
-  const voices = [
-    { voiceName: 'remote-en', lang: 'en-US', localService: false },
-    { voiceName: 'remote-gb', lang: 'en-GB', localService: false },
-    { voiceName: 'local-en', lang: 'en-GB', localService: true },
+test('spoken sites shorten every HTTPS host without a leading www', () => {
+  const origins = [
+    'https://www.google.com',
+    'https://example.com',
+    'https://docs.example.com:8443',
+    'http://example.com',
+    'https://www.example.com',
+    'https://example.com/',
+    'https://example.com/path?q=1',
+    'https://www.example.com:9443/path',
+    'not an origin',
   ];
-  assert.equal(pickVoice(voices, 'en-GB').voiceName, 'local-en');
-  assert.equal(pickVoice([{ voiceName: 'en', lang: 'en-US', localService: true }], 'fr-FR'), null);
-  assert.equal(pickVoice([], 'en-US'), null);
-});
-
-test('long text is cut at sentence boundaries within the limit', () => {
-  const sentence = 'This is a sentence used to test the splitter. ';
-  const text = sentence.repeat(5000).trim();
-  const chunks = chunkText(text, 1000);
-  assert.ok(chunks.length > 1);
-  assert.ok(chunks.every((chunk) => chunk.length <= 1000));
-  assert.equal(chunks.join(' '), text);
+  assert.deepEqual(spokenSites(origins), [
+    'google.com',
+    'example.com',
+    'docs.example.com:8443',
+    'http://example.com',
+    'example.com',
+    'example.com',
+    'example.com',
+    'example.com:9443',
+    'not an origin',
+  ]);
+  // A www and non-www collision still speaks both as the same short host;
+  // the real origins remain distinct for consent and requests.
+  assert.deepEqual(spokenSites(['https://www.example.com', 'https://example.com']), [
+    'example.com',
+    'example.com',
+  ]);
+  const snapshot = [...origins];
+  spokenSites(snapshot);
+  assert.deepEqual(snapshot, origins);
+  assert.deepEqual(spokenSites(null), []);
 });
 
 test('local recognition capability is detected explicitly', () => {
@@ -424,8 +492,8 @@ test('availability monitoring follows every state and stops on abort', async () 
   }
 });
 
-test('Listening is spoken before the microphone opens and one final is accepted', async () => {
-  const control = fakeBrowser({ holdSpeech: true });
+test('the isolated live track feeds local recognition and is released after one final', async () => {
+  const control = fakeBrowser({ audio: 'running', autoCue: false });
   try {
     const speech = new Speech();
     speech.localAvailable = true;
@@ -438,28 +506,41 @@ test('Listening is spoken before the microphone opens and one final is accepted'
       onEnd: (info) => ends.push(info),
     });
     await tick();
-    // The word is still playing, so no native session may exist yet.
-    assert.equal(control.spoken[0], 'Listening');
-    assert.equal(control.starts, 0);
-    assert.equal(control.recognition.active, false);
-
-    control.releaseSpeech();
-    await tick();
+    assert.deepEqual(control.gumOptions, [{ audio: { echoCancellation: { exact: 'all' } } }]);
     assert.equal(control.starts, 1);
-    const outcome = await pending;
-    assert.equal(outcome.ready, true);
-    assert.equal(ready.length, 1);
+    const track = control.startArgs[0];
+    assert.equal(track.kind, 'audio');
+    assert.equal(control.lastEcho, 'all');
+
+    control.finishCue();
+    assert.deepEqual(await pending, { ready: true, sessionId: 1 });
 
     control.recognition.onresult(resultEvent('one', false));
     assert.deepEqual(results, []);
     control.recognition.onresult(resultEvent('one'));
     control.recognition.onresult(resultEvent('one'));
+    await tick(3005);
     await tick();
     assert.equal(results.length, 1);
     assert.equal(results[0][0], 'one');
     assert.equal(ends.length, 1);
     assert.equal(ends[0].reason, 'final');
+    assert.equal(track.readyState, 'ended');
+    assert.equal(track.onended, null);
     assert.equal(control.recognition.active, false);
+  } finally {
+    clearBrowser();
+  }
+});
+
+test('a non-isolatable platform refuses the track instead of falling back to the default microphone', async () => {
+  const control = fakeBrowser({ platform: 'android' });
+  try {
+    const speech = new Speech();
+    speech.localAvailable = true;
+    await assert.rejects(speech.startListening({}), (error) => error.code === 'unsupported-input');
+    assert.equal(control.gumCalls, 0);
+    assert.equal(control.starts, 0);
   } finally {
     clearBrowser();
   }
@@ -485,8 +566,13 @@ test('the start tone follows the native start and gates readiness', async () => 
     control.recognition.onstart?.();
     control.recognition.onstart?.();
     await tick();
-    assert.equal(control.oscillators.length, 1);
+    assert.equal(control.oscillators.length, 2);
     assert.equal(control.oscillators[0].frequency.value, 880);
+    assert.equal(control.oscillators[1].frequency.value, 880);
+    assert.ok(Math.abs(control.oscillators[0].stopAt - 0.19) < 1e-9);
+    assert.ok(Math.abs(control.oscillators[1].startAt - 0.27) < 1e-9);
+    assert.equal(Math.max(...control.gains[0].gain.values), 0.25);
+    assert.equal(Math.max(...control.gains[1].gain.values), 0.25);
     assert.deepEqual(ready, []);
 
     control.recognition.onresult(resultEvent('one'));
@@ -499,7 +585,11 @@ test('the start tone follows the native start and gates readiness', async () => 
     assert.equal(ready.length, 1);
     assert.equal(ready[0].cuePlayed, true);
 
-    control.recognition.onresult(resultEvent('one'));
+    control.recognition.onresult(cumulativeEvent([
+      { transcript: 'ignored' },
+      { transcript: 'one' },
+    ]));
+    await tick(3005);
     await tick();
     assert.deepEqual(results, ['one']);
   } finally {
@@ -507,26 +597,67 @@ test('the start tone follows the native start and gates readiness', async () => 
   }
 });
 
-test('an unavailable start tone still becomes ready and accepts one final', async () => {
+test('an unavailable start tone stops the live input instead of listening silently', async () => {
   const control = fakeBrowser({ audio: 'suspended' });
   try {
     const speech = new Speech();
     speech.localAvailable = true;
     const ready = [];
     const results = [];
-    const pending = speech.startListening({
-      onReady: (info) => ready.push(info),
-      onResult: (text) => results.push(text),
-    });
-    const outcome = await pending;
-    assert.deepEqual(outcome, { ready: true, sessionId: 1 });
+    await assert.rejects(
+      speech.startListening({
+        onReady: (info) => ready.push(info),
+        onResult: (text) => results.push(text),
+      }),
+      (error) => error.code === 'listening',
+    );
     assert.equal(control.starts, 1);
     assert.deepEqual(control.oscillators, []);
-    assert.equal(ready.length, 1);
-    assert.equal(ready[0].cuePlayed, false);
-    control.recognition.onresult(resultEvent('help'));
+    assert.equal(ready.length, 0);
+    assert.equal(control.tracksStopped, 1);
+    control.recognition.onresult?.(resultEvent('help'));
     await tick();
-    assert.deepEqual(results, ['help']);
+    assert.deepEqual(results, []);
+    assert.equal(speech.session.ended, true);
+  } finally {
+    clearBrowser();
+  }
+});
+
+test('refusing echo cancellation all or an ended track stops before native start', async () => {
+  for (const setup of [
+    { gum: 'constraint' },
+    { echo: true },
+    { trackEnded: true },
+  ]) {
+    const control = fakeBrowser(setup);
+    if (setup.trackEnded) {
+      const makeStream = control.makeStream;
+      control.makeStream = () => {
+        const stream = makeStream();
+        stream.getAudioTracks()[0].readyState = 'ended';
+        return stream;
+      };
+    }
+    try {
+      const speech = new Speech();
+      speech.localAvailable = true;
+      await assert.rejects(speech.startListening({}), (error) => error.code === 'audio-capture');
+      assert.equal(control.starts, 0, JSON.stringify(setup));
+      assert.equal(control.tracksStopped, setup.trackEnded || setup.echo === true ? 1 : 0, JSON.stringify(setup));
+    } finally {
+      clearBrowser();
+    }
+  }
+});
+
+test('a capture permission refusal keeps its own recovery code', async () => {
+  const control = fakeBrowser({ gum: 'deny' });
+  try {
+    const speech = new Speech();
+    speech.localAvailable = true;
+    await assert.rejects(speech.startListening({}), (error) => error.code === 'not-allowed');
+    assert.equal(control.starts, 0);
   } finally {
     clearBrowser();
   }
@@ -540,7 +671,7 @@ test('a held start tone cancels without readiness and spares the next cue', asyn
     const first = speech.startListening({});
     await tick();
     await tick();
-    assert.equal(control.oscillators.length, 1);
+    assert.equal(control.oscillators.length, 2);
 
     speech.stopListening();
     assert.deepEqual(await first, { ready: false, cancelled: true, sessionId: 1 });
@@ -551,7 +682,7 @@ test('a held start tone cancels without readiness and spares the next cue', asyn
     const second = speech.startListening({});
     await tick();
     await tick();
-    assert.equal(control.oscillators.length, 2);
+    assert.equal(control.oscillators.length, 4);
     const secondToken = speech.session.readyCueToken;
     assert.ok(secondToken);
 
@@ -561,7 +692,7 @@ test('a held start tone cancels without readiness and spares the next cue', asyn
     assert.equal(speech.session.readyDelivered, false);
     assert.equal(speech.session.readyCueToken, secondToken);
 
-    control.oscillators[1].onended?.();
+    control.oscillators[3].onended?.();
     const outcome = await second;
     assert.equal(outcome.ready, true);
     assert.equal(outcome.sessionId, 2);
@@ -587,8 +718,8 @@ test('an active session is reused instead of starting recognition twice', async 
   }
 });
 
-test('stopping a pending session cancels readiness and ignores stale callbacks', async () => {
-  const control = fakeBrowser({ holdSpeech: true });
+test('stopping while the isolated stream is pending never starts and releases a late stream', async () => {
+  const control = fakeBrowser({ gum: 'pending' });
   try {
     const speech = new Speech();
     speech.localAvailable = true;
@@ -599,28 +730,18 @@ test('stopping a pending session cancels readiness and ignores stale callbacks',
       onEnd: (info) => ends.push(info),
     });
     await tick();
+    assert.equal(control.gumCalls, 1);
     speech.stopListening();
     const outcome = await pending;
     assert.equal(outcome.ready, false);
     assert.equal(outcome.cancelled, true);
+    control.releaseGum();
     await tick();
+    assert.equal(control.starts, 0);
+    assert.equal(control.tracksStopped, 1);
     assert.deepEqual(results, []);
     assert.equal(ends.length, 0);
     assert.equal(speech.listening, false);
-  } finally {
-    clearBrowser();
-  }
-});
-
-test('a failed Listening prompt stops before the microphone opens', async () => {
-  const control = fakeBrowser({ failSpeech: true });
-  try {
-    const speech = new Speech();
-    speech.localAvailable = true;
-    await assert.rejects(speech.startListening({}), (error) => error.code === 'listening');
-    assert.equal(control.starts, 0);
-    assert.equal(control.nativeBusy, false);
-    assert.equal(speech.session.ended, true);
   } finally {
     clearBrowser();
   }
@@ -634,6 +755,7 @@ test('play resolves only after the last tone ends and fails on suspended audio',
     await tick();
     // The choice cue is one short tone.
     assert.equal(control.oscillators.length, 1);
+    assert.equal(Math.max(...control.gains[0].gain.values), 0.15);
     let settled = false;
     playing.then(() => { settled = true; });
     await tick(10);
@@ -661,17 +783,17 @@ test('regression: a timed-out Listening cue never plays after the audio context 
     const speech = new Speech();
     const playing = speech.play('listening');
     await flush();
-    assert.equal(control.oscillators.length, 1);
+    assert.equal(control.oscillators.length, 2);
     const timedOut = control.oscillators[0];
     assert.equal(timedOut.frequency.value, 880);
     assert.equal(timedOut.disconnected, false);
-    assert.equal(control.scheduledStops, 1);
+    assert.equal(control.scheduledStops, 2);
     assert.equal(control.immediateStops, 0);
 
     // Wall time passes while the audio clock is frozen by suspension.
     control.suspendAudio();
     assert.equal(control.advanceAudio(5_000), 0);
-    t.mock.timers.tick(80 + 2_000);
+    t.mock.timers.tick(440 + 2_000);
     await flush();
     assert.equal(await playing, false);
     assert.equal(timedOut.stoppedImmediately, true);
@@ -688,10 +810,10 @@ test('regression: a timed-out Listening cue never plays after the audio context 
     timedOut.onended?.();
     const next = speech.play('listening');
     await flush();
-    assert.equal(control.oscillators.length, 2);
-    const current = control.oscillators[1];
-    assert.equal(control.playableOscillators().length, 1);
-    assert.equal(control.playableOscillators()[0], current);
+    assert.equal(control.oscillators.length, 4);
+    const current = control.oscillators[3];
+    assert.equal(control.playableOscillators().length, 2);
+    assert.equal(control.playableOscillators().at(-1), current);
     timedOut.onended?.();
     timedOut.onended?.();
     await flush();
@@ -755,44 +877,417 @@ test('microphone requests share one pending prompt, stop tracks, and propagate r
   }
 });
 
-test('forceSpeech speaks the status word in screen-reader mode only', async () => {
+test('screen-reader delivery appends every message to the log and never speaks', async () => {
   const control = fakeBrowser();
+  const statusEl = fakeLog();
+  const alertEl = { textContent: '' };
   try {
-    const speech = new Speech({ outputMode: 'screen-reader' });
+    const speech = new Speech();
+    speech.attach({ statusEl, alertEl });
     const normal = await speech.announce('An ordinary answer.');
-    assert.deepEqual(normal, { spoken: true, interrupted: false, reason: null });
-    assert.deepEqual(control.spoken, []);
+    assert.deepEqual(normal, { delivered: true, interrupted: false, reason: null });
+    assert.deepEqual(statusEl.entries.map((entry) => entry.textContent), ['An ordinary answer.']);
 
-    const forced = await speech.announce('working', { forceSpeech: true });
-    assert.equal(forced.spoken, true);
-    assert.deepEqual(control.spoken, ['working']);
+    const status = await speech.announce('working');
+    assert.deepEqual(status, { delivered: true, interrupted: false, reason: null });
+    // Identical messages remain distinct additions so a screen reader reads
+    // each one instead of seeing an unchanged region.
+    await speech.announce('working');
+    assert.deepEqual(statusEl.entries.map((entry) => entry.textContent), [
+      'An ordinary answer.',
+      'working',
+      'working',
+    ]);
+
+    const alert = await speech.announce('Failed.', { alert: true });
+    assert.equal(alert.delivered, true);
+    assert.equal(alertEl.textContent, 'Failed.');
+    assert.equal(statusEl.entries.length, 3);
+
+    speech.clearStatus();
+    assert.equal(statusEl.entries.length, 0);
   } finally {
     clearBrowser();
   }
 });
 
-test('stopping speech settles a chunk that never reports an event', async () => {
-  const control = fakeBrowser({ holdSpeech: true });
+test('a single-value status target still shows only the latest message', async () => {
+  fakeBrowser();
+  const statusEl = { textContent: '' };
   try {
     const speech = new Speech();
-    const pending = speech.announce('A long introduction to interrupt.');
-    await tick();
-    assert.equal(control.speechOptions.length, 1);
-    assert.equal(speech.speaking, true);
-    speech.stopSpeaking('speech');
-    assert.equal(control.stopCalls, 1);
-    assert.equal(speech.currentChunk, null);
-    const outcome = await Promise.race([pending, tick(100).then(() => 'timeout')]);
-    assert.deepEqual(outcome, { spoken: false, interrupted: true, reason: 'speech' });
-    assert.equal(speech.speaking, false);
-    // A late event from the stopped chunk cannot extend or revive output.
-    control.speechOptions[0].onEvent({ type: 'end' });
-    assert.equal(speech.speaking, false);
-    const next = speech.announce('Second message.');
-    await tick();
-    control.speechOptions[1].onEvent({ type: 'end' });
-    assert.deepEqual(await next, { spoken: true, interrupted: false, reason: null });
+    speech.attach({ statusEl, alertEl: { textContent: '' } });
+    await speech.announce('First.');
+    await speech.announce('Second.');
+    assert.equal(statusEl.textContent, 'Second.');
   } finally {
+    clearBrowser();
+  }
+});
+
+test('repeating the same alert text clears the channel first', async () => {
+  fakeBrowser();
+  let value = '';
+  let clears = 0;
+  const alertEl = {
+    get textContent() { return value; },
+    set textContent(next) {
+      if (next === '') clears += 1;
+      value = String(next);
+    },
+  };
+  try {
+    const speech = new Speech();
+    speech.attach({ statusEl: { textContent: '' }, alertEl });
+    await speech.announce('I heard: yes', { alert: true });
+    await speech.announce('I heard: yes', { alert: true });
+    assert.equal(clears, 2);
+    assert.equal(value, 'I heard: yes');
+  } finally {
+    clearBrowser();
+  }
+});
+
+test('a missing live target is not delivered and an empty announcement is a no-op', async () => {
+  fakeBrowser();
+  try {
+    const speech = new Speech();
+    assert.deepEqual(await speech.announce('Nowhere to write.'), {
+      delivered: false,
+      interrupted: false,
+      reason: null,
+    });
+    assert.deepEqual(await speech.announce('   '), {
+      delivered: true,
+      interrupted: false,
+      reason: null,
+    });
+  } finally {
+    clearBrowser();
+  }
+});
+
+test('fifteen seconds of silence ends the authorized command once', async (t) => {
+  const control = fakeBrowser({ audio: 'running' });
+  t.mock.timers.enable({ apis: ['setTimeout'] });
+  const flush = async () => {
+    for (let index = 0; index < 20; index += 1) await Promise.resolve();
+  };
+  try {
+    const speech = new Speech();
+    speech.localAvailable = true;
+    const ends = [];
+    const pending = speech.startListening({ onEnd: (info) => ends.push(info) });
+    await flush();
+    assert.deepEqual(await pending, { ready: true, sessionId: 1 });
+
+    t.mock.timers.tick(14_999);
+    await flush();
+    assert.deepEqual(ends, []);
+    t.mock.timers.tick(1);
+    await flush();
+    assert.equal(ends.length, 1);
+    assert.equal(ends[0].reason, 'no-speech');
+    assert.equal(control.tracksStopped, 1);
+    const starts = control.starts;
+    t.mock.timers.tick(10_000);
+    await flush();
+    assert.equal(control.starts, starts);
+    assert.equal(speech.session.ended, true);
+  } finally {
+    t.mock.timers.reset();
+    clearBrowser();
+  }
+});
+
+test('an early native no-speech restarts the same command without another prompt', async (t) => {
+  const control = fakeBrowser({ audio: 'running' });
+  t.mock.timers.enable({ apis: ['setTimeout'] });
+  const flush = async () => {
+    for (let index = 0; index < 20; index += 1) await Promise.resolve();
+  };
+  try {
+    const speech = new Speech();
+    speech.localAvailable = true;
+    const ready = [];
+    const ends = [];
+    const pending = speech.startListening({
+      onReady: (info) => ready.push(info),
+      onEnd: (info) => ends.push(info),
+    });
+    await flush();
+    await pending;
+    const staleResult = control.recognition.onresult;
+
+    t.mock.timers.tick(5_000);
+    await flush();
+    control.recognition.onerror({ error: 'no-speech' });
+    control.releaseEnd();
+    await flush();
+    assert.equal(control.gumCalls, 1);
+    assert.equal(control.starts, 1);
+    assert.equal(control.oscillators.length, 2);
+
+    t.mock.timers.tick(250);
+    await flush();
+    assert.equal(control.starts, 2);
+    assert.equal(control.recognitions.length, 2);
+    assert.equal(control.oscillators.length, 2);
+    assert.equal(ready.length, 1);
+
+    staleResult(resultEvent('late'));
+    await flush();
+    assert.equal(speech.session.segments.length, 0);
+
+    t.mock.timers.tick(10_000);
+    await flush();
+    assert.equal(ends.length, 1);
+    assert.equal(ends[0].reason, 'no-speech');
+  } finally {
+    t.mock.timers.reset();
+    clearBrowser();
+  }
+});
+
+test('final segments join across a three-second pause and interim text never executes', async (t) => {
+  const control = fakeBrowser({ audio: 'running' });
+  t.mock.timers.enable({ apis: ['setTimeout'] });
+  const flush = async () => {
+    for (let index = 0; index < 20; index += 1) await Promise.resolve();
+  };
+  try {
+    const speech = new Speech();
+    speech.localAvailable = true;
+    const results = [];
+    const ends = [];
+    const pending = speech.startListening({
+      onResult: (text) => results.push(text),
+      onEnd: (info) => ends.push(info),
+    });
+    await flush();
+    await pending;
+
+    control.recognition.onresult(cumulativeEvent([{ transcript: 'Read the first' }]));
+    t.mock.timers.tick(2_000);
+    await flush();
+    assert.deepEqual(results, []);
+
+    control.recognition.onresult(cumulativeEvent([
+      { transcript: 'Read the first' },
+      { transcript: 'paragraph', final: false },
+    ]));
+    t.mock.timers.tick(2_999);
+    await flush();
+    assert.deepEqual(results, []);
+
+    control.recognition.onresult(cumulativeEvent([
+      { transcript: 'Read the first' },
+      { transcript: 'paragraph' },
+    ]));
+    control.recognition.onresult(cumulativeEvent([
+      { transcript: 'Read the first' },
+      { transcript: 'paragraph' },
+    ]));
+    t.mock.timers.tick(2_999);
+    await flush();
+    assert.deepEqual(results, []);
+
+    t.mock.timers.tick(1);
+    await flush();
+    assert.deepEqual(results, ['Read the first paragraph']);
+    assert.equal(ends.length, 1);
+    assert.equal(ends[0].reason, 'final');
+    assert.equal(control.tracksStopped, 1);
+    assert.equal(control.recognitions.length, 1);
+  } finally {
+    t.mock.timers.reset();
+    clearBrowser();
+  }
+});
+
+test('identical words at different finalized indexes are kept', async (t) => {
+  const control = fakeBrowser({ audio: 'running' });
+  t.mock.timers.enable({ apis: ['setTimeout'] });
+  const flush = async () => {
+    for (let index = 0; index < 20; index += 1) await Promise.resolve();
+  };
+  try {
+    const speech = new Speech();
+    speech.localAvailable = true;
+    const results = [];
+    const pending = speech.startListening({ onResult: (text) => results.push(text) });
+    await flush();
+    await pending;
+    control.recognition.onresult(cumulativeEvent([
+      { transcript: 'very' },
+      { transcript: 'very' },
+    ]));
+    t.mock.timers.tick(3_000);
+    await flush();
+    assert.deepEqual(results, ['very very']);
+  } finally {
+    t.mock.timers.reset();
+    clearBrowser();
+  }
+});
+
+test('a final result after stop is included once before native end', async (t) => {
+  const control = fakeBrowser({ audio: 'running', holdEnd: true });
+  t.mock.timers.enable({ apis: ['setTimeout'] });
+  const flush = async () => {
+    for (let index = 0; index < 20; index += 1) await Promise.resolve();
+  };
+  try {
+    const speech = new Speech();
+    speech.localAvailable = true;
+    const results = [];
+    const ends = [];
+    const pending = speech.startListening({
+      onResult: (text) => results.push(text),
+      onEnd: (info) => ends.push(info),
+    });
+    await flush();
+    await pending;
+
+    control.recognition.onresult(resultEvent('Read the first'));
+    t.mock.timers.tick(3_000);
+    await flush();
+    assert.deepEqual(results, []);
+    control.recognition.onresult(cumulativeEvent([
+      { transcript: 'Read the first' },
+      { transcript: 'paragraph' },
+    ]));
+    await flush();
+    control.releaseEnd();
+    await flush();
+    assert.deepEqual(results, ['Read the first paragraph']);
+    assert.equal(ends.length, 1);
+    assert.equal(ends[0].reason, 'final');
+  } finally {
+    t.mock.timers.reset();
+    clearBrowser();
+  }
+});
+
+test('a missing native end after stop delivers only finalized text', async (t) => {
+  const control = fakeBrowser({ audio: 'running', holdEnd: true });
+  t.mock.timers.enable({ apis: ['setTimeout'] });
+  const flush = async () => {
+    for (let index = 0; index < 20; index += 1) await Promise.resolve();
+  };
+  try {
+    const speech = new Speech();
+    speech.localAvailable = true;
+    const results = [];
+    const pending = speech.startListening({ onResult: (text) => results.push(text) });
+    await flush();
+    await pending;
+
+    control.recognition.onresult(resultEvent('Read this'));
+    t.mock.timers.tick(3_000);
+    await flush();
+    t.mock.timers.tick(2_000);
+    await flush();
+    assert.deepEqual(results, ['Read this']);
+    assert.equal(control.tracksStopped, 1);
+    assert.equal(speech.session.ended, true);
+  } finally {
+    t.mock.timers.reset();
+    clearBrowser();
+  }
+});
+
+test('only interim text finishes with no request instead of an instruction', async (t) => {
+  const control = fakeBrowser({ audio: 'running' });
+  t.mock.timers.enable({ apis: ['setTimeout'] });
+  const flush = async () => {
+    for (let index = 0; index < 20; index += 1) await Promise.resolve();
+  };
+  try {
+    const speech = new Speech();
+    speech.localAvailable = true;
+    const results = [];
+    const ends = [];
+    const pending = speech.startListening({
+      onResult: (text) => results.push(text),
+      onEnd: (info) => ends.push(info),
+    });
+    await flush();
+    await pending;
+
+    control.recognition.onresult(resultEvent('unfinished thought', false));
+    control.releaseEnd();
+    await flush();
+    t.mock.timers.tick(3_000);
+    await flush();
+    assert.deepEqual(results, []);
+    assert.equal(ends.length, 1);
+    assert.equal(ends[0].reason, 'no-speech');
+  } finally {
+    t.mock.timers.reset();
+    clearBrowser();
+  }
+});
+
+test('the sixty-second command cap cancels without submitting partial text', async (t) => {
+  const control = fakeBrowser({ audio: 'running' });
+  t.mock.timers.enable({ apis: ['setTimeout'] });
+  const flush = async () => {
+    for (let index = 0; index < 20; index += 1) await Promise.resolve();
+  };
+  try {
+    const speech = new Speech();
+    speech.localAvailable = true;
+    const results = [];
+    const ends = [];
+    const pending = speech.startListening({
+      onResult: (text) => results.push(text),
+      onEnd: (info) => ends.push(info),
+    });
+    await flush();
+    await pending;
+
+    control.recognition.onresult(resultEvent('keep talking', false));
+    t.mock.timers.tick(59_999);
+    await flush();
+    assert.deepEqual(ends, []);
+    t.mock.timers.tick(1);
+    await flush();
+    assert.deepEqual(results, []);
+    assert.equal(ends.length, 1);
+    assert.equal(ends[0].reason, 'timeout');
+    assert.equal(control.tracksStopped, 1);
+  } finally {
+    t.mock.timers.reset();
+    clearBrowser();
+  }
+});
+
+test('cancelling during final flush drops the pending result', async (t) => {
+  const control = fakeBrowser({ audio: 'running', holdEnd: true });
+  t.mock.timers.enable({ apis: ['setTimeout'] });
+  const flush = async () => {
+    for (let index = 0; index < 20; index += 1) await Promise.resolve();
+  };
+  try {
+    const speech = new Speech();
+    speech.localAvailable = true;
+    const results = [];
+    const pending = speech.startListening({ onResult: (text) => results.push(text) });
+    await flush();
+    await pending;
+
+    control.recognition.onresult(resultEvent('Do not use this'));
+    t.mock.timers.tick(3_000);
+    await flush();
+    speech.stopListening();
+    control.releaseEnd();
+    await flush();
+    assert.deepEqual(results, []);
+    assert.equal(speech.session.ended, true);
+    assert.equal(speech.session.cancelled, true);
+  } finally {
+    t.mock.timers.reset();
     clearBrowser();
   }
 });
@@ -833,54 +1328,60 @@ test('the working tone repeats on one timer and stops immediately', async (t) =>
   }
 });
 
-test('cancelling the Listening prompt stops speech and never opens the microphone', async () => {
-  const control = fakeBrowser({ holdSpeech: true });
+test('cancelling before capture resolves leaves no live input and the next request listens once', async () => {
+  const control = fakeBrowser({ gum: 'pending', audio: 'running' });
   try {
     const speech = new Speech();
     speech.localAvailable = true;
     const pending = speech.startListening({});
     await tick();
-    assert.equal(control.starts, 0);
+    assert.equal(control.gumCalls, 1);
 
     speech.stopListening();
-    assert.equal(control.stopCalls, 1);
     assert.deepEqual(await pending, { ready: false, cancelled: true, sessionId: 1 });
     assert.equal(control.starts, 0);
     assert.equal(speech.listening, false);
 
-    // The next request gets its own spoken prompt and recognizer.
-    control.ttsHold = false;
+    // The cancelled request still receives its stream and must release it.
+    control.releaseGum();
+    await tick();
+    assert.equal(control.starts, 0);
+    assert.equal(control.tracksStopped, 1);
+    assert.equal(control.lastTrack.readyState, 'ended');
+
+    control.gum = 'grant';
     const next = speech.startListening({});
     await tick();
-    assert.equal(control.spoken.at(-1), 'Listening');
     assert.equal(control.starts, 1);
+    assert.equal(control.startArgs.at(-1).kind, 'audio');
     assert.equal((await next).ready, true);
   } finally {
     clearBrowser();
   }
 });
 
-test('a newer reply is not stopped by the old session cleanup', async () => {
-  const control = fakeBrowser({ holdSpeech: true });
+test('a newer announcement is delivered without reviving the old capture', async () => {
+  const control = fakeBrowser({ gum: 'pending' });
+  const statusEl = fakeLog();
   try {
     const speech = new Speech();
+    speech.attach({ statusEl, alertEl: { textContent: '' } });
     speech.localAvailable = true;
     const pending = speech.startListening({});
     await tick();
-    assert.equal(control.starts, 0);
+    assert.equal(control.gumCalls, 1);
 
-    const answer = speech.announce('An answer replaces the prompt.');
-    await tick();
-    assert.equal(control.stopCalls, 1);
-    assert.equal(control.heldSpeech.length, 1);
+    const answer = await speech.announce('An answer replaces the capture.');
+    assert.equal(answer.delivered, true);
+    assert.deepEqual(statusEl.entries.map((entry) => entry.textContent), [
+      'An answer replaces the capture.',
+    ]);
 
-    speech.stopListening();
-    assert.equal(control.stopCalls, 1);
-    assert.equal(control.heldSpeech.length, 1);
-
-    control.releaseSpeech();
-    assert.equal((await answer).spoken, true);
     assert.equal((await pending).cancelled, true);
+    control.releaseGum();
+    await tick();
+    assert.equal(control.starts, 0);
+    assert.equal(control.tracksStopped, 1);
   } finally {
     clearBrowser();
   }
@@ -1041,7 +1542,7 @@ test('a start timeout with no native end retries with a fresh recognizer', async
     t.mock.timers.tick(2_000);
     await flush();
 
-    // Once the native session finally ends, Alt+Z can listen again.
+    // Once the native session finally ends, the next listen request can start.
     control.releaseEnd();
     await flush();
     control.holdStart = false;

@@ -5,19 +5,29 @@ export const SOUND_CUES = Object.freeze({
   choose: [[660, 80]],
   cancel: [[440, 80], [220, 120]],
   fail: [[220, 80], [220, 80]],
-  listening: [[880, 80]],
+  listening: [[880, 180], [880, 180]],
   working: [[440, 50], [550, 50]],
 });
 
 const START_TIMEOUT_MS = 10_000;
+const INITIAL_SPEECH_TIMEOUT_MS = 15_000;
+const SPEECH_PAUSE_MS = 3_000;
+const COMMAND_TIMEOUT_MS = 60_000;
+const RECOGNITION_RESTART_MS = 250;
 const ABORT_TIMEOUT_MS = 2_000;
 const RESUME_TIMEOUT_MS = 2_000;
 const CUE_GRACE_MS = 2_000;
+const CUE_GAP_MS = 80;
 const CUE_GAIN = 0.15;
+const LISTENING_GAIN = 0.25;
 const WORKING_GAIN = 0.035;
 const WORKING_DELAY_MS = 400;
 const WORKING_GAP_MS = 1200;
 const WORKING_FAILURES = 3;
+// Chrome only honors the track overload on these platforms; elsewhere the
+// extra argument can be dropped and the default microphone used instead.
+const ISOLATED_INPUT_OS = new Set(['win', 'mac', 'linux']);
+const ISOLATION_UNAVAILABLE = 'System audio cancellation is unavailable for this recording. Speech did not start. You can type instead.';
 
 const wait = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
@@ -27,33 +37,38 @@ function speechError(code, message) {
   return error;
 }
 
-export function pickVoice(voices, lang) {
-  if (!Array.isArray(voices) || voices.length === 0) return null;
-  const exact = voices.filter((voice) => voice.lang === lang);
-  const prefix = voices.filter((voice) => voice.lang?.startsWith(lang.split('-')[0]));
-  const pool = exact.length ? exact : prefix;
-  if (!pool.length) return null;
-  return pool.find((voice) => voice.localService) ?? pool[0];
+function releaseStream(stream) {
+  for (const track of stream?.getTracks?.() ?? []) {
+    try { track.stop(); } catch {}
+  }
 }
 
-export function chunkText(text, max = 32_000) {
-  const value = String(text ?? '').trim();
-  if (!value) return [];
-  if (value.length <= max) return [value];
-  const chunks = [];
-  let rest = value;
-  while (rest.length > max) {
-    const window = rest.slice(0, max);
-    const cut = Math.max(
-      window.lastIndexOf('. '), window.lastIndexOf('! '), window.lastIndexOf('? '),
-      window.lastIndexOf('; '), window.lastIndexOf('\n'),
-    );
-    const end = cut > max * 0.6 ? cut + 1 : max;
-    chunks.push(rest.slice(0, end).trim());
-    rest = rest.slice(end).trim();
+function captureError(error) {
+  if (error?.name === 'NotAllowedError' || error?.name === 'SecurityError') {
+    return speechError('not-allowed', 'Microphone permission was denied.');
   }
-  if (rest) chunks.push(rest);
-  return chunks;
+  if (error?.name === 'OverconstrainedError') {
+    return speechError('audio-capture', ISOLATION_UNAVAILABLE);
+  }
+  return speechError('mic', `Cannot use the microphone: ${error?.message ?? 'no input device was found'}`);
+}
+
+// Speech-only shortening. Callers keep the real origins for consent, storage,
+// and requests. Every HTTPS site is spoken as its host without a leading www;
+// other schemes and unparseable values stay unchanged.
+export function spokenSites(origins) {
+  if (!Array.isArray(origins)) return [];
+  return origins.map((origin) => {
+    if (typeof origin !== 'string') return origin;
+    let url;
+    try {
+      url = new URL(origin);
+    } catch {
+      return origin;
+    }
+    if (url.protocol !== 'https:') return origin;
+    return url.host.startsWith('www.') ? url.host.slice(4) : url.host;
+  });
 }
 
 export function localRecognitionSupported(Recognition) {
@@ -61,16 +76,12 @@ export function localRecognitionSupported(Recognition) {
 }
 
 export class Speech {
-  constructor({ lang = 'en-US', outputMode = 'tts' } = {}) {
+  constructor({ lang = 'en-US' } = {}) {
     this.lang = lang;
-    this.outputMode = outputMode;
     this.statusEl = null;
     this.alertEl = null;
     this.audio = null;
-    this.voiceName = null;
-    this.speaking = false;
     this.listening = false;
-    this.generation = 0;
     this.sessionSeq = 0;
     this.session = null;
     this.inputGeneration = 0;
@@ -83,10 +94,6 @@ export class Speech {
     this.cuePromise = null;
     this.cueFinish = null;
     this.cueInterrupted = false;
-    this.currentChunk = null;
-    this.stopReason = null;
-    this.promptSession = null;
-    this.promptGeneration = null;
     this.workingActive = false;
     this.workingTimer = null;
     this.workingToken = 0;
@@ -97,19 +104,6 @@ export class Speech {
   attach({ statusEl, alertEl }) {
     this.statusEl = statusEl;
     this.alertEl = alertEl;
-  }
-
-  setOutputMode(mode) {
-    this.outputMode = mode === 'screen-reader' ? 'screen-reader' : 'tts';
-  }
-
-  async loadVoice() {
-    try {
-      const voices = await chrome.tts.getVoices();
-      this.voiceName = pickVoice(voices, this.lang)?.voiceName ?? null;
-    } catch {
-      this.voiceName = null;
-    }
   }
 
   async resumeAudio() {
@@ -170,26 +164,29 @@ export class Speech {
     this.cueFinish = stopCue;
     try {
       const start = this.audio.currentTime + 0.01;
+      const gainValue = name === 'listening' ? LISTENING_GAIN : CUE_GAIN;
       let offset = 0;
-      for (const [frequency, duration] of cue) {
+      for (const [index, [frequency, duration]] of cue.entries()) {
         const oscillator = this.audio.createOscillator();
         const gain = this.audio.createGain();
         nodes.push({ oscillator, gain });
         oscillator.type = 'sine';
         oscillator.frequency.value = frequency;
         gain.gain.setValueAtTime(0.0001, start + offset);
-        gain.gain.exponentialRampToValueAtTime(CUE_GAIN, start + offset + 0.01);
+        gain.gain.exponentialRampToValueAtTime(gainValue, start + offset + 0.01);
         gain.gain.exponentialRampToValueAtTime(0.0001, start + offset + duration / 1000);
         oscillator.connect(gain).connect(this.audio.destination);
         oscillator.start(start + offset);
         oscillator.stop(start + offset + duration / 1000);
         offset += duration / 1000;
+        if (index < cue.length - 1) offset += CUE_GAP_MS / 1000;
       }
       nodes.at(-1).oscillator.onended = () => {
         release(false);
         finish(true);
       };
-      const totalMs = cue.reduce((sum, [, duration]) => sum + duration, 0);
+      const tones = cue.reduce((sum, [, duration]) => sum + duration, 0);
+      const totalMs = tones + CUE_GAP_MS * (cue.length - 1);
       const timer = setTimeout(stopCue, totalMs + CUE_GRACE_MS);
       const result = await finished;
       clearTimeout(timer);
@@ -245,8 +242,8 @@ export class Speech {
 
   async playWorkingGroup(token) {
     if (!this.workingActive || token !== this.workingToken) return;
-    // Spoken output, listening, and earcons win; retry after the gap.
-    if (this.speaking || this.listening || this.cuePromise) {
+    // Listening and earcons win; retry after the gap.
+    if (this.listening || this.cuePromise) {
       this.scheduleWorking(WORKING_GAP_MS);
       return;
     }
@@ -256,7 +253,7 @@ export class Speech {
       this.workingFailures += 1;
       if (this.workingFailures >= WORKING_FAILURES) {
         this.stopWorking();
-        this.writeStatus('The working sound could not play. Spoken controls still work.', true);
+        this.writeStatus('The working sound could not play. Spoken controls still work.');
         return;
       }
       this.scheduleWorking(WORKING_GAP_MS);
@@ -290,90 +287,39 @@ export class Speech {
 
   writeStatus(text, alert = false) {
     const target = alert ? this.alertEl : this.statusEl;
-    if (target) target.textContent = String(text);
-  }
-
-  speakChunk(text) {
-    return new Promise((resolve) => {
-      let settled = false;
-      const chunk = { finish: null };
-      const finish = (ok) => {
-        if (settled) return;
-        settled = true;
-        clearTimeout(timer);
-        if (this.currentChunk === chunk) this.currentChunk = null;
-        resolve(ok);
-      };
-      chunk.finish = finish;
-      this.currentChunk = chunk;
-      const timer = setTimeout(() => finish(false), Math.min(30_000, 2000 + text.length * 100));
-      try {
-        chrome.tts.speak(text, {
-          lang: this.lang,
-          rate: 1,
-          pitch: 1,
-          volume: 1,
-          ...(this.voiceName ? { voiceName: this.voiceName } : {}),
-          onEvent: (event) => {
-            if (event.type === 'end') {
-              finish(true);
-            } else if (event.type === 'error' || event.type === 'interrupted' || event.type === 'cancelled') {
-              finish(false);
-            }
-          },
-        });
-      } catch {
-        finish(false);
-      }
-    });
-  }
-
-  // forceSpeech bypasses the screen-reader output mode for mandatory status
-  // words and for reading recognized speech back before it is used; ordinary
-  // answers keep the user's chosen output.
-  async announce(text, { alert = false, keepListening = false, forceSpeech = false } = {}) {
-    const value = String(text ?? '').trim();
-    if (!value) return { spoken: true, interrupted: false, reason: null };
-    if (!keepListening) this.stopListening();
-    if (this.speaking || this.currentChunk) this.stopSpeaking('replaced');
-    const generation = ++this.generation;
-    this.stopReason = null;
-    this.speaking = true;
-    const interrupted = () => ({ spoken: false, interrupted: true, reason: this.stopReason ?? 'replaced' });
-    try {
-      if (this.outputMode === 'screen-reader' && !forceSpeech) {
-        this.writeStatus(value, alert);
-        return { spoken: true, interrupted: false, reason: null };
-      }
-      let spoken = true;
-      for (const chunk of chunkText(value)) {
-        if (generation !== this.generation) return interrupted();
-        const ok = await this.speakChunk(chunk);
-        if (generation !== this.generation) return interrupted();
-        if (!ok) {
-          spoken = false;
-          break;
-        }
-      }
-      if (!spoken) this.writeStatus(value, alert);
-      return { spoken, interrupted: false, reason: null };
-    } finally {
-      if (generation === this.generation) this.speaking = false;
+    if (!target || target.isConnected === false) return false;
+    const value = String(text);
+    if (!alert && target.getAttribute?.('role') === 'log' && target.ownerDocument) {
+      // A log accumulates messages: replacing its text would overwrite what a
+      // screen reader has not read yet. Append one populated node per message.
+      const message = target.ownerDocument.createElement('div');
+      message.textContent = value;
+      target.append(message);
+      return true;
     }
+    // The alert channel and single-value status targets show only the latest;
+    // clearing first lets an identical message produce a fresh announcement.
+    if (alert) target.textContent = '';
+    target.textContent = value;
+    return true;
   }
 
-  // Settles the blocked chunk even when Chrome sends no event for stop(), so a
-  // late event can never touch newer output.
-  stopSpeaking(reason = 'user') {
-    this.generation += 1;
-    this.stopReason = reason;
-    this.speaking = false;
-    const chunk = this.currentChunk;
-    this.currentChunk = null;
-    chunk?.finish(false);
-    try {
-      chrome.tts.stop();
-    } catch {}
+  clearStatus() {
+    if (this.statusEl) this.statusEl.textContent = '';
+  }
+
+  // A live-region write is delivery to the page, not proof that a screen
+  // reader finished speaking. Stopping recording here keeps a readback from
+  // being captured as a new command.
+  async announce(text, { alert = false } = {}) {
+    const value = String(text ?? '').trim();
+    if (!value) return { delivered: true, interrupted: false, reason: null };
+    this.stopListening();
+    return {
+      delivered: this.writeStatus(value, alert),
+      interrupted: false,
+      reason: null,
+    };
   }
 
   recognitionClass() {
@@ -387,8 +333,8 @@ export class Speech {
     if (!this.recognition) {
       const recognition = new Recognition();
       recognition.lang = this.lang;
-      recognition.interimResults = false;
-      recognition.continuous = false;
+      recognition.interimResults = true;
+      recognition.continuous = true;
       recognition.maxAlternatives = 1;
       this.recognition = recognition;
     }
@@ -531,17 +477,13 @@ export class Speech {
     }
   }
 
-  async ensureRecognitionReady() {
-    // Every listening session owns a fresh native recognizer. A previous
-    // session that lost its end event can never block the next Alt+Z.
+  createNativeRecognition() {
+    // Every native attempt owns a fresh recognizer. A previous attempt that
+    // lost its end event can never receive results for the next one.
     this.recognition = null;
     const recognition = this.ensureRecognition();
     if (!('processLocally' in recognition)) {
       throw speechError('unsupported', 'This Chrome does not support local speech recognition.');
-    }
-    if (!this.localAvailable) await this.refreshLocalStatus();
-    if (!this.localAvailable) {
-      throw speechError('unavailable', 'The English speech pack is still being prepared. Try again in a moment.');
     }
     try {
       recognition.processLocally = true;
@@ -552,9 +494,17 @@ export class Speech {
     return recognition;
   }
 
+  async ensureRecognitionReady() {
+    if (!this.localAvailable) await this.refreshLocalStatus();
+    if (!this.localAvailable) {
+      throw speechError('unavailable', 'The English speech pack is still being prepared. Try again in a moment.');
+    }
+    return this.createNativeRecognition();
+  }
+
   current(session) {
     return this.session === session && !session.ended && !session.cancelled
-      && !session.closing && !session.failure;
+      && !session.failure && !session.finalDelivered && !session.terminal;
   }
 
   startListening({ onResult, onError, onReady, onEnd } = {}) {
@@ -614,9 +564,28 @@ export class Speech {
       failure: null,
       reason: null,
       recognition: null,
+      stream: null,
+      track: null,
       startTimer: null,
       endTimer: null,
       readyCueToken: null,
+      attempt: null,
+      preparedRecognition: null,
+      finishing: false,
+      terminal: false,
+      segments: [],
+      initialTimer: null,
+      pauseTimer: null,
+      commandTimer: null,
+      restartTimer: null,
+      initialDeadline: 0,
+      commandDeadline: 0,
+      pauseDeadline: 0,
+      deadlinesStarted: false,
+      hasSpeech: false,
+      speechActive: false,
+      restartPending: false,
+      errorDelivered: false,
     };
     session.endedPromise = new Promise((resolve) => { session.resolveEnd = resolve; });
     session.ready = new Promise((resolve, reject) => {
@@ -633,9 +602,23 @@ export class Speech {
   }
 
   async runSession(session) {
-    let recognition;
+    let platform = null;
     try {
-      recognition = await this.ensureRecognitionReady();
+      platform = (await chrome.runtime.getPlatformInfo())?.os ?? null;
+    } catch {}
+    if (!this.current(session)) {
+      this.finishSession(session, 'cancelled');
+      return;
+    }
+    if (!ISOLATED_INPUT_OS.has(platform)) {
+      this.failSession(session, speechError(
+        'unsupported-input',
+        'This system cannot isolate the microphone for local recognition. You can type instead.',
+      ));
+      return;
+    }
+    try {
+      session.preparedRecognition = await this.ensureRecognitionReady();
     } catch (error) {
       this.failSession(session, error);
       return;
@@ -644,88 +627,193 @@ export class Speech {
       this.finishSession(session, 'cancelled');
       return;
     }
-    session.recognition = recognition;
-    // The word must finish before the microphone opens, so the recognizer can
-    // never capture the assistant's own prompt.
-    const prompt = this.announce('Listening', { forceSpeech: true, keepListening: true });
-    const promptGeneration = this.generation;
-    this.promptSession = session;
-    this.promptGeneration = promptGeneration;
-    const outcome = await prompt;
-    if (this.promptSession === session && this.promptGeneration === promptGeneration) {
-      this.promptSession = null;
-      this.promptGeneration = null;
+    let stream;
+    try {
+      stream = await navigator.mediaDevices.getUserMedia({
+        audio: { echoCancellation: { exact: 'all' } },
+      });
+    } catch (error) {
+      if (!this.current(session)) {
+        this.finishSession(session, 'cancelled');
+        return;
+      }
+      this.failSession(session, captureError(error));
+      return;
     }
+    // A stream that arrives after a cancel still owns live tracks.
     if (!this.current(session)) {
+      releaseStream(stream);
       this.finishSession(session, 'cancelled');
       return;
     }
-    if (outcome.interrupted) {
-      this.stopListening();
+    session.stream = stream;
+    session.track = stream?.getAudioTracks?.()[0] ?? null;
+    const track = session.track;
+    if (!track || track.kind !== 'audio' || track.readyState !== 'live') {
+      this.releaseInput(session);
+      this.failSession(session, speechError('audio-capture', ISOLATION_UNAVAILABLE));
       return;
     }
-    if (!outcome.spoken) {
-      this.failSession(session, speechError(
-        'listening',
-        'The listening prompt could not be spoken. Check the speech output, then press Alt+Z to try again.',
-      ));
+    if (track.getSettings?.().echoCancellation !== 'all') {
+      this.releaseInput(session);
+      this.failSession(session, speechError('audio-capture', ISOLATION_UNAVAILABLE));
       return;
     }
-    this.bindRecognition(session);
-    session.startTimer = setTimeout(() => {
-      if (session.started || session.ended) return;
-      this.failSession(session, speechError('start-timeout', 'Chrome did not start listening. Press Alt+Z to try again.'));
-    }, START_TIMEOUT_MS);
-    // Set before the native call: a throwing start() can still leave the
-    // recognizer active, so this session must also release through onend.
-    session.startRequested = true;
+    track.onended = () => {
+      if (!this.current(session)) return;
+      this.failSession(session, speechError('audio-capture', 'The microphone stopped. Choose Listen to try again, or type instead.'));
+    };
+    this.startAttempt(session);
+  }
+
+  startAttempt(session) {
+    if (!this.current(session) || session.finishing) return;
+    const track = session.track;
+    if (!track || track.kind !== 'audio' || track.readyState !== 'live') {
+      this.failSession(session, speechError('audio-capture', ISOLATION_UNAVAILABLE));
+      return;
+    }
+    let recognition;
     try {
-      recognition.start();
+      recognition = session.preparedRecognition ?? this.createNativeRecognition();
+      session.preparedRecognition = null;
+    } catch (error) {
+      this.failSession(session, error);
+      return;
+    }
+    const attempt = {
+      recognition,
+      started: false,
+      retired: false,
+      ignoredFloor: 0,
+      finals: new Map(),
+      interims: new Map(),
+      startTimer: null,
+      endTimer: null,
+      flushed: false,
+    };
+    session.recognition = recognition;
+    session.attempt = attempt;
+    // Set before the native call: a throwing start() can still leave the
+    // recognizer active, so the session must also release through onend.
+    session.startRequested = true;
+    recognition.onstart = () => { void this.handleStart(session, attempt); };
+    recognition.onresult = (event) => { this.handleResult(session, attempt, event); };
+    recognition.onerror = (event) => { this.handleError(session, attempt, event); };
+    recognition.onspeechstart = () => { this.handleSpeech(session, attempt, true); };
+    recognition.onspeechend = () => { this.handleSpeech(session, attempt, false); };
+    recognition.onend = () => { this.handleEnd(session, attempt); };
+    attempt.startTimer = setTimeout(() => {
+      if (!this.current(session) || session.attempt !== attempt || attempt.started || attempt.retired) return;
+      this.failSession(session, speechError('start-timeout', 'Chrome did not start listening. Choose Listen to try again.'));
+    }, START_TIMEOUT_MS);
+    try {
+      recognition.start(track);
     } catch (error) {
       this.failSession(session, speechError('start', `Could not start recognition: ${error?.message ?? 'try again'}`));
     }
   }
 
-  bindRecognition(session) {
-    const recognition = session.recognition;
-    recognition.onstart = () => { void this.handleStart(session); };
-    recognition.onresult = (event) => { this.handleResult(session, event); };
-    recognition.onerror = (event) => { this.handleError(session, event); };
-    recognition.onend = () => { this.handleEnd(session); };
-  }
-
-  async handleStart(session) {
-    if (!this.current(session)) {
+  async handleStart(session, attempt) {
+    if (!this.current(session) || session.attempt !== attempt || attempt.retired) {
       // An abort issued while start was in flight may not have taken effect;
       // release this old recognizer again without touching a newer session.
-      try { session.recognition?.abort(); } catch {}
+      try { attempt.recognition.abort(); } catch {}
       return;
     }
-    if (session.started) return;
-    clearTimeout(session.startTimer);
+    if (attempt.started) return;
+    clearTimeout(attempt.startTimer);
+    attempt.startTimer = null;
+    attempt.started = true;
     session.started = true;
     this.listening = true;
+    if (session.readyDelivered) {
+      // A restarted recognizer never replays the prompt, cue, or ready event.
+      session.restartPending = false;
+      return;
+    }
     // The earcon is the real microphone-ready signal, not the prompt. Wait for
-    // this session's cue, without turning unavailable audio into a failed mic.
+    // the complete double tone, without turning unavailable audio into a
+    // failed microphone.
     const cue = this.play('listening');
     const token = this.cueToken;
     session.readyCueToken = token;
     const played = await cue;
     if (session.readyCueToken === token) session.readyCueToken = null;
     if (!this.current(session)) {
-      try { session.recognition?.abort(); } catch {}
+      try { attempt.recognition.abort(); } catch {}
       return;
     }
-    if (token !== this.cueToken) {
+    // No ready signal means no recording: stop the live input instead of
+    // listening without telling the user the microphone is ready.
+    if (token !== this.cueToken || played !== true) {
       this.failSession(session, speechError(
         'listening',
-        'The start sound was replaced before listening began. Press Alt+Z to try again.',
+        'The start sound could not play, so listening stopped. Check the system sound, then choose Listen to try again.',
       ));
       return;
     }
     session.readyDelivered = true;
+    this.startDeadlines(session);
     session.settle?.({ ready: true, sessionId: session.id });
-    session.handlers.onReady?.({ sessionId: session.id, cuePlayed: played === true });
+    session.handlers.onReady?.({ sessionId: session.id, cuePlayed: true });
+    // The first recognizer may have ended while the cue was still playing.
+    if (session.restartPending) this.scheduleRestart(session);
+  }
+
+  startDeadlines(session) {
+    if (session.deadlinesStarted || !this.current(session)) return;
+    session.deadlinesStarted = true;
+    const now = Date.now();
+    session.initialDeadline = now + INITIAL_SPEECH_TIMEOUT_MS;
+    session.commandDeadline = now + COMMAND_TIMEOUT_MS;
+    session.initialTimer = setTimeout(() => {
+      if (!this.current(session) || session.hasSpeech) return;
+      this.endWith(session, 'no-speech');
+    }, INITIAL_SPEECH_TIMEOUT_MS);
+    session.commandTimer = setTimeout(() => {
+      if (!this.current(session)) return;
+      this.endWith(session, 'timeout');
+    }, COMMAND_TIMEOUT_MS);
+  }
+
+  clearPause(session) {
+    clearTimeout(session.pauseTimer);
+    session.pauseTimer = null;
+    session.pauseDeadline = 0;
+  }
+
+  resetPause(session) {
+    if (!this.current(session) || session.finishing) return;
+    this.clearPause(session);
+    session.pauseDeadline = Date.now() + SPEECH_PAUSE_MS;
+    session.pauseTimer = setTimeout(() => {
+      session.pauseTimer = null;
+      if (!this.current(session) || session.finishing) return;
+      this.beginFinishing(session);
+    }, SPEECH_PAUSE_MS);
+  }
+
+  // Restarts and native phrase ends must not postpone an existing quiet
+  // deadline; only new speech activity may rearm it.
+  ensurePause(session) {
+    if (session.pauseTimer || session.finishing) return;
+    this.resetPause(session);
+  }
+
+  handleSpeech(session, attempt, active) {
+    if (!this.current(session) || session.attempt !== attempt || attempt.retired) return;
+    if (!session.readyDelivered) return;
+    session.hasSpeech = true;
+    if (active) {
+      session.speechActive = true;
+      clearTimeout(session.initialTimer);
+      session.initialTimer = null;
+      this.clearPause(session);
+      return;
+    }
+    session.speechActive = false;
+    this.resetPause(session);
   }
 
   cancelSessionCue(session) {
@@ -735,66 +823,289 @@ export class Speech {
     if (token === this.cueToken) this.cancelCue();
   }
 
-  handleResult(session, event) {
-    if (!this.current(session)) return;
-    if (session.finalDelivered) return;
-    const last = event.results?.[event.results.length - 1];
-    if (!last?.isFinal) return;
-    const text = last[0]?.transcript?.trim();
-    if (!text) return;
-    if (!session.readyDelivered) return;
-    if (this.speaking) return;
-    session.finalDelivered = true;
-    session.reason = 'final';
-    this.listening = false;
-    try { session.recognition.stop(); } catch {}
-    session.handlers.onResult?.(text, { sessionId: session.id });
-  }
-
-  handleError(session, event) {
-    if (!this.current(session)) return;
-    session.reason = event.error ?? 'error';
-    this.listening = false;
-    if (!session.started) {
-      const message = event.error === 'not-allowed'
-        ? 'Microphone permission was denied.'
-        : `Could not start recognition: ${event.error ?? 'unknown error'}`;
-      this.failSession(session, speechError(event.error ?? 'start', message));
+  handleResult(session, attempt, event) {
+    if (!this.current(session) || session.attempt !== attempt || attempt.retired) return;
+    const results = event?.results;
+    if (!results) return;
+    if (!session.readyDelivered) {
+      // Speech before the ready cue is not a command. Remember where it ended
+      // so a later cumulative event cannot replay it.
+      attempt.ignoredFloor = Math.max(attempt.ignoredFloor, results.length);
       return;
     }
-    if (event.error !== 'aborted' && event.error !== 'no-speech') session.handlers.onError?.(event.error);
+    let heard = false;
+    let sawFinal = false;
+    for (let index = 0; index < results.length; index += 1) {
+      if (index < attempt.ignoredFloor) continue;
+      const result = results[index];
+      const text = result?.[0]?.transcript?.trim();
+      if (!text) continue;
+      if (result.isFinal) {
+        if (attempt.finals.get(index) === text) continue;
+        attempt.finals.set(index, text);
+        sawFinal = true;
+        heard = true;
+      } else {
+        if (attempt.interims.get(index) === text) continue;
+        attempt.interims.set(index, text);
+        heard = true;
+      }
+    }
+    if (!heard || session.finishing) return;
+    session.hasSpeech = true;
+    if (sawFinal) {
+      // A finalized phrase is the only executable text; interim hypotheses
+      // only keep the command alive.
+      session.speechActive = false;
+      clearTimeout(session.initialTimer);
+      session.initialTimer = null;
+      this.resetPause(session);
+      return;
+    }
+    session.speechActive = true;
+    clearTimeout(session.initialTimer);
+    session.initialTimer = null;
+    this.clearPause(session);
   }
 
-  handleEnd(session) {
-    if (session.ended) return;
-    const wasCurrent = this.session === session;
-    if (!session.started && !session.settled) {
-      session.settle?.({ ready: false, cancelled: session.cancelled, sessionId: session.id });
+  flushAttempt(session, attempt) {
+    if (attempt.flushed) return;
+    attempt.flushed = true;
+    const ordered = [...attempt.finals.entries()].sort((a, b) => a[0] - b[0]);
+    for (const [, text] of ordered) session.segments.push(text);
+  }
+
+  detachAttempt(attempt) {
+    if (!attempt) return;
+    clearTimeout(attempt.startTimer);
+    clearTimeout(attempt.endTimer);
+    attempt.startTimer = null;
+    attempt.endTimer = null;
+    const recognition = attempt.recognition;
+    if (recognition) {
+      recognition.onstart = null;
+      recognition.onresult = null;
+      recognition.onerror = null;
+      recognition.onend = null;
+      recognition.onspeechstart = null;
+      recognition.onspeechend = null;
     }
-    const reason = session.reason ?? (session.cancelled ? 'cancelled' : 'end');
+    attempt.retired = true;
+  }
+
+  handleError(session, attempt, event) {
+    if (!this.current(session) || session.attempt !== attempt || attempt.retired) return;
+    const code = event?.error ?? 'error';
+    if (!attempt.started) {
+      const message = code === 'not-allowed'
+        ? 'Microphone permission was denied.'
+        : `Could not start recognition: ${code}`;
+      this.failSession(session, speechError(code, message));
+      return;
+    }
+    if (code === 'aborted') return;
+    if (code === 'no-speech') {
+      // Early engine silence is not the user's 15-second window. Wait for the
+      // native end before starting a fresh recognizer; a busy instance is
+      // never restarted over.
+      clearTimeout(attempt.endTimer);
+      attempt.endTimer = setTimeout(() => {
+        if (!this.current(session) || session.attempt !== attempt || attempt.retired) return;
+        try { attempt.recognition.abort(); } catch {}
+        this.failSession(session, speechError(
+          'recognition',
+          'Speech recognition stopped before the microphone released. Choose Listen to try again, or type instead.',
+        ));
+      }, ABORT_TIMEOUT_MS);
+      return;
+    }
+    this.failSession(session, speechError(code, `Speech recognition stopped: ${code}. Choose Listen to try again, or type instead.`));
+  }
+
+  handleEnd(session, attempt) {
+    if (attempt.retired || session.attempt !== attempt) return;
+    clearTimeout(attempt.startTimer);
+    attempt.startTimer = null;
+    clearTimeout(attempt.endTimer);
+    attempt.endTimer = null;
+    this.flushAttempt(session, attempt);
+    this.detachAttempt(attempt);
+    session.attempt = null;
+    if (session.ended) return;
+    this.listening = false;
+    if (session.cancelled || session.failure) {
+      this.finishSession(session, session.cancelled ? 'cancelled' : 'error');
+      return;
+    }
+    if (session.finishing) {
+      this.completeFinal(session);
+      return;
+    }
+    if (!session.readyDelivered) {
+      // The cue may still be playing; restart once readiness is delivered.
+      session.restartPending = true;
+      return;
+    }
+    if (!attempt.started) {
+      this.failSession(session, speechError('start', 'Chrome could not start speech recognition. Choose Listen to try again.'));
+      return;
+    }
+    // A native end closes one phrase, not the command. Keep what was finalized
+    // and restart on the same isolated track without extending a quiet deadline.
+    session.speechActive = false;
+    if (session.hasSpeech) this.ensurePause(session);
+    this.scheduleRestart(session);
+  }
+
+  scheduleRestart(session) {
+    if (!this.current(session) || session.finishing || session.restartTimer) return;
+    session.restartPending = false;
+    session.restartTimer = setTimeout(() => {
+      session.restartTimer = null;
+      if (!this.current(session) || session.finishing) return;
+      this.startAttempt(session);
+    }, RECOGNITION_RESTART_MS);
+  }
+
+  beginFinishing(session) {
+    if (!this.current(session) || session.finishing) return;
+    session.finishing = true;
+    this.clearListeningTimers(session);
+    const attempt = session.attempt;
+    if (!attempt) {
+      this.completeFinal(session);
+      return;
+    }
+    clearTimeout(attempt.endTimer);
+    attempt.endTimer = setTimeout(() => {
+      if (!this.current(session) || session.attempt !== attempt) return;
+      try { attempt.recognition.abort(); } catch {}
+      this.completeFinal(session);
+    }, ABORT_TIMEOUT_MS);
+    try {
+      attempt.recognition.stop();
+    } catch {
+      try { attempt.recognition.abort(); } catch {}
+      this.completeFinal(session);
+    }
+  }
+
+  completeFinal(session) {
+    if (session.ended || session.finalDelivered) return;
+    const attempt = session.attempt;
+    if (attempt) {
+      this.flushAttempt(session, attempt);
+      this.detachAttempt(attempt);
+      session.attempt = null;
+    }
+    if (session.ended || session.finalDelivered) return;
+    session.finalDelivered = true;
+    session.reason = 'final';
+    this.clearTimers(session);
+    this.listening = false;
+    this.releaseInput(session);
+    const text = session.segments.join(' ').replace(/\s+/gu, ' ').trim();
+    this.finishSession(session, text ? 'final' : 'no-speech');
+    if (text) session.handlers.onResult?.(text, { sessionId: session.id });
+    session.handlers.onEnd?.({ sessionId: session.id, reason: text ? 'final' : 'no-speech' });
+  }
+
+  endWith(session, reason) {
+    if (!this.current(session) || session.finishing) return;
+    session.terminal = true;
+    session.reason = reason;
+    this.clearTimers(session);
+    this.listening = false;
+    this.releaseInput(session);
+    const attempt = session.attempt;
+    if (attempt) {
+      this.detachAttempt(attempt);
+      try { attempt.recognition.abort(); } catch {}
+      session.attempt = null;
+    }
+    this.cancelSessionCue(session);
     this.finishSession(session, reason);
-    if (wasCurrent && !session.cancelled) session.handlers.onEnd?.({ sessionId: session.id, reason });
+    session.handlers.onEnd?.({ sessionId: session.id, reason });
   }
 
   failSession(session, error) {
-    if (session.failure) return;
+    if (session.failure || session.ended) return;
     session.failure = error;
     session.reason = 'error';
+    this.listening = false;
+    this.clearTimers(session);
+    const deliveredReady = session.readyDelivered;
     session.settle?.({ error });
     if (session.closing) return;
     session.closing = true;
+    // Release the device and cue now, but let a delayed native end settle the
+    // recognizer so the next request can bind a fresh instance safely.
     this.abortSession(session);
     this.armEndDeadline(session, 'error');
+    if (deliveredReady && !session.errorDelivered) {
+      session.errorDelivered = true;
+      session.handlers.onError?.(error?.code ?? 'error');
+    }
+  }
+
+  clearTimers(session) {
+    clearTimeout(session.startTimer);
+    clearTimeout(session.endTimer);
+    clearTimeout(session.initialTimer);
+    clearTimeout(session.pauseTimer);
+    clearTimeout(session.commandTimer);
+    clearTimeout(session.restartTimer);
+    session.startTimer = null;
+    session.endTimer = null;
+    session.initialTimer = null;
+    session.pauseTimer = null;
+    session.commandTimer = null;
+    session.restartTimer = null;
+    const attempt = session.attempt;
+    if (attempt) {
+      clearTimeout(attempt.startTimer);
+      clearTimeout(attempt.endTimer);
+      attempt.startTimer = null;
+      attempt.endTimer = null;
+    }
+  }
+
+  clearListeningTimers(session) {
+    clearTimeout(session.initialTimer);
+    clearTimeout(session.pauseTimer);
+    clearTimeout(session.commandTimer);
+    clearTimeout(session.restartTimer);
+    session.initialTimer = null;
+    session.pauseTimer = null;
+    session.commandTimer = null;
+    session.restartTimer = null;
+    const attempt = session.attempt;
+    if (attempt) {
+      clearTimeout(attempt.startTimer);
+      attempt.startTimer = null;
+    }
+  }
+
+  // Idempotent: a late stream, a final result, and a cancel may all race here.
+  releaseInput(session) {
+    if (!session) return;
+    if (session.track) session.track.onended = null;
+    session.track = null;
+    const stream = session.stream;
+    session.stream = null;
+    releaseStream(stream);
   }
 
   abortSession(session) {
     this.cancelSessionCue(session);
-    try { session.recognition?.abort(); } catch {}
+    this.releaseInput(session);
+    const recognition = session.attempt?.recognition ?? session.recognition;
+    try { recognition?.abort(); } catch {}
   }
 
   // Only a session that never reached native start may finish without onend;
   // otherwise wait a bounded time, abort once more, then abandon the old
-  // recognizer. The next Alt+Z gets a fresh instance instead of a reload gate.
+  // recognizer. The next listen request gets a fresh instance instead of a reload gate.
   armEndDeadline(session, reason) {
     clearTimeout(session.endTimer);
     session.endTimer = null;
@@ -804,7 +1115,8 @@ export class Speech {
     }
     session.endTimer = setTimeout(() => {
       if (session.ended) return;
-      try { session.recognition?.abort(); } catch {}
+      const recognition = session.attempt?.recognition ?? session.recognition;
+      try { recognition?.abort(); } catch {}
       this.finishSession(session, reason);
     }, ABORT_TIMEOUT_MS);
   }
@@ -813,22 +1125,22 @@ export class Speech {
     if (session.ended) return;
     session.ended = true;
     session.reason ??= reason;
-    clearTimeout(session.startTimer);
-    clearTimeout(session.endTimer);
+    this.clearTimers(session);
     this.cancelSessionCue(session);
+    this.releaseInput(session);
+    if (session.attempt) this.detachAttempt(session.attempt);
+    session.attempt = null;
     const recognition = session.recognition;
     if (recognition) {
       recognition.onstart = null;
       recognition.onresult = null;
       recognition.onerror = null;
       recognition.onend = null;
+      recognition.onspeechstart = null;
+      recognition.onspeechend = null;
       if (this.recognition === recognition) this.recognition = null;
     }
     if (this.session === session) this.listening = false;
-    if (this.promptSession === session) {
-      this.promptSession = null;
-      this.promptGeneration = null;
-    }
     if (!session.settled) session.settle?.({ ready: false, cancelled: session.cancelled, sessionId: session.id });
     session.resolveEnd?.();
   }
@@ -838,19 +1150,19 @@ export class Speech {
     // Every stop revokes requests already waiting for the old session to end.
     this.inputGeneration += 1;
     this.listening = false;
-    // Only the source session's own pending prompt may be stopped; a newer
-    // announcement owns a different generation and must keep speaking.
-    if (session && this.promptSession === session && this.promptGeneration === this.generation) {
-      this.promptSession = null;
-      this.promptGeneration = null;
-      this.stopSpeaking('user');
+    if (!session || session.ended) return;
+    // A delivered final already owns the outcome; a later readback announcement
+    // must not relabel it as cancelled.
+    if (session.finalDelivered) {
+      this.releaseInput(session);
+      return;
     }
-    if (!session || session.ended || session.closing) return;
+    if (session.closing) return;
     session.closing = true;
     session.cancelled = true;
     session.reason = 'cancelled';
     if (!session.settled) session.settle?.({ ready: false, cancelled: true, sessionId: session.id });
-    clearTimeout(session.startTimer);
+    this.clearTimers(session);
     this.abortSession(session);
     this.armEndDeadline(session, 'cancelled');
   }
