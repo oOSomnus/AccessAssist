@@ -19,17 +19,55 @@
   const root = host.attachShadow({ mode: 'open' });
   const style = document.createElement('style');
   style.textContent = `
-    :host { all: initial; }
+    :host {
+      all: initial;
+      --launcher-accent: #6534d5;
+      --launcher-accent-hover: #5225b5;
+      --launcher-on-accent: #ffffff;
+      --launcher-mark-bg: #ffffff;
+      --launcher-mark-fg: #5225b5;
+      --launcher-focus: #8f2dce;
+      --launcher-shadow: rgba(24, 32, 48, 0.28);
+    }
     button {
-      min-width: 56px; min-height: 56px; padding: 0 18px;
-      border: 2px solid #ffffff; border-radius: 28px;
-      background: #111111; color: #ffffff;
+      display: inline-flex; align-items: center; gap: 8px;
+      min-width: 56px; min-height: 56px; max-width: calc(100vw - 32px);
+      padding: 0 18px 0 14px;
+      border: 1px solid var(--launcher-accent); border-radius: 28px;
+      background: var(--launcher-accent); color: var(--launcher-on-accent);
       font: 600 18px/1.2 system-ui, sans-serif;
-      box-shadow: 0 2px 8px rgba(0, 0, 0, 0.55);
+      box-shadow: 0 4px 14px var(--launcher-shadow);
       cursor: pointer;
     }
-    button:focus-visible { outline: 4px solid #ffbf47; outline-offset: 3px; }
-    @media (prefers-contrast: more) { button { background: #000000; border-color: #ffff00; } }
+    button:hover, button:active { border-color: var(--launcher-accent-hover); background: var(--launcher-accent-hover); }
+    .mark {
+      flex: none; display: grid; place-items: center;
+      width: 28px; height: 28px; border-radius: 9px;
+      background: var(--launcher-mark-bg); color: var(--launcher-mark-fg); font-size: 16px;
+    }
+    .label { min-width: 0; overflow-wrap: anywhere; text-align: left; }
+    button:focus-visible { outline: 3px solid var(--launcher-focus); outline-offset: 3px; }
+    @media (prefers-color-scheme: dark) {
+      :host {
+        --launcher-accent: #bca1ff;
+        --launcher-accent-hover: #cfbdff;
+        --launcher-on-accent: #201238;
+        --launcher-mark-bg: #201238;
+        --launcher-mark-fg: #f7f9fd;
+        --launcher-focus: #e0b7ff;
+        --launcher-shadow: rgba(0, 0, 0, 0.45);
+      }
+    }
+    @media (prefers-contrast: more) { button { border-width: 2px; } }
+    @media (forced-colors: active) {
+      button {
+        border: 2px solid ButtonText; background: ButtonFace; color: ButtonText;
+        box-shadow: none;
+      }
+      .mark { border: 1px solid ButtonText; background: ButtonText; color: ButtonFace; }
+      button:hover, button:active { border-color: ButtonText; background: ButtonFace; }
+      button:focus-visible { outline: 3px solid Highlight; }
+    }
     @media (prefers-reduced-motion: reduce) { button { transition: none; } }
     .sr {
       position: absolute; width: 1px; height: 1px; padding: 0; margin: -1px;
@@ -38,7 +76,14 @@
   `;
   const button = document.createElement('button');
   button.type = 'button';
-  button.textContent = 'Assistant';
+  const mark = document.createElement('span');
+  mark.className = 'mark';
+  mark.setAttribute('aria-hidden', 'true');
+  mark.textContent = 'A';
+  const label = document.createElement('span');
+  label.className = 'label';
+  label.textContent = 'Assistant';
+  button.append(mark, label);
   button.setAttribute('aria-label', 'Open the AccessAssist voice assistant, shortcut Alt+Z');
   const status = document.createElement('p');
   status.className = 'sr';

@@ -8,40 +8,97 @@
 </head>
 <body>
   <header class="bar">
-    <h1>AccessAssist</h1>
+    <div class="bar-heading">
+      <span class="brand-mark" aria-hidden="true">A</span>
+      <h1>AccessAssist</h1>
+    </div>
     <p id="page-line">Checking the current page...</p>
     <p id="mode-line">Guide mode</p>
   </header>
 
   <main>
-    <section id="voice-setup" class="voice-setup" data-number-scope="voice" aria-labelledby="voice-setup-heading">
-      <h2 id="voice-setup-heading">Set up voice</h2>
-      <p>Voice needs a one-time English speech pack and microphone access. Choose Prepare voice, or press Alt+Z in the panel. Speech is recognized on this device.</p>
-      <p class="hint">Only the recording stays on this device. Spoken commands and page content you allow are still sent to the AI service you configure.</p>
-      <div class="voice-buttons">
-        <button id="start-using" type="button" data-number="1">1 Prepare voice</button>
-        <button id="return-assistant" type="button" data-number="1" hidden>1 Return to assistant</button>
-      </div>
-      <p id="voice-status" class="hint" role="status"></p>
-      <button id="open-setup" type="button" data-number="2" hidden>2 Open setup tab</button>
-    </section>
+    <div class="panel-content">
+      <section id="voice-setup" class="voice-setup" data-number-scope="voice" aria-labelledby="voice-setup-heading">
+        <h2 id="voice-setup-heading">Set up voice</h2>
+        <p>Voice needs a one-time English speech pack and microphone access. Choose Prepare voice, or press Alt+Z in the panel. Speech is recognized on this device.</p>
+        <p class="hint">Only the recording stays on this device. Spoken commands and page content you allow are still sent to the AI service you configure.</p>
+        <div class="voice-buttons">
+          <button id="start-using" type="button" data-number="1">1 Prepare voice</button>
+          <button id="return-assistant" type="button" data-number="1" hidden>1 Return to assistant</button>
+        </div>
+        <p id="voice-status" class="hint" role="status"></p>
+        <button id="open-setup" type="button" data-number="2" hidden>2 Open setup tab</button>
+      </section>
 
-    <section id="conversation" aria-labelledby="transcript-heading">
-      <h2 id="transcript-heading" class="visually-hidden">Conversation</h2>
-      <ol id="transcript" class="transcript" aria-label="Conversation"></ol>
-    </section>
+      <section id="conversation" aria-labelledby="transcript-heading">
+        <h2 id="transcript-heading" class="visually-hidden">Conversation</h2>
+        <ol id="transcript" class="transcript" aria-label="Conversation"></ol>
+        <p class="conversation-empty">Ask me to read this page, describe an image, or guide you through a task.</p>
+      </section>
 
-    <section id="ask" class="ask" data-number-scope="choice" hidden aria-labelledby="ask-heading">
-      <h2 id="ask-heading">Your choice</h2>
-      <p id="ask-question"></p>
-      <ol id="ask-sites" aria-label="Source sites" hidden></ol>
-      <div id="ask-options" role="group" aria-label="Choices"></div>
-      <p class="hint">Press a number to choose. To say the choice, press Alt+Z first. Press Escape to cancel.</p>
-    </section>
+      <section id="ask" class="ask" data-number-scope="choice" hidden aria-labelledby="ask-heading">
+        <h2 id="ask-heading">Your choice</h2>
+        <p id="ask-question"></p>
+        <ol id="ask-sites" aria-label="Source sites" hidden></ol>
+        <div id="ask-options" role="group" aria-label="Choices"></div>
+        <p class="hint">Press a number to choose. To say the choice, press Alt+Z first. Press Escape to cancel.</p>
+      </section>
+
+      <section class="settings" data-number-scope="settings" aria-labelledby="settings-heading">
+        <h2 id="settings-heading">Settings</h2>
+        <details id="settings">
+          <summary data-number="8">8 Open settings</summary>
+          <form id="settings-form" novalidate>
+            <label for="api-key">OpenCode Go API key, kept only for this browser session</label>
+            <input id="api-key" name="apiKey" type="password" autocomplete="off" spellcheck="false">
+            <p class="hint">Billing and access are handled by OpenCode Go. The field clears after saving; the key is never read aloud.</p>
+            <p class="hint"><a href="https://opencode.ai/console" target="_blank" rel="noreferrer" data-number="1">1 Get an API key</a>. Sign in, subscribe to Go if needed, copy the key, then paste it here. <a href="https://opencode.ai/docs/go/" target="_blank" rel="noreferrer" data-number="2">2 Go help</a>.</p>
+
+            <details id="advanced-api">
+              <summary data-number="3">3 Advanced API settings</summary>
+              <label for="protocol">API format</label>
+              <select id="protocol" name="protocol">
+                <option value="openai">1 OpenAI compatible</option>
+                <option value="anthropic">2 Anthropic compatible</option>
+              </select>
+
+              <label for="base-url">API address, without chat/completions or messages</label>
+              <input id="base-url" name="baseUrl" type="url" autocomplete="off" spellcheck="false">
+
+              <label for="model">Model</label>
+              <input id="model" name="model" type="text" autocomplete="off" spellcheck="false">
+
+              <label for="anthropic-version" id="anthropic-version-label">Anthropic API version</label>
+              <input id="anthropic-version" name="anthropicVersion" type="text" autocomplete="off" spellcheck="false">
+            </details>
+
+            <button id="save-settings" type="submit" data-number="4">4 Save settings</button>
+            <p id="settings-status" class="hint" role="status"></p>
+          </form>
+
+          <label for="output-mode">Speech output</label>
+          <select id="output-mode">
+            <option value="tts">1 Extension speech</option>
+            <option value="screen-reader">2 System screen reader</option>
+          </select>
+
+          <fieldset data-number-scope="launcher">
+            <legend>Assistant button position</legend>
+            <label><input type="radio" name="launcher" value="br" data-number="1" checked> 1 Bottom right</label>
+            <label><input type="radio" name="launcher" value="bl" data-number="2"> 2 Bottom left</label>
+            <label><input type="radio" name="launcher" value="tr" data-number="3"> 3 Top right</label>
+            <label><input type="radio" name="launcher" value="tl" data-number="4"> 4 Top left</label>
+          </fieldset>
+
+          <button id="replay-intro" type="button" data-number="5">5 Replay introduction</button>
+          <p id="shortcut-status" class="hint"></p>
+        </details>
+      </section>
+    </div>
 
     <form id="composer" novalidate>
       <label for="message">Message</label>
-      <textarea id="message" rows="3" autocomplete="off" spellcheck="false" aria-describedby="composer-hint"></textarea>
+      <textarea id="message" rows="2" autocomplete="off" spellcheck="false" aria-describedby="composer-hint"></textarea>
       <p id="composer-hint" class="hint">Control plus Enter sends; on macOS use Command plus Enter. Number keys choose within the focused group. In text fields they type text.</p>
       <div class="buttons" data-number-scope="composer">
         <button id="send" type="submit" data-number="1">1 Send</button>
@@ -53,57 +110,6 @@
         <button id="close-panel" type="button" data-number="7">7 Close panel</button>
       </div>
     </form>
-
-    <section class="settings" data-number-scope="settings" aria-labelledby="settings-heading">
-      <h2 id="settings-heading">Settings</h2>
-      <details id="settings">
-        <summary data-number="8">8 Open settings</summary>
-        <form id="settings-form" novalidate>
-          <label for="api-key">OpenCode Go API key, kept only for this browser session</label>
-          <input id="api-key" name="apiKey" type="password" autocomplete="off" spellcheck="false">
-          <p class="hint">Billing and access are handled by OpenCode Go. The field clears after saving; the key is never read aloud.</p>
-          <p class="hint"><a href="https://opencode.ai/console" target="_blank" rel="noreferrer" data-number="1">1 Get an API key</a>. Sign in, subscribe to Go if needed, copy the key, then paste it here. <a href="https://opencode.ai/docs/go/" target="_blank" rel="noreferrer" data-number="2">2 Go help</a>.</p>
-
-          <details id="advanced-api">
-            <summary data-number="3">3 Advanced API settings</summary>
-            <label for="protocol">API format</label>
-            <select id="protocol" name="protocol">
-              <option value="openai">1 OpenAI compatible</option>
-              <option value="anthropic">2 Anthropic compatible</option>
-            </select>
-
-            <label for="base-url">API address, without chat/completions or messages</label>
-            <input id="base-url" name="baseUrl" type="url" autocomplete="off" spellcheck="false">
-
-            <label for="model">Model</label>
-            <input id="model" name="model" type="text" autocomplete="off" spellcheck="false">
-
-            <label for="anthropic-version" id="anthropic-version-label">Anthropic API version</label>
-            <input id="anthropic-version" name="anthropicVersion" type="text" autocomplete="off" spellcheck="false">
-          </details>
-
-          <button id="save-settings" type="submit" data-number="4">4 Save settings</button>
-          <p id="settings-status" class="hint" role="status"></p>
-        </form>
-
-        <label for="output-mode">Speech output</label>
-        <select id="output-mode">
-          <option value="tts">1 Extension speech</option>
-          <option value="screen-reader">2 System screen reader</option>
-        </select>
-
-        <fieldset data-number-scope="launcher">
-          <legend>Assistant button position</legend>
-          <label><input type="radio" name="launcher" value="br" data-number="1" checked> 1 Bottom right</label>
-          <label><input type="radio" name="launcher" value="bl" data-number="2"> 2 Bottom left</label>
-          <label><input type="radio" name="launcher" value="tr" data-number="3"> 3 Top right</label>
-          <label><input type="radio" name="launcher" value="tl" data-number="4"> 4 Top left</label>
-        </fieldset>
-
-        <button id="replay-intro" type="button" data-number="5">5 Replay introduction</button>
-        <p id="shortcut-status" class="hint"></p>
-      </details>
-    </section>
   </main>
 
   <div id="sr-status" role="status" aria-live="polite" class="visually-hidden"></div>

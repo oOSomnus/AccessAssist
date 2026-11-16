@@ -136,10 +136,12 @@ function setVoiceStatus(text) {
 
 function addTranscript(who, text) {
   const item = document.createElement('li');
+  item.dataset.role = who === 'user' ? 'user' : 'assistant';
   const label = document.createElement('span');
   label.className = 'who';
   label.textContent = who === 'user' ? 'You' : 'Assistant';
   const body = document.createElement('span');
+  body.className = 'message-body';
   body.textContent = text;
   item.append(label, body);
   $('transcript').append(item);
@@ -786,7 +788,14 @@ function showChoice(set, sourceSites = []) {
   for (const option of set.options) {
     const button = document.createElement('button');
     button.type = 'button';
-    button.textContent = `${option.number} ${option.label}`;
+    const number = document.createElement('span');
+    number.className = 'choice-number';
+    number.setAttribute('aria-hidden', 'true');
+    number.textContent = String(option.number);
+    const label = document.createElement('span');
+    label.className = 'choice-label';
+    label.textContent = option.label;
+    button.append(number, document.createTextNode(' '), label);
     button.setAttribute('aria-label', `Choice ${option.number}, ${option.label}`);
     button.addEventListener('click', () => selectOption(set.id, String(option.number)));
     container.append(button);
