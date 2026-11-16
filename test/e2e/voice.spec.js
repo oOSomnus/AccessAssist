@@ -358,6 +358,81 @@ test('a spoken answer does not move focus, and the next number answers the new c
   }
 });
 
+test('a spoken answer from a focused option restores Message for the next question', async () => {
+  const { context, extensionId } = await launch();
+  try {
+    await resetMock();
+    await openFixture(context, '/grid-native');
+    const panel = await openPanel(context, extensionId);
+    await sendText(panel, 'Select Monday two to three.');
+    await expect(panel.locator('#ask-sites')).toBeVisible({ timeout: 30_000 });
+
+    // Programmatic activation keeps the automatic-question focus deferral in
+    // place, while the explicit focus below simulates an open-shortcut target.
+    await panel.evaluate(() => document.getElementById('listen').click());
+    await expect(panel.locator('#mode-line')).toContainText('Listening. Speak now.', { timeout: 15_000 });
+    await panel.locator('#ask-options button').first().focus();
+    await emitFinal(panel, '1');
+    await expect(panel.locator('#ask-question')).toContainText('AM or PM', { timeout: 30_000 });
+    await expect(panel.locator('#message')).toBeFocused();
+    await expect(panel.locator('#ask-options button').first()).not.toBeFocused();
+    expect((await voiceState(panel)).starts).toBe(1);
+  } finally {
+    await context.close();
+  }
+});
+
+test('one warm open request focuses once and preserves the draft caret', async () => {
+  const { context, extensionId, worker } = await launch();
+  try {
+    await resetMock();
+    await openFixture(context, '/article');
+    const panel = await openPanel(context, extensionId);
+    await sendText(panel, 'What is this page about?');
+    await expect(panel.locator('#ask-sites')).toBeVisible({ timeout: 30_000 });
+    await panel.locator('#message').fill('keep this draft');
+    await panel.evaluate(() => document.getElementById('message').setSelectionRange(2, 6));
+
+    await panel.evaluate(() => {
+      window.__aaFocus = { window: 0, choice: 0 };
+      const originalWindowFocus = window.focus.bind(window);
+      window.focus = () => {
+        window.__aaFocus.window += 1;
+        originalWindowFocus();
+      };
+      const originalFocus = HTMLElement.prototype.focus;
+      HTMLElement.prototype.focus = function (...args) {
+        if (this.matches?.('#ask-options button')) window.__aaFocus.choice += 1;
+        return originalFocus.apply(this, args);
+      };
+      window.__aaReleaseClaim = null;
+      const send = chrome.runtime.sendMessage.bind(chrome.runtime);
+      chrome.runtime.sendMessage = async (message, ...rest) => {
+        if (message?.type !== 'CLAIM_INTENT') return send(message, ...rest);
+        const response = await send(message, ...rest);
+        await new Promise((resolve) => { window.__aaReleaseClaim = resolve; });
+        return response;
+      };
+    });
+
+    await sendIntent(worker, { id: 'held-focus', mode: 'typing', source: 'command', tabId: 0 });
+    await expect(panel.locator('#ask-options button').first()).toBeFocused();
+    expect(await panel.evaluate(() => window.__aaFocus)).toEqual({ window: 1, choice: 1 });
+
+    // While the claim is held, move focus; the post-claim handler retargets the
+    // current choice without asking the window for focus again.
+    await panel.locator('#ask-options button').nth(1).focus();
+    await panel.evaluate(() => window.__aaReleaseClaim?.());
+    await expect(panel.locator('#ask-options button').first()).toBeFocused();
+    expect(await panel.evaluate(() => window.__aaFocus)).toEqual({ window: 1, choice: 2 });
+    expect(await panel.locator('#message').inputValue()).toBe('keep this draft');
+    expect(await panel.locator('#message').evaluate((element) => [element.selectionStart, element.selectionEnd]))
+      .toEqual([2, 6]);
+  } finally {
+    await context.close();
+  }
+});
+
 test('an explicit open shortcut focuses the current choice without touching the draft', async () => {
   const { context, extensionId, worker } = await launch();
   try {

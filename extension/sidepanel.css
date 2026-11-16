@@ -323,7 +323,27 @@ label { display: block; margin-top: 12px; font-weight: 600; }
 #settings > fieldset,
 #settings > button { margin-top: 12px; }
 
-#shortcut-status { margin-top: 8px; }
+.shortcut-help {
+  margin-top: 16px;
+  padding-top: 16px;
+  border-top: 1px solid var(--border);
+}
+
+.shortcut-help h3 { margin: 0; font-size: 1rem; font-weight: 600; }
+
+#shortcut-status {
+  display: grid;
+  gap: 12px;
+  margin: 12px 0 0;
+}
+
+#shortcut-status dt { font-weight: 600; }
+#shortcut-status dd { margin: 4px 0 0; overflow-wrap: anywhere; }
+
+.shortcut-help ul { margin: 12px 0 0; padding-left: 20px; }
+.shortcut-help li + li { margin-top: 8px; }
+.shortcut-help p { margin-top: 12px; }
+.shortcut-help code { font-size: 0.95rem; overflow-wrap: anywhere; }
 
 fieldset {
   margin-top: 12px;

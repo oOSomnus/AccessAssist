@@ -135,8 +135,73 @@ const state = {
 const speech = new Speech({ lang: 'en-US' });
 speech.attach({ statusEl: $('sr-status'), alertEl: $('sr-alert') });
 
+const SHORTCUT_MODIFIERS = new Map([
+  ['ctrl', 'Ctrl'], ['control', 'Ctrl'], ['macctrl', 'Ctrl'], ['⌃', 'Ctrl'],
+  ['shift', 'Shift'], ['⇧', 'Shift'],
+  ['alt', 'Alt'],
+  ['option', 'Option'], ['⌥', 'Option'],
+  ['command', 'Command'], ['cmd', 'Command'], ['⌘', 'Command'],
+  ['search', 'Search'], ['win', 'Win'], ['super', 'Super'], ['meta', 'Meta'],
+]);
+
+// Chrome localizes key names before returning them from commands.getAll().
+const SHORTCUT_KEYS = new Map([
+  ['space', 'Space'], ['空格键', 'Space'], ['空格鍵', 'Space'],
+  ['period', 'Period'], ['.', 'Period'], ['句号', 'Period'], ['句號', 'Period'],
+  ['comma', 'Comma'], [',', 'Comma'], ['逗号', 'Comma'], ['逗號', 'Comma'],
+  ['home', 'Home'], ['end', 'End'],
+  ['insert', 'Insert'], ['ins', 'Insert'],
+  ['delete', 'Delete'], ['del', 'Delete'],
+  ['page up', 'Page Up'], ['pageup', 'Page Up'],
+  ['向上翻页', 'Page Up'], ['向上翻頁', 'Page Up'],
+  ['page down', 'Page Down'], ['pagedown', 'Page Down'],
+  ['向下翻页', 'Page Down'], ['向下翻頁', 'Page Down'],
+  ['left', 'Left Arrow'], ['left arrow', 'Left Arrow'], ['arrowleft', 'Left Arrow'],
+  ['向左箭头', 'Left Arrow'], ['向左鍵', 'Left Arrow'],
+  ['right', 'Right Arrow'], ['right arrow', 'Right Arrow'], ['arrowright', 'Right Arrow'],
+  ['向右箭头', 'Right Arrow'], ['向右鍵', 'Right Arrow'],
+  ['up', 'Up Arrow'], ['up arrow', 'Up Arrow'], ['arrowup', 'Up Arrow'],
+  ['向上箭头', 'Up Arrow'], ['向上鍵', 'Up Arrow'],
+  ['down', 'Down Arrow'], ['down arrow', 'Down Arrow'], ['arrowdown', 'Down Arrow'],
+  ['向下箭头', 'Down Arrow'], ['向下鍵', 'Down Arrow'],
+  ['tab', 'Tab'], ['enter', 'Enter'], ['backspace', 'Backspace'], ['退格', 'Backspace'],
+  ['esc', 'Escape'], ['escape', 'Escape'],
+  ['media next track', 'Media Next Track'], ['medianexttrack', 'Media Next Track'],
+  ['下一首媒體曲目', 'Media Next Track'], ['媒体下一曲', 'Media Next Track'],
+  ['media previous track', 'Media Previous Track'], ['mediaprevtrack', 'Media Previous Track'],
+  ['上一首媒體曲目', 'Media Previous Track'], ['媒体上一曲', 'Media Previous Track'],
+  ['media play/pause', 'Media Play/Pause'], ['mediaplaypause', 'Media Play/Pause'],
+  ['媒体播放/暂停', 'Media Play/Pause'], ['媒體播放/暫停', 'Media Play/Pause'],
+  ['media stop', 'Media Stop'], ['mediastop', 'Media Stop'],
+  ['媒体停止', 'Media Stop'], ['停止媒體播放', 'Media Stop'],
+]);
+
+function shortcutToken(part) {
+  const lower = part.toLowerCase();
+  const canonical = SHORTCUT_MODIFIERS.get(lower) ?? SHORTCUT_KEYS.get(lower);
+  if (canonical) return canonical;
+  if (/^[a-z]$/iu.test(part)) return part.toUpperCase();
+  if (/^[0-9]$/u.test(part)) return part;
+  if (/^f(?:[1-9]|1[0-9]|2[0-4])$/iu.test(part)) return part.toUpperCase();
+  return null;
+}
+
+// Returns '' when unassigned, null when Chrome assigned a key this build cannot
+// translate, and a canonical English binding otherwise.
+function englishShortcut(value) {
+  const raw = String(value ?? '').trim();
+  if (!raw) return '';
+  const parts = raw.replace(/[⌃⇧⌥⌘]/gu, (glyph) => `+${glyph}+`)
+    .split('+')
+    .map((part) => part.trim())
+    .filter(Boolean);
+  const tokens = parts.map(shortcutToken);
+  if (!tokens.length || tokens.includes(null)) return null;
+  return tokens.join('+');
+}
+
 function shortcutFor(name) {
-  return state.commands.find((command) => command.name === name)?.shortcut ?? '';
+  return englishShortcut(state.commands.find((command) => command.name === name)?.shortcut) ?? '';
 }
 
 function spokenShortcut(value) {
@@ -947,18 +1012,43 @@ function showChoice(set, sourceSites = []) {
   }
 }
 
+function choiceTriggerFor(element) {
+  return element instanceof HTMLElement
+    && element !== document.body
+    && element !== document.documentElement
+    && !$('ask').contains(element)
+    ? element
+    : null;
+}
+
 function hideChoice() {
   const focused = document.activeElement;
   const restore = focused instanceof HTMLElement && $('ask').contains(focused);
+  const trigger = state.choiceTrigger;
+  state.choiceTrigger = null;
+  // Removing the focused option would drop focus to the document body, which
+  // makes a screen reader reannounce the panel instead of naming a control.
+  if (restore && document.visibilityState === 'visible' && document.hasFocus()) {
+    const target = trigger && usableNumberTarget(trigger) && choiceTriggerFor(trigger);
+    // The Message focus listener would otherwise enter focusComposer and reset
+    // a draft's selection; setting typing first keeps the existing caret.
+    if (target === $('message')) {
+      state.mode = 'typing';
+      updateModeLine();
+    }
+    if (target) target.focus();
+    if (document.activeElement !== target) {
+      state.mode = 'typing';
+      updateModeLine();
+      $('message').focus({ preventScroll: true });
+    }
+  }
   $('ask').hidden = true;
   $('ask-question').textContent = '';
   const sites = $('ask-sites');
   sites.replaceChildren();
   sites.hidden = true;
   $('ask-options').replaceChildren();
-  const trigger = state.choiceTrigger;
-  state.choiceTrigger = null;
-  if (restore && trigger?.isConnected && !state.deferChoiceFocus) trigger.focus();
 }
 
 // Number keys act within the nearest data-number-scope group. Without one,
@@ -1141,7 +1231,7 @@ function presentSet(set, { timeoutMs = 0, recordChoice = true, sourceSites = [] 
   return new Promise((resolve) => {
     const current = { set, resolve, timer: null, recordChoice, sourceSites: [...sourceSites] };
     state.choice = current;
-    state.choiceTrigger = document.activeElement instanceof HTMLElement ? document.activeElement : null;
+    state.choiceTrigger = choiceTriggerFor(document.activeElement);
     state.audioPaused = false;
     // A screen-reader announcement is not finished when the DOM write returns;
     // moving focus into the new group would cut it off. Number shortcuts still
@@ -1214,6 +1304,7 @@ function focusComposer() {
   cancelVoice();
   state.mode = 'typing';
   updateModeLine();
+  if (document.activeElement === $('message')) return;
   $('message').focus();
   $('message').setSelectionRange($('message').value.length, $('message').value.length);
 }
@@ -2349,17 +2440,17 @@ function resetConversation() {
 
 // An unanswered question wins focus; otherwise the composer does. This never
 // prepares voice or opens the microphone.
-function focusEntryTarget() {
+function focusEntryTarget({ requestWindowFocus = true } = {}) {
   // An explicit open shortcut is the one request allowed to take keyboard focus
   // from the page; automatic replies keep deferring to the current control.
-  window.focus();
+  if (requestWindowFocus) window.focus();
   state.deferChoiceFocus = false;
   if (!$('ask').hidden) {
     const first = $('ask-options').querySelector('button');
     if (first) {
       state.mode = 'typing';
       updateModeLine();
-      first.focus();
+      if (document.activeElement !== first) first.focus();
       return;
     }
   }
@@ -2372,7 +2463,11 @@ async function handleEntryIntent(intent) {
   state.deferChoiceFocus = false;
   interruptOutput();
   cancelVoice();
-  focusEntryTarget();
+  // A warm open notification already transferred keyboard focus before the
+  // serialized claim; asking the window again would repeat its announcement.
+  const notified = intent.mode === 'typing' && intent.source === 'command'
+    && state.requestedIntents.has(intent.id);
+  focusEntryTarget({ requestWindowFocus: !notified });
   state.audioPaused = false;
   state.voiceRetry = false;
   if (intent.mode === 'typing') {
@@ -2390,7 +2485,6 @@ async function handleEntryIntent(intent) {
     // Read-only readiness refresh keeps the Listen label accurate after setup;
     // it never installs the pack or opens the microphone.
     await refreshVoiceStatus().catch(() => {});
-    focusEntryTarget();
     return;
   }
   state.mode = 'voice';
@@ -2500,18 +2594,30 @@ async function changeLauncherPosition(position) {
   speech.writeStatus('Assistant button position updated.');
 }
 
+const SHORTCUT_COMMAND_IDS = ['open-assistant', 'listen-once', 'close-assistant', 'replay-introduction'];
+
 async function updateShortcutStatus() {
+  let commands;
   try {
-    const { commands } = await send('GET_COMMANDS');
-    state.commands = commands ?? [];
-    const lines = state.commands.map((command) => `${command.description}: ${command.shortcut || 'not set'}`);
-    const unbound = state.commands.some((command) => !command.shortcut);
-    const numbers = 'Choices in the panel always use Control plus Shift plus a top-row number, even when the entry shortcuts change. Plain digits type text or stay with the screen reader. Use your screen reader to stop speech already being read.';
-    $('shortcut-status').textContent = `${lines.join('. ')}. ${numbers}${unbound ? ' You can set shortcuts at chrome://extensions/shortcuts.' : ''}`;
+    ({ commands } = await send('GET_COMMANDS'));
   } catch {
     // Keep the last known bindings; a transient worker failure must not turn
     // real shortcuts into fallback wording.
-    if (!state.commands.length) $('shortcut-status').textContent = '';
+    return;
+  }
+  state.commands = Array.isArray(commands) ? commands : [];
+  for (const name of SHORTCUT_COMMAND_IDS) {
+    const cell = document.querySelector(`#shortcut-status dd[data-command="${name}"]`);
+    if (!cell) continue;
+    const command = state.commands.find((candidate) => candidate.name === name);
+    let label = 'Unavailable';
+    if (command) {
+      const shortcut = englishShortcut(command.shortcut);
+      label = shortcut === null
+        ? 'Assigned in Chrome'
+        : (shortcut.replaceAll('+', ' + ') || 'Not assigned');
+    }
+    if (cell.textContent !== label) cell.textContent = label;
   }
 }
 

@@ -1,5 +1,5 @@
 import { expect, test } from '@playwright/test';
-import { launch, openFixture, openPanel, resetMock, voiceState } from './helpers.js';
+import { announcements, launch, openFixture, openPanel, resetMock, voiceState } from './helpers.js';
 
 async function attachScreenshot(page, testInfo, name) {
   await testInfo.attach(name, {
@@ -174,6 +174,246 @@ test('appearance: conversation scroll keeps the composer reachable', async ({}, 
   }
 });
 
+test('appearance: shortcut help stays readable and structured', async ({}, testInfo) => {
+  const { context, extensionId } = await launch();
+  try {
+    await resetMock();
+    await openFixture(context, '/article');
+    const panel = await openPanel(context, extensionId);
+    await panel.locator('#settings > summary').click();
+    await panel.locator('#shortcut-heading').scrollIntoViewIfNeeded();
+
+    expect(await panel.locator('#shortcut-status > div').count()).toBe(4);
+    expect(await panel.locator('#shortcut-status dt').allTextContents())
+      .toEqual(['Open assistant', 'Listen once', 'Close panel', 'Replay introduction']);
+    expect(await panel.locator('.shortcut-help li').count()).toBe(3);
+    await expect(panel.locator('.shortcut-help code')).toHaveText('chrome://extensions/shortcuts');
+
+    for (const size of [
+      { width: 391, height: 904 },
+      { width: 320, height: 760 },
+      { width: 160, height: 640 },
+    ]) {
+      await panel.setViewportSize(size);
+      await panel.locator('#shortcut-heading').scrollIntoViewIfNeeded();
+      const check = await panel.evaluate(() => {
+        const section = document.querySelector('.shortcut-help');
+        const items = [...section.querySelectorAll('dt, dd, li, p, code')];
+        return {
+          viewport: window.innerWidth,
+          overflow: section.scrollWidth - section.clientWidth,
+          items: items.map((element) => {
+            const box = element.getBoundingClientRect();
+            return {
+              text: element.textContent,
+              overflow: element.scrollWidth - element.clientWidth,
+              textOverflow: getComputedStyle(element).textOverflow,
+              left: box.left,
+              right: box.right,
+            };
+          }),
+        };
+      });
+      expect(check.overflow).toBeLessThanOrEqual(1);
+      for (const item of check.items) {
+        expect(item.left).toBeGreaterThanOrEqual(-1);
+        expect(item.right).toBeLessThanOrEqual(check.viewport + 1);
+        expect(item.overflow).toBeLessThanOrEqual(1);
+        expect(item.textOverflow).not.toBe('ellipsis');
+        expect(item.text.trim()).not.toBe('');
+      }
+      await attachScreenshot(panel, testInfo, `shortcut-help-${size.width}x${size.height}`);
+      const tail = panel.locator('.shortcut-help p').last();
+      await tail.scrollIntoViewIfNeeded();
+      const tailBox = await tail.boundingBox();
+      expect(tailBox.y).toBeGreaterThanOrEqual(0);
+      expect(tailBox.y + tailBox.height).toBeLessThanOrEqual(size.height + 1);
+      await attachScreenshot(panel, testInfo, `shortcut-help-tail-${size.width}x${size.height}`);
+    }
+
+    await panel.setViewportSize({ width: 391, height: 904 });
+    await panel.locator('#shortcut-heading').scrollIntoViewIfNeeded();
+    await panel.emulateMedia({ colorScheme: 'dark' });
+    await attachScreenshot(panel, testInfo, 'shortcut-help-dark-391x904');
+    await panel.emulateMedia({ forcedColors: 'active', reducedMotion: 'reduce' });
+    await attachScreenshot(panel, testInfo, 'shortcut-help-forced-391x904');
+    await panel.emulateMedia({ colorScheme: 'light', forcedColors: 'none', reducedMotion: 'no-preference' });
+    await panel.evaluate(() => { document.body.style.zoom = '1.5'; });
+    await panel.locator('#shortcut-heading').scrollIntoViewIfNeeded();
+    await attachScreenshot(panel, testInfo, 'shortcut-help-zoom-391x904');
+    expect(await panel.evaluate(() => document.documentElement.scrollWidth
+      <= document.documentElement.clientWidth + 1)).toBe(true);
+
+    expect((await voiceState(panel)).starts).toBe(0);
+  } finally {
+    await context.close();
+  }
+});
+
+test('appearance: shortcut help normalizes browser-localized bindings', async ({}, testInfo) => {
+  const { context, extensionId } = await launch();
+  await context.addInitScript(() => {
+    if (!location.protocol.startsWith('chrome-extension:') || !location.pathname.endsWith('/sidepanel.html')) return;
+    if (!globalThis.chrome?.runtime?.sendMessage) return;
+    window.__aaCommands = [
+      { name: '_execute_action', description: '', shortcut: '' },
+      { name: 'listen-once', description: 'Listen once for a voice command', shortcut: 'Ctrl+Shift+Y' },
+      { name: 'replay-introduction', description: 'Replay the AccessAssist introduction', shortcut: '' },
+      { name: 'open-assistant', description: 'Open or focus the assistant without listening', shortcut: 'Ctrl+Shift+空格键' },
+      { name: 'close-assistant', description: 'Close the AccessAssist side panel', shortcut: 'Ctrl+Shift+句号' },
+    ];
+    window.__aaCommandsFail = false;
+    const send = chrome.runtime.sendMessage.bind(chrome.runtime);
+    chrome.runtime.sendMessage = (message, ...rest) => {
+      if (message?.type === 'GET_COMMANDS') {
+        if (window.__aaCommandsFail) return Promise.reject(new Error('commands unavailable'));
+        return Promise.resolve({ commands: window.__aaCommands });
+      }
+      return send(message, ...rest);
+    };
+  });
+  try {
+    await resetMock();
+    await openFixture(context, '/article');
+    const panel = await openPanel(context, extensionId);
+    await panel.locator('#settings > summary').click();
+    await panel.locator('#shortcut-heading').scrollIntoViewIfNeeded();
+
+    await expect(panel.locator('#shortcut-status dd')).toHaveText([
+      'Ctrl + Shift + Space',
+      'Ctrl + Shift + Y',
+      'Ctrl + Shift + Period',
+      'Not assigned',
+    ]);
+    expect(await panel.locator('#shortcut-status > div').count()).toBe(4);
+    const helpText = await panel.locator('.shortcut-help').innerText();
+    expect(helpText).not.toContain(': not set');
+    expect(helpText).not.toContain('_execute_action');
+    expect(helpText).not.toMatch(/[\u4e00-\u9fff]/u);
+
+    await panel.locator('#replay-intro').click();
+    await expect.poll(async () => await announcements(panel), { timeout: 15_000 })
+      .toContain('Press Control plus Shift plus Space');
+    const spoken = await announcements(panel);
+    expect(spoken).not.toMatch(/[\u4e00-\u9fff]/u);
+
+    // Captured browser strings may use adjacent macOS glyphs and other keys.
+    await panel.evaluate(() => {
+      window.__aaCommands = [
+        { name: 'open-assistant', shortcut: '⌃⇧空格鍵' },
+        { name: 'listen-once', shortcut: '⌘⇧,' },
+        { name: 'close-assistant', shortcut: 'Alt+Shift+O' },
+        { name: 'replay-introduction', shortcut: '' },
+      ];
+      window.dispatchEvent(new Event('focus'));
+    });
+    await expect(panel.locator('#shortcut-status dd')).toHaveText([
+      'Ctrl + Shift + Space',
+      'Command + Shift + Comma',
+      'Alt + Shift + O',
+      'Not assigned',
+    ]);
+
+    await panel.evaluate(() => {
+      window.__aaCommands = [
+        { name: 'open-assistant', shortcut: 'Ctrl+Shift+未知键' },
+        { name: 'listen-once', shortcut: 'Ctrl+Shift+未知键' },
+        { name: 'replay-introduction', shortcut: '' },
+      ];
+      window.dispatchEvent(new Event('focus'));
+    });
+    await expect(panel.locator('#shortcut-status dd')).toHaveText([
+      'Assigned in Chrome',
+      'Assigned in Chrome',
+      'Unavailable',
+      'Not assigned',
+    ]);
+    await panel.locator('#replay-intro').click();
+    await expect.poll(async () => await announcements(panel), { timeout: 15_000 })
+      .toContain('Choose Listen to listen');
+
+    // Identical refreshes and failed queries must not rewrite the help.
+    await panel.evaluate(() => {
+      window.__aaHelpMutations = 0;
+      new MutationObserver((records) => { window.__aaHelpMutations += records.length; })
+        .observe(document.querySelector('.shortcut-help'), {
+          subtree: true, childList: true, characterData: true, attributes: true,
+        });
+      document.getElementById('message').value = 'draft';
+      document.getElementById('message').setSelectionRange(1, 3);
+    });
+    await panel.evaluate(() => window.dispatchEvent(new Event('focus')));
+    await panel.waitForTimeout(200);
+    expect(await panel.evaluate(() => window.__aaHelpMutations)).toBe(0);
+    expect(await panel.locator('#message').evaluate((element) => [element.value, element.selectionStart, element.selectionEnd]))
+      .toEqual(['draft', 1, 3]);
+
+    await panel.evaluate(() => {
+      window.__aaCommandsFail = true;
+      window.dispatchEvent(new Event('focus'));
+    });
+    await panel.waitForTimeout(200);
+    expect(await panel.locator('#shortcut-status dd').allTextContents()).toEqual([
+      'Assigned in Chrome',
+      'Assigned in Chrome',
+      'Unavailable',
+      'Not assigned',
+    ]);
+    expect(await panel.evaluate(() => window.__aaHelpMutations)).toBe(0);
+
+    await panel.evaluate(() => {
+      window.__aaCommandsFail = false;
+      window.__aaCommands = [
+        { name: 'open-assistant', shortcut: 'Alt+Shift+O' },
+        { name: 'listen-once', shortcut: 'Ctrl+Shift+Y' },
+        { name: 'close-assistant', shortcut: 'Ctrl+Shift+Period' },
+        { name: 'replay-introduction', shortcut: '' },
+      ];
+      window.dispatchEvent(new Event('focus'));
+    });
+    await expect(panel.locator('#shortcut-status dd')).toHaveText([
+      'Alt + Shift + O',
+      'Ctrl + Shift + Y',
+      'Ctrl + Shift + Period',
+      'Not assigned',
+    ]);
+    expect(await panel.evaluate(() => window.__aaHelpMutations)).toBeGreaterThan(0);
+    expect((await voiceState(panel)).starts).toBe(0);
+  } finally {
+    await context.close();
+  }
+});
+
+
+test('appearance: shortcut help stays unavailable when commands cannot be read', async () => {
+  const { context, extensionId } = await launch();
+  await context.addInitScript(() => {
+    if (!location.protocol.startsWith('chrome-extension:') || !location.pathname.endsWith('/sidepanel.html')) return;
+    if (!globalThis.chrome?.runtime?.sendMessage) return;
+    const send = chrome.runtime.sendMessage.bind(chrome.runtime);
+    chrome.runtime.sendMessage = (message, ...rest) => (
+      message?.type === 'GET_COMMANDS'
+        ? Promise.reject(new Error('commands unavailable'))
+        : send(message, ...rest)
+    );
+  });
+  try {
+    await resetMock();
+    await openFixture(context, '/article');
+    const panel = await openPanel(context, extensionId);
+    await panel.locator('#settings > summary').click();
+    await expect(panel.locator('#shortcut-status dd')).toHaveText([
+      'Unavailable',
+      'Unavailable',
+      'Unavailable',
+      'Unavailable',
+    ]);
+    expect(await panel.locator('.shortcut-help li').count()).toBe(3);
+  } finally {
+    await context.close();
+  }
+});
+
 test('appearance: narrow source consent preserves complete origins and keyboard choice', async ({}, testInfo) => {
   const { context, extensionId } = await launch();
   const longOrigin = `https://${'a'.repeat(63)}.example.test`;
@@ -276,15 +516,18 @@ test('appearance: narrow source consent preserves complete origins and keyboard 
 
     await panel.locator('#ask-options button').first().focus();
     // The cancelled turn immediately asks again; record the state restored by
-    // Escape at the moment focus returns instead of racing the next prompt.
+    // Escape after the synchronous focus handler has hidden the old question.
     await panel.evaluate(() => {
       window.__aaEscapeState = null;
       document.addEventListener('focusin', (event) => {
         if (!window.__aaEscapeState && event.target?.id === 'message') {
-          window.__aaEscapeState = {
-            askHidden: document.getElementById('ask').hidden,
-            sites: document.querySelectorAll('#ask-sites li').length,
-          };
+          queueMicrotask(() => {
+            if (window.__aaEscapeState) return;
+            window.__aaEscapeState = {
+              askHidden: document.getElementById('ask').hidden,
+              sites: document.querySelectorAll('#ask-sites li').length,
+            };
+          });
         }
       });
     });

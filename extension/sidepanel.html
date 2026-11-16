@@ -88,7 +88,21 @@
           </fieldset>
 
           <button id="replay-intro" type="button" data-number="5">5 Replay introduction</button>
-          <p id="shortcut-status" class="hint"></p>
+          <section class="shortcut-help" aria-labelledby="shortcut-heading">
+            <h3 id="shortcut-heading">Keyboard shortcuts</h3>
+            <dl id="shortcut-status">
+              <div><dt>Open assistant</dt><dd data-command="open-assistant">Unavailable</dd></div>
+              <div><dt>Listen once</dt><dd data-command="listen-once">Unavailable</dd></div>
+              <div><dt>Close panel</dt><dd data-command="close-assistant">Unavailable</dd></div>
+              <div><dt>Replay introduction</dt><dd data-command="replay-introduction">Unavailable</dd></div>
+            </dl>
+            <ul class="hint">
+              <li>Choose options with Control + Shift + 1–9 on the top row. These keys stay the same when entry shortcuts change.</li>
+              <li>Plain digits type text or stay with your screen reader.</li>
+              <li>Use your screen reader to stop speech already being read.</li>
+            </ul>
+            <p class="hint">View or change bindings at <code>chrome://extensions/shortcuts</code>.</p>
+          </section>
         </details>
       </section>
     </div>

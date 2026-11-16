@@ -39,6 +39,126 @@ test('read flow speaks the real paragraph and does not submit the form', async (
   }
 });
 
+test('a real option click returns focus to Message, not the document', async () => {
+  const { context, extensionId } = await launch();
+  try {
+    await resetMock();
+    await openFixture(context, '/grid-native');
+    const panel = await openPanel(context, extensionId);
+    await sendText(panel, 'Select Monday two to three.');
+    await expect(panel.locator('#ask-sites')).toBeVisible({ timeout: 30_000 });
+
+    await panel.locator('#ask-options button').first().click();
+    await expect(panel.locator('#ask-question')).toContainText('AM or PM', { timeout: 30_000 });
+    await expect(panel.locator('#message')).toBeFocused();
+    expect(await panel.evaluate(() => document.activeElement === document.body)).toBe(false);
+    await panel.keyboard.press('2');
+    await expect(panel.locator('#message')).toHaveValue('2');
+    await expect.poll(async () => await announcements(panel)).toContain('Selected option 1:');
+    expect((await voiceState(panel)).starts).toBe(0);
+  } finally {
+    await context.close();
+  }
+});
+
+test('restoring Message after a choice keeps the draft and selection', async () => {
+  const { context, extensionId } = await launch();
+  try {
+    await resetMock();
+    await openFixture(context, '/grid-native');
+    const panel = await openPanel(context, extensionId);
+    await panel.locator('#message').focus();
+    await sendText(panel, 'Select Monday two to three.');
+    await expect(panel.locator('#ask-sites')).toBeVisible({ timeout: 30_000 });
+
+    await panel.locator('#message').fill('keep this draft');
+    await panel.evaluate(() => document.getElementById('message').setSelectionRange(2, 6));
+    await panel.locator('#ask-options button').first().click();
+    await expect(panel.locator('#ask-question')).toContainText('AM or PM', { timeout: 30_000 });
+    await expect(panel.locator('#message')).toBeFocused();
+    expect(await panel.locator('#message').evaluate((element) => ({
+      value: element.value,
+      start: element.selectionStart,
+      end: element.selectionEnd,
+    }))).toEqual({ value: 'keep this draft', start: 2, end: 6 });
+  } finally {
+    await context.close();
+  }
+});
+
+test('choice completion returns to a stable trigger outside the question', async () => {
+  const { context, extensionId } = await launch();
+  try {
+    await resetMock();
+    await openFixture(context, '/grid-native');
+    const panel = await openPanel(context, extensionId);
+    await panel.locator('#close-panel').focus();
+    await sendText(panel, 'Select Monday two to three.');
+    await expect(panel.locator('#ask-sites')).toBeVisible({ timeout: 30_000 });
+    await panel.locator('#ask-options button').first().click();
+    await expect(panel.locator('#close-panel')).toBeFocused();
+  } finally {
+    await context.close();
+  }
+});
+
+test('an unusable saved trigger falls back to Message', async () => {
+  const { context, extensionId } = await launch();
+  try {
+    await resetMock();
+    await openFixture(context, '/grid-native');
+    const panel = await openPanel(context, extensionId);
+    await panel.locator('#close-panel').focus();
+    await sendText(panel, 'Select Monday two to three.');
+    await expect(panel.locator('#ask-sites')).toBeVisible({ timeout: 30_000 });
+    await panel.evaluate(() => { document.getElementById('close-panel').disabled = true; });
+    await panel.locator('#ask-options button').first().click();
+    await expect(panel.locator('#message')).toBeFocused();
+  } finally {
+    await context.close();
+  }
+});
+
+test('completion behind another page does not pull focus into the panel', async () => {
+  const { context, extensionId } = await launch();
+  try {
+    await resetMock();
+    const page = await openFixture(context, '/grid-native');
+    const panel = await openPanel(context, extensionId);
+    await sendText(panel, 'Select Monday two to three.');
+    await expect(panel.locator('#ask-sites')).toBeVisible({ timeout: 30_000 });
+    await panel.locator('#ask-options button').first().focus();
+    await page.bringToFront();
+    await panel.evaluate(() => {
+      window.__aaWindowFocus = 0;
+      window.focus = () => { window.__aaWindowFocus += 1; };
+    });
+    await answer(panel, 0);
+    await expect(panel.locator('#ask-question')).toContainText('AM or PM', { timeout: 30_000 });
+    expect(await panel.evaluate(() => window.__aaWindowFocus)).toBe(0);
+    expect(await page.evaluate(() => document.hasFocus())).toBe(true);
+  } finally {
+    await context.close();
+  }
+});
+
+test('programmatic completion leaves unrelated settings focus alone', async () => {
+  const { context, extensionId } = await launch();
+  try {
+    await resetMock();
+    await openFixture(context, '/grid-native');
+    const panel = await openPanel(context, extensionId);
+    await panel.locator('#settings > summary').click();
+    await sendText(panel, 'Select Monday two to three.');
+    await expect(panel.locator('#ask-sites')).toBeVisible({ timeout: 30_000 });
+    await panel.locator('#api-key').focus();
+    await answer(panel, 0);
+    await expect(panel.locator('#api-key')).toBeFocused();
+  } finally {
+    await context.close();
+  }
+});
+
 test('ambiguous time asks for AM or PM, then edits with confirmation and undo', async () => {
   const { context, extensionId } = await launch();
   try {
