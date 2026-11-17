@@ -265,10 +265,11 @@ async function initialize() {
     };
   }
   if (Object.keys(defaults).length) await chrome.storage.local.set(defaults).catch(() => {});
-  const executing = await chrome.storage.session.get('executing').catch(() => ({}));
-  if (executing.executing) {
+  const storedMarkers = await chrome.storage.session.get(null).catch(() => ({}));
+  const markers = Object.keys(storedMarkers).filter((key) => key.startsWith('executing:'));
+  if (markers.length) {
     notices.push('The last action was interrupted while executing; its result is unknown. Observe the page again before deciding.');
-    await chrome.storage.session.remove('executing').catch(() => {});
+    await chrome.storage.session.remove(markers).catch(() => {});
   }
 }
 

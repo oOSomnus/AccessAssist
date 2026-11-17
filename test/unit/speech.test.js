@@ -1693,6 +1693,7 @@ test('voice setup view keeps every status sentence', () => {
     [{ ...base, surface: 'panel', local: 'unavailable' }, 'This Chrome cannot recognize speech on this device. Choose Retry after enabling local speech.'],
     [{ ...base, surface: 'panel', local: 'error' }, 'Chrome could not check the English speech pack. Choose Retry.'],
     [{ ...base, surface: 'panel', local: 'downloadable' }, 'The English speech pack is not ready. Choose Prepare voice to start.'],
+    [{ ...base, surface: 'panel', local: 'downloading' }, 'Chrome is downloading the English speech pack. Voice will be ready when it finishes.'],
     [{ ...base, surface: 'panel', preparing: true, mic: 'prompt' }, 'Chrome is preparing the English speech pack and will ask for the microphone.'],
     [{ ...base, surface: 'setup', ready: true }, 'Microphone access is granted. Speech is ready on this device.'],
     [{ ...base, surface: 'setup' }, 'Waiting for the English speech pack.'],
@@ -1702,10 +1703,25 @@ test('voice setup view keeps every status sentence', () => {
     [{ ...base, surface: 'setup', local: 'unavailable' }, 'This Chrome cannot recognize speech on this device.'],
     [{ ...base, surface: 'setup', local: 'error' }, 'Chrome could not check the English speech pack. Choose Retry.'],
     [{ ...base, surface: 'setup', local: 'downloadable' }, 'Chrome needs the English speech pack. Choose Prepare voice to start.'],
+    [{ ...base, surface: 'setup', local: 'downloading' }, 'Chrome is downloading the English speech pack. Voice will be ready when it finishes.'],
     [{ ...base, surface: 'setup', preparing: true }, 'Chrome is preparing the English speech pack and will ask for the microphone. Allow it when Chrome asks.'],
   ];
   for (const [input, expected] of cases) {
     assert.equal(voiceSetupView(input).status, expected, JSON.stringify(input));
+  }
+});
+
+test('a downloading pack says so and hides Prepare voice', () => {
+  const base = { local: 'available', mic: 'granted', ready: false, preparing: false, failed: false, listen: 'Press X to listen' };
+  const downloading = 'Chrome is downloading the English speech pack. Voice will be ready when it finishes.';
+  for (const surface of ['panel', 'setup']) {
+    const busy = voiceSetupView({ ...base, surface, local: 'downloading' });
+    assert.equal(busy.status, downloading, surface);
+    assert.equal(busy.startHidden, true, surface);
+    const ready = voiceSetupView({ ...base, surface, local: 'downloadable' });
+    assert.match(ready.status, /Choose Prepare voice/u, surface);
+    assert.equal(ready.startHidden, false, surface);
+    assert.equal(ready.startLabel, '1 Prepare voice', surface);
   }
 });
 

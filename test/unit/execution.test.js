@@ -101,21 +101,38 @@ test('a run writes the crash marker before the task and clears it afterwards', a
   const queue = createExecutionQueue({ session });
   let markedDuringTask = false;
   const run = await queue.run(7, async () => {
-    markedDuringTask = 'executing' in session.state;
+    markedDuringTask = 'executing:7' in session.state;
     return 'done';
   });
   assert.equal(markedDuringTask, true);
   assert.equal(run.value, 'done');
-  assert.deepEqual(session.log, [['set', 'executing'], ['remove', 'executing']]);
-  assert.equal('executing' in session.state, false);
+  assert.deepEqual(session.log, [['set', 'executing:7'], ['remove', 'executing:7']]);
+  assert.equal('executing:7' in session.state, false);
 });
 
 test('a throwing run still clears the marker', async () => {
   const session = memorySession();
   const queue = createExecutionQueue({ session });
   await assert.rejects(queue.run(1, async () => { throw new Error('boom'); }), /boom/u);
-  assert.deepEqual(session.log, [['set', 'executing'], ['remove', 'executing']]);
-  assert.equal('executing' in session.state, false);
+  assert.deepEqual(session.log, [['set', 'executing:1'], ['remove', 'executing:1']]);
+  assert.equal('executing:1' in session.state, false);
+});
+
+test('one tab finishing keeps another running tab\'s marker', async () => {
+  const session = memorySession();
+  const queue = createExecutionQueue({ session });
+  let release;
+  const blocked = new Promise((resolve) => { release = resolve; });
+  const slow = queue.run(1, async () => {
+    await blocked;
+    return 'one';
+  });
+  assert.equal((await queue.run(2, async () => 'two')).value, 'two');
+  assert.equal('executing:1' in session.state, true);
+  assert.equal('executing:2' in session.state, false);
+  release();
+  assert.equal((await slow).value, 'one');
+  assert.equal('executing:1' in session.state, false);
 });
 
 test('unavailable session storage does not block a run', async () => {

@@ -499,8 +499,8 @@ test('a local undo is marked as an execution', async () => {
   assert.deepEqual(response, { unavailable: true, reason: 'No action to undo' });
   // A worker killed mid-undo must be reported on restart, so the undo door
   // writes the same crash marker as a confirmed proposal.
-  const markers = calls.sessionSet.filter((value) => 'executing' in value);
+  const markers = calls.sessionSet.filter((value) => 'executing:7' in value);
   assert.equal(markers.length, 1);
-  assert.equal(markers[0].executing.tabId, 7);
-  assert.equal('executing' in behavior.sessionState, false);
+  assert.equal(markers[0]['executing:7'].tabId, 7);
+  assert.equal('executing:7' in behavior.sessionState, false);
 });

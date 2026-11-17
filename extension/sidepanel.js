@@ -1579,6 +1579,7 @@ async function submitMessage(raw) {
   }
   if (/^(undo|undo last step|undo last)[.!?]?$/iu.test(text)) {
     const turn = turns.next();
+    state.runningTurn = turn;
     state.busy = true;
     syncWorking();
     try {
@@ -1943,7 +1944,7 @@ async function finishProposal(report, turn) {
 async function performUndo(turn) {
   if (!state.tab) return 'There is nothing to undo.';
   const tabId = state.tab.tabId;
-  const stale = () => !turn.isCurrent() || state.tab?.tabId !== tabId;
+  const stale = () => turn.stale || state.tab?.tabId !== tabId;
   const replaced = 'The turn was replaced before undo could finish.';
   const result = await send('UNDO_REQUEST', { tabId });
   if (stale()) return replaced;
