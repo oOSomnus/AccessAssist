@@ -97,7 +97,7 @@ export const TOOLS = Object.freeze([
   },
   {
     name: 'propose_action',
-    description: 'Change the page. Low-risk steps (typing in ordinary fields, checking boxes, choosing options, selecting tabs or cells, hovering) run immediately and can be undone; anything else waits for the user to confirm. Use ask_user first when required information is unclear; do not guess. Prefer set_value for ordinary form fields; set blur false only when the field must stay focused, for example to pick an autocomplete suggestion afterwards. A hover, blur, drag, screenshot point, double click, right click, held or modified click must be proposed alone. The result is {outcome, page}, where page is the page after the action.',
+    description: 'Change the page. Low-risk steps (typing in ordinary fields, checking boxes, choosing options, toggling checkable cells or options, hovering) run immediately and can be undone; anything else waits for the user to confirm. Use ask_user first when required information is unclear; do not guess. Prefer set_value for ordinary form fields; set blur false only when the field must stay focused, for example to pick an autocomplete suggestion afterwards. A hover, blur, drag, screenshot point, double click, right click, held or modified click must be proposed alone. The result is {outcome, page}, where page is the page after the action.',
     parameters: schema({
       summary: { type: 'string', description: 'One sentence describing what will be done' },
       steps: { type: 'array', minItems: 1, maxItems: 20, items: stepSchema },

@@ -344,6 +344,7 @@ test('Shift extends the selection and does not stick to the next click', async (
     await run(panel);
     await run(panel);
     await expect(page.locator('#selected')).toHaveText('Item one, Item two, Item three');
+    await run(panel);
     await expect(page.locator('#selected')).toHaveText('Item two');
   } finally {
     await context.close();

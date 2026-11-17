@@ -36,7 +36,7 @@ export function riskFor(steps) {
       const unusual = step.button === 'right' || step.clickCount === 2
         || step.holdMs > 0 || (step.modifiers?.length ?? 0) > 0;
       if (step.point || step.kind === 'visual-region' || step.submits || unusual) current = 'irreversible';
-      else if (SAFE_CLICK_ROLES.has(step.role)) current = 'compensating';
+      else if (SAFE_CLICK_ROLES.has(step.role) && step.togglesChecked) current = 'compensating';
       else current = 'irreversible';
     } else if (step.type === 'hover' || step.type === 'blur') current = 'irreversible';
     else if (step.type === 'drag' || step.type === 'press_key') current = 'irreversible';
@@ -269,6 +269,8 @@ export function validateStep(raw, ctx) {
       step.clickCount = clickCount;
       step.holdMs = hold.value;
       step.modifiers = mods.modifiers;
+      // Undo reverses a click only by clicking again, which restores checked state alone.
+      step.togglesChecked = (target.ariaChecked ?? null) !== null || typeof target.checked === 'boolean';
       break;
     }
     case 'hover': {

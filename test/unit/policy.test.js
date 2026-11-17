@@ -62,9 +62,17 @@ test('steps validate against observed targets and risk', () => {
 
   const grid = validateProposal(proposal({
     steps: [{ type: 'click', snapshotId: 's1', nodeId: 7 }],
-  }), context({ targets: new Map([['s1:7', target({ role: 'gridcell' })]]) }));
+  }), context({ targets: new Map([['s1:7', target({ role: 'gridcell', ariaChecked: 'false' })]]) }));
   assert.equal(grid.proposal.risk, 'compensating');
   assert.equal(grid.proposal.undoKind, 'compensating');
+
+  // A click that only moves aria-selected has no inverse, so it needs consent.
+  const tab = validateProposal(proposal({
+    steps: [{ type: 'click', snapshotId: 's1', nodeId: 7 }],
+  }), context({ targets: new Map([['s1:7', target({ role: 'tab', ariaSelected: 'false', ariaChecked: null })]]) }));
+  assert.equal(tab.proposal.risk, 'irreversible');
+  assert.equal(tab.proposal.undoKind, 'unavailable');
+  assert.equal(autoRuns(tab.proposal), false);
 
   const disabled = validateProposal(proposal({
     steps: [{ type: 'set_value', snapshotId: 's1', nodeId: 5, value: 'x' }],
