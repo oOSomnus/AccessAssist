@@ -7,7 +7,7 @@ AccessAssist is a Chrome side panel for blind users. It reads a page on command,
 Requires Chrome 142 or later. No build step and no npm install: `extension/` is the whole extension.
 
 1. Open `chrome://extensions`, turn on Developer mode, choose "Load unpacked", and select the `extension/` folder.
-2. Open a web page and press `Control+Shift+Space` (physical Control on macOS too), or use the toolbar button or the "Assistant" button on the page. This opens or focuses the panel without recording. Drag the Assistant button anywhere in the viewport to move it; the position is remembered. After updating the extension, reload already open pages to get the new button.
+2. Open a web page and press `Control+Shift+Space` (physical Control on macOS too), or use the toolbar button or the "Assistant" button on the page. This opens or focuses the panel without recording. Drag the Assistant button anywhere in the viewport to move it, or focus it and press Shift+Arrow to nudge it; the position is remembered. After updating the extension, reload already open pages to get the new button.
 3. Press `Control+Shift+Y` for one dictated command, or choose Listen. `Control+Shift+Period` closes the panel. Replay introduction has no default key; use the Settings button or assign one at `chrome://extensions/shortcuts`. An existing profile keeps its saved key until you rebind Close panel there once.
 4. In Settings, paste an OpenCode Go API key and save. The panel has a "Get an API key" link. The key lasts for this browser session, and changing the API origin clears it. Advanced API settings also include Reasoning effort. Provider default sends no effort parameter; supported levels depend on the model, and some models map levels to the same behavior.
 

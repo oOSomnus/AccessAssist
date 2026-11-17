@@ -1069,7 +1069,7 @@ test('the Assistant launcher drags, persists, and never opens the panel', async 
   }
 });
 
-test('launcher drag cannot click through and focus returns to the open button', async () => {
+test('launcher drag cannot click through; Shift+Arrow moves it, and focus returns to the open button', async () => {
   const { context, extensionId, worker } = await launch();
   try {
     await resetMock();
@@ -1157,6 +1157,19 @@ test('launcher drag cannot click through and focus returns to the open button', 
     });
     await worker.evaluate((id) => chrome.tabs.sendMessage(id, { type: 'FOCUS_LAUNCHER' }), tabId);
     await expect.poll(async () => (await launcherState(page)).active).toBe('launcher-open');
+    const keyStart = await storedLauncher(worker);
+    await page.evaluate(() => {
+      window.__aaPageKeys = [];
+      window.addEventListener('keydown', (event) => window.__aaPageKeys.push(event.key));
+    });
+    const beforeKey = await launcherState(page);
+    await page.keyboard.press('Shift+ArrowLeft');
+    await expect.poll(async () => (await storedLauncher(worker)).x).toBeLessThan(keyStart.x);
+    const afterKey = await launcherState(page);
+    expect(beforeKey.left - afterKey.left).toBeGreaterThan(15);
+    expect(afterKey.active).toBe('launcher-open');
+    expect(await page.evaluate(() => window.__aaPageKeys)).not.toContain('ArrowLeft');
+    expect(await sessionIntents(worker)).toEqual([]);
     await clearIntents(worker);
     await watchIntentEvents(worker);
     await page.keyboard.press('Enter');

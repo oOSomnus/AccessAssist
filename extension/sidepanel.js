@@ -2656,9 +2656,13 @@ function bindEvents() {
   $('protocol').addEventListener('change', toggleAnthropicFields);
   document.addEventListener('keydown', handleNumberShortcut);
   document.addEventListener('keydown', (event) => {
-    if (event.key === 'Escape' && state.choice) {
+    if (event.key !== 'Escape') return;
+    if (state.choice) {
       event.preventDefault();
       finishChoice(state.choice.set.id, null, 'cancelled');
+    } else if (state.busy) {
+      event.preventDefault();
+      void cancelFromButton();
     }
   });
   document.addEventListener('pointerdown', () => void speech.resumeAudio(), { once: true });
@@ -2906,6 +2910,7 @@ async function initializePanel() {
     openSettingsForKey();
   }
   state.ready = true;
+  document.body.dataset.ready = 'true';
   intent = latestIntent(intent, state.pendingIntent);
   state.pendingIntent = null;
   if (!isForThisWindow(intent)) intent = null;

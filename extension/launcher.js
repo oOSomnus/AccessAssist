@@ -8,6 +8,11 @@
   const DEFAULT_POSITION = { x: 1, y: 1 };
   const MARGIN = 16;
   const DRAG_THRESHOLD = 6;
+  const MOVE_STEP = 16;
+  const NUDGE = {
+    ArrowUp: [0, -MOVE_STEP], ArrowDown: [0, MOVE_STEP],
+    ArrowLeft: [-MOVE_STEP, 0], ArrowRight: [MOVE_STEP, 0],
+  };
   const clamp = (value, min, max) => Math.min(Math.max(value, min), Math.max(min, max));
   const validPosition = (value) => Boolean(value)
     && typeof value === 'object'
@@ -111,6 +116,7 @@
   label.textContent = 'Assistant';
   openButton.append(mark, label);
   openButton.setAttribute('aria-label', 'Open the AccessAssist assistant');
+  openButton.setAttribute('aria-keyshortcuts', 'Shift+ArrowUp Shift+ArrowDown Shift+ArrowLeft Shift+ArrowRight');
   bar.append(openButton);
 
   const status = document.createElement('p');
@@ -318,6 +324,21 @@
     }).catch(() => {
       status.textContent = 'Could not open the assistant. Use the toolbar button or try again.';
     });
+  });
+
+  // Keyboard alternative to dragging: Shift+Arrow nudges and saves like a drag end.
+  openButton.addEventListener('keydown', (event) => {
+    const step = NUDGE[event.key];
+    if (!event.isTrusted || !step || !event.shiftKey || event.altKey || event.ctrlKey || event.metaKey) return;
+    event.preventDefault();
+    event.stopPropagation();
+    if (!loaded || savePending || dragging) return;
+    const rect = barRect();
+    if (!rect.width || !rect.height) return;
+    const clamped = clampPixels(rect.left + step[0], rect.top + step[1], rect);
+    committed = pixelsPosition(clamped.left, clamped.top, rect);
+    render();
+    void persistPosition(committed);
   });
 
   root.addEventListener('keydown', (event) => {

@@ -521,6 +521,9 @@ export async function seedIntent(worker, intent) {
 // Voice is the panel's only input: one Listen session carries the command.
 // A programmatic click keeps the user's focus where the test put it.
 export async function sendText(panel, text) {
+  // The Listen label can appear before initializePanel finishes; clicks before
+  // state.ready are dropped, so wait for the panel's own ready marker.
+  await panel.locator('body[data-ready="true"]').waitFor({ state: 'attached' });
   await panel.locator('#listen', { hasText: '1 Listen' }).waitFor();
   await panel.evaluate(() => document.getElementById('listen').click());
   await panel.locator('#mode-line', { hasText: 'Listening. Speak now.' }).waitFor({ timeout: 15_000 });
