@@ -249,7 +249,7 @@ test('an open command broadcasts focus before native open or storage settle', as
 
   const notices = () => calls.messages.filter((message) => message.type === 'ENTRY_INTENT');
   assert.equal(notices().length, 1);
-  assert.equal(notices()[0].intent.mode, 'typing');
+  assert.equal(notices()[0].intent.mode, 'open');
   assert.equal(notices()[0].intent.source, 'command');
   assert.equal(notices()[0].intent.windowId, 42);
   assert.deepEqual(calls.open, [{ windowId: 42 }]);
@@ -272,7 +272,7 @@ test('the stored command intent is claimed exactly once', async () => {
   const stored = calls.sessionSet.find((value) => Object.keys(value).some((key) => key.startsWith('intent:')));
   assert.ok(stored, JSON.stringify(calls.sessionSet));
   const entry = stored['intent:42'];
-  assert.equal(entry.mode, 'typing');
+  assert.equal(entry.mode, 'open');
 
   const claim = () => new Promise((resolve) => {
     listeners.message(

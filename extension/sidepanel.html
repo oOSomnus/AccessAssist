@@ -100,7 +100,7 @@
             </dl>
             <ul class="hint">
               <li>Choose options with Control + Shift + 1–9 on the top row. These keys stay the same when entry shortcuts change.</li>
-              <li>Plain digits type text or stay with your screen reader.</li>
+              <li>Plain digits stay with your screen reader.</li>
               <li>Use your screen reader to stop speech already being read.</li>
             </ul>
             <p class="hint">View or change bindings at <code>chrome://extensions/shortcuts</code>.</p>
@@ -109,19 +109,15 @@
       </section>
     </div>
 
-    <form id="composer" novalidate>
-      <label for="message">Message</label>
-      <textarea id="message" rows="2" autocomplete="off" spellcheck="false" aria-describedby="composer-hint"></textarea>
-      <p id="composer-hint" class="hint">Control or Command plus Enter sends.</p>
+    <div id="composer">
       <div class="buttons" data-number-scope="composer">
-        <button id="send" type="submit" data-number="1">1 Send</button>
-        <button id="listen" type="button" data-number="2">2 Prepare voice</button>
-        <button id="pause" type="button" data-number="3">3 Stop listening</button>
-        <button id="repeat" type="button" data-number="4">4 Repeat choices</button>
-        <button id="cancel" type="button" data-number="5">5 Cancel</button>
-        <button id="undo" type="button" data-number="6">6 Undo</button>
+        <button id="listen" type="button" data-number="1">1 Prepare voice</button>
+        <button id="pause" type="button" data-number="2">2 Stop listening</button>
+        <button id="repeat" type="button" data-number="3">3 Repeat choices</button>
+        <button id="cancel" type="button" data-number="4">4 Cancel</button>
+        <button id="undo" type="button" data-number="5">5 Undo</button>
       </div>
-    </form>
+    </div>
   </main>
 
   <div id="sr-status" role="log" aria-label="Assistant announcements" aria-live="polite" aria-relevant="additions" aria-atomic="false" class="visually-hidden"></div>

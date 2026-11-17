@@ -518,12 +518,13 @@ export async function seedIntent(worker, intent) {
   return storeIntent(worker, intent);
 }
 
+// Voice is the panel's only input: one Listen session carries the command.
+// A programmatic click keeps the user's focus where the test put it.
 export async function sendText(panel, text) {
-  await panel.evaluate((value) => {
-    const input = document.getElementById('message');
-    input.value = value;
-    document.getElementById('composer').requestSubmit();
-  }, text);
+  await panel.locator('#listen', { hasText: '1 Listen' }).waitFor();
+  await panel.evaluate(() => document.getElementById('listen').click());
+  await panel.locator('#mode-line', { hasText: 'Listening. Speak now.' }).waitFor({ timeout: 15_000 });
+  await emitFinal(panel, text);
 }
 
 export async function answer(panel, index) {

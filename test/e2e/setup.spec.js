@@ -92,7 +92,7 @@ test('returning from setup prepares the original panel without listening', async
     await closed;
     await panel.bringToFront();
     // Setup completion only focuses the panel; the microphone stays closed.
-    await expect(panel.locator('#message')).toBeFocused();
+    await expect(panel.locator('#listen')).toBeFocused();
     await panel.waitForTimeout(300);
     expect((await voiceState(panel)).starts).toBe(0);
 
