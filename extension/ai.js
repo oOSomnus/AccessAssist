@@ -155,7 +155,9 @@ function openaiMessages(system, messages) {
       output.push(entry);
     } else if (message.role === 'tool') {
       for (const result of message.results ?? []) {
-        output.push({ role: 'tool', tool_call_id: result.id, content: String(result.content ?? '') });
+        // OpenAI tool messages have no error flag, so the text must carry it.
+        const content = String(result.content ?? '');
+        output.push({ role: 'tool', tool_call_id: result.id, content: result.isError ? `Error: ${content}` : content });
       }
     }
   }

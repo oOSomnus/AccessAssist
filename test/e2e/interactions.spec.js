@@ -18,11 +18,6 @@ async function run(panel) {
   await answerWhen(panel, 'Run anyway?', 0);
 }
 
-// One confirmation for a reversible change.
-async function edit(panel) {
-  await answerWhen(panel, 'Run this?', 0);
-}
-
 test('browser text entry commits a new value and clearing does not submit', async () => {
   const { context, extensionId } = await launch();
   try {
@@ -33,14 +28,12 @@ test('browser text entry commits a new value and clearing does not submit', asyn
 
     await sendText(panel, 'Interaction fill name');
     await answerWhen(panel, 'page text', 0);
-    await edit(panel);
     await expect(page.locator('#name')).toHaveValue('Alex Morgan');
     await expect(page.locator('#committed')).toHaveText('Alex Morgan');
     await expect(page.locator('#submits')).toHaveText('0');
     await expect(panel.locator('#transcript')).toContainText('Committed name: Alex Morgan');
 
     await sendText(panel, 'Interaction clear name');
-    await edit(panel);
     await expect(page.locator('#name')).toHaveValue('');
     await expect(page.locator('#committed')).toHaveText('');
     await expect(page.locator('#submits')).toHaveText('0');
@@ -57,7 +50,6 @@ test('autocomplete keeps focus, then the suggestion and blur commit', async () =
     const panel = await openPanel(context, extensionId);
     await sendText(panel, 'Interaction autocomplete');
     await answerWhen(panel, 'page text', 0);
-    await edit(panel);
     await run(panel);
     await run(panel);
 
@@ -80,7 +72,6 @@ test('a long field is replaced fully and undo restores every character', async (
 
     await sendText(panel, 'Interaction long note');
     await answerWhen(panel, 'page text', 0);
-    await answerWhen(panel, 'Run this?', 0);
     await undoLastChange(panel);
     await answerWhen(panel, 'Undo this change?', 0);
 
@@ -99,7 +90,6 @@ test('a later edit blocks undo of a long field', async () => {
     const panel = await openPanel(context, extensionId);
     await sendText(panel, 'Interaction long note');
     await answerWhen(panel, 'page text', 0);
-    await edit(panel);
     await expect(page.locator('#notes')).toHaveValue(/^Replacement text/u, { timeout: 30_000 });
 
     await page.evaluate(() => {
@@ -123,7 +113,6 @@ test('oversized and read-only fields are refused before typing', async () => {
 
     await sendText(panel, 'Interaction huge archive note');
     await answerWhen(panel, 'page text', 0);
-    await answerWhen(panel, 'Run this?', 0);
     await expect(panel.locator('#transcript')).toContainText('too large to replace safely');
     expect((await page.locator('#huge').inputValue()).length).toBe(65_537);
 
@@ -145,7 +134,6 @@ test('focus stealing and rich text cannot corrupt another field', async () => {
 
     await sendText(panel, 'Interaction focus stealing');
     await answerWhen(panel, 'page text', 0);
-    await answerWhen(panel, 'Run this?', 0);
     await expect(panel.locator('#transcript')).toContainText('lost focus');
     await expect(page.locator('#steal')).toHaveValue('');
     await expect(page.locator('#other')).toHaveValue('untouched');
@@ -224,7 +212,6 @@ test('Tab moves focus and the next field can be filled', async () => {
     await sendText(panel, 'Interaction tab');
     await answerWhen(panel, 'page text', 0);
     await run(panel);
-    await edit(panel);
     await expect(page.locator('#notes')).toHaveValue('Tabbed name');
     await expect(page.locator('#committed')).toHaveText('Old Name');
   } finally {
@@ -240,7 +227,6 @@ test('date fields keep the native value path', async () => {
     const panel = await openPanel(context, extensionId);
     await sendText(panel, 'Interaction date');
     await answerWhen(panel, 'page text', 0);
-    await edit(panel);
     await expect(page.locator('#when')).toHaveValue('2026-12-01');
     await expect(page.locator('#when-model')).toHaveText('2026-12-01');
   } finally {
@@ -257,7 +243,6 @@ test('double click opens a real editor and the rename commits', async () => {
     await sendText(panel, 'Interaction double click');
     await answerWhen(panel, 'page text', 0);
     await run(panel);
-    await edit(panel);
     await run(panel);
     await expect(page.locator('#rename')).toHaveText('Annual report');
   } finally {
@@ -289,7 +274,6 @@ test('hover reveals a submenu that can then be observed and clicked', async () =
     const panel = await openPanel(context, extensionId);
     await sendText(panel, 'Interaction hover options');
     await answerWhen(panel, 'page text', 0);
-    await run(panel);
     await run(panel);
     await expect(page.locator('#archived')).toHaveText('yes');
   } finally {
@@ -360,7 +344,6 @@ test('Shift extends the selection and does not stick to the next click', async (
     await run(panel);
     await run(panel);
     await expect(page.locator('#selected')).toHaveText('Item one, Item two, Item three');
-    await edit(panel);
     await expect(page.locator('#selected')).toHaveText('Item two');
   } finally {
     await context.close();
@@ -420,7 +403,7 @@ test('a drag path across a password or frame is refused', async () => {
     await expect(page.locator('#order')).toHaveText('alpha beta gamma');
 
     await sendText(panel, 'Interaction drag into frame');
-    await expect(panel.locator('#transcript')).toContainText('not in the observed page snapshot');
+    await expect(panel.locator('#transcript')).toContainText('must come from the same observation');
     await expect(panel.locator('#ask')).toBeHidden();
   } finally {
     await context.close();
@@ -508,7 +491,7 @@ test('a container scroll invalidates an older screenshot point', async () => {
     await sendText(panel, 'Interaction scroll stale screenshot');
     await answerWhen(panel, 'page text', 0);
     await answerWhen(panel, 'screenshot', 0);
-    await expect(panel.locator('#transcript')).toContainText('not in the observed page snapshot');
+    await expect(panel.locator('#transcript')).toContainText('Unknown or expired target id');
     await expect(page.locator('#deep')).toHaveText('Deep item');
   } finally {
     await context.close();
@@ -524,7 +507,6 @@ test('anthropic: text entry and clearing commit through the browser', async () =
     const panel = await openPanel(context, extensionId, { protocol: 'anthropic' });
     await sendText(panel, 'Interaction fill name');
     await answerWhen(panel, 'page text', 0);
-    await edit(panel);
     await expect(page.locator('#name')).toHaveValue('Alex Morgan');
     await expect(page.locator('#committed')).toHaveText('Alex Morgan');
   } finally {
@@ -540,7 +522,6 @@ test('anthropic: a hover exposes a submenu that then clicks', async () => {
     const panel = await openPanel(context, extensionId, { protocol: 'anthropic' });
     await sendText(panel, 'Interaction hover options');
     await answerWhen(panel, 'page text', 0);
-    await run(panel);
     await run(panel);
     await expect(page.locator('#archived')).toHaveText('yes');
   } finally {
