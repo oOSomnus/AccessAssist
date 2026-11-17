@@ -3,17 +3,21 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="description" content="Voice-first web reading and operation assistant for blind users">
   <title>AccessAssist</title>
   <link rel="stylesheet" href="sidepanel.css">
 </head>
 <body>
   <header class="bar">
     <div class="bar-heading">
-      <span class="brand-mark" aria-hidden="true">A</span>
+      <svg class="brand-mark" viewBox="0 0 32 32" aria-hidden="true" focusable="false"><rect class="mark-tile" width="32" height="32" rx="8"/><path class="mark-bubble" d="M9 7h14a4 4 0 0 1 4 4v7a4 4 0 0 1-4 4h-7l-6 5v-5H9a4 4 0 0 1-4-4v-7a4 4 0 0 1 4-4z"/><path class="mark-bars" d="M12 12.5v4M16 10.5v8M20 12.5v4"/></svg>
       <h1>AccessAssist</h1>
-      <button id="close-panel" type="button" aria-label="Close panel" data-number-scope="composer">Close</button>
+      <div class="bar-actions">
+        <button id="settings-toggle" type="button" aria-expanded="false" aria-controls="settings" data-number="8"><svg class="icon" viewBox="0 0 24 24" aria-hidden="true" focusable="false"><path d="M12.22 2h-.44a2 2 0 0 0-2 2v.18a2 2 0 0 1-1 1.73l-.43.25a2 2 0 0 1-2 0l-.15-.08a2 2 0 0 0-2.73.73l-.22.38a2 2 0 0 0 .73 2.73l.15.1a2 2 0 0 1 1 1.72v.51a2 2 0 0 1-1 1.74l-.15.09a2 2 0 0 0-.73 2.73l.22.38a2 2 0 0 0 2.73.73l.15-.08a2 2 0 0 1 2 0l.43.25a2 2 0 0 1 1 1.73V20a2 2 0 0 0 2 2h.44a2 2 0 0 0 2-2v-.18a2 2 0 0 1 1-1.73l.43-.25a2 2 0 0 1 2 0l.15.08a2 2 0 0 0 2.73-.73l.22-.39a2 2 0 0 0-.73-2.73l-.15-.08a2 2 0 0 1-1-1.74v-.5a2 2 0 0 1 1-1.74l.15-.09a2 2 0 0 0 .73-2.73l-.22-.38a2 2 0 0 0-2.73-.73l-.15.08a2 2 0 0 1-2 0l-.43-.25a2 2 0 0 1-1-1.73V4a2 2 0 0 0-2-2z"/><circle cx="12" cy="12" r="3"/></svg><span class="label">8 Settings</span></button>
+        <button id="close-panel" class="quiet" type="button" aria-label="Close panel" data-number-scope="composer">Close</button>
+      </div>
     </div>
-    <p id="page-line">Checking the current page...</p>
+    <p id="page-line">Checking the current page…</p>
     <p id="mode-line">Guide mode</p>
   </header>
 
@@ -25,6 +29,64 @@
         <ol id="ask-sites" aria-label="Source sites" hidden></ol>
         <div id="ask-options" role="group" aria-labelledby="ask-question"></div>
         <p id="choice-shortcut-hint" class="hint">Press Control plus Shift plus a number to choose. Press Escape to cancel.</p>
+      </section>
+
+      <section id="settings" class="settings" data-number-scope="settings" aria-labelledby="settings-heading" hidden>
+        <h2 id="settings-heading">Settings</h2>
+        <form id="settings-form" novalidate>
+          <label for="api-key">OpenCode Go API key, kept only for this browser session</label>
+          <input id="api-key" name="apiKey" type="password" autocomplete="off" spellcheck="false">
+          <p class="hint">Billing and access are handled by OpenCode Go. The field clears after saving; the key is never read aloud.</p>
+          <p class="hint"><a href="https://opencode.ai/console" target="_blank" rel="noreferrer" data-number="1">1 Get an API key</a>. Sign in, subscribe to Go if needed, copy the key, then paste it here. <a href="https://opencode.ai/docs/go/" target="_blank" rel="noreferrer" data-number="2">2 Go help</a>.</p>
+
+          <details id="advanced-api">
+            <summary data-number="3">3 Advanced API settings</summary>
+            <label for="protocol">API format</label>
+            <select id="protocol" name="protocol">
+              <option value="openai">1 OpenAI compatible</option>
+              <option value="anthropic">2 Anthropic compatible</option>
+            </select>
+
+            <label for="base-url">API address, without chat/completions or messages</label>
+            <input id="base-url" name="baseUrl" type="url" autocomplete="off" spellcheck="false">
+
+            <label for="model">Model</label>
+            <input id="model" name="model" type="text" autocomplete="off" spellcheck="false">
+
+            <label for="effort">Reasoning effort</label>
+            <select id="effort" name="effort" aria-describedby="effort-hint">
+              <option value="default">Provider default</option>
+              <option value="low">Low</option>
+              <option value="medium">Medium</option>
+              <option value="high">High</option>
+              <option value="max">Maximum</option>
+            </select>
+            <p id="effort-hint" class="hint">Provider default sends no effort parameter. Supported levels depend on the model; some models map levels to the same behavior.</p>
+
+            <label for="anthropic-version" id="anthropic-version-label">Anthropic API version</label>
+            <input id="anthropic-version" name="anthropicVersion" type="text" autocomplete="off" spellcheck="false">
+          </details>
+
+          <button id="save-settings" type="submit" data-number="4">4 Save settings</button>
+          <p id="settings-status" class="hint" role="status"></p>
+        </form>
+
+        <button id="replay-intro" type="button" data-number="5">5 Replay introduction</button>
+        <section class="shortcut-help" aria-labelledby="shortcut-heading">
+          <h3 id="shortcut-heading">Keyboard shortcuts</h3>
+          <dl id="shortcut-status">
+            <div><dt>Open assistant</dt><dd data-command="open-assistant">Unavailable</dd></div>
+            <div><dt>Listen once</dt><dd data-command="listen-once">Unavailable</dd></div>
+            <div><dt>Close panel</dt><dd data-command="close-assistant">Unavailable</dd></div>
+            <div><dt>Replay introduction</dt><dd data-command="replay-introduction">Unavailable</dd></div>
+          </dl>
+          <ul class="hint">
+            <li>Choose options with Control + Shift + 1 to 9 on the top row. These keys stay the same when entry shortcuts change.</li>
+            <li>Plain digits stay with your screen reader.</li>
+            <li>Use your screen reader to stop speech already being read.</li>
+          </ul>
+          <p class="hint">View or change bindings at <code>chrome://extensions/shortcuts</code>.</p>
+        </section>
       </section>
 
       <section id="conversation" aria-labelledby="transcript-heading">
@@ -46,66 +108,6 @@
           <p class="hint">Only the recording stays on this device. Spoken commands and page content you allow are still sent to the AI service you configure.</p>
         </details>
         <button id="open-setup" type="button" data-number="2" hidden>2 Open setup tab</button>
-      </section>
-
-      <section class="settings" data-number-scope="settings" aria-label="Settings">
-        <details id="settings">
-          <summary data-number="8">8 Settings</summary>
-          <form id="settings-form" novalidate>
-            <label for="api-key">OpenCode Go API key, kept only for this browser session</label>
-            <input id="api-key" name="apiKey" type="password" autocomplete="off" spellcheck="false">
-            <p class="hint">Billing and access are handled by OpenCode Go. The field clears after saving; the key is never read aloud.</p>
-            <p class="hint"><a href="https://opencode.ai/console" target="_blank" rel="noreferrer" data-number="1">1 Get an API key</a>. Sign in, subscribe to Go if needed, copy the key, then paste it here. <a href="https://opencode.ai/docs/go/" target="_blank" rel="noreferrer" data-number="2">2 Go help</a>.</p>
-
-            <details id="advanced-api">
-              <summary data-number="3">3 Advanced API settings</summary>
-              <label for="protocol">API format</label>
-              <select id="protocol" name="protocol">
-                <option value="openai">1 OpenAI compatible</option>
-                <option value="anthropic">2 Anthropic compatible</option>
-              </select>
-
-              <label for="base-url">API address, without chat/completions or messages</label>
-              <input id="base-url" name="baseUrl" type="url" autocomplete="off" spellcheck="false">
-
-              <label for="model">Model</label>
-              <input id="model" name="model" type="text" autocomplete="off" spellcheck="false">
-
-              <label for="effort">Reasoning effort</label>
-              <select id="effort" name="effort" aria-describedby="effort-hint">
-                <option value="default">Provider default</option>
-                <option value="low">Low</option>
-                <option value="medium">Medium</option>
-                <option value="high">High</option>
-                <option value="max">Maximum</option>
-              </select>
-              <p id="effort-hint" class="hint">Provider default sends no effort parameter. Supported levels depend on the model; some models map levels to the same behavior.</p>
-
-              <label for="anthropic-version" id="anthropic-version-label">Anthropic API version</label>
-              <input id="anthropic-version" name="anthropicVersion" type="text" autocomplete="off" spellcheck="false">
-            </details>
-
-            <button id="save-settings" type="submit" data-number="4">4 Save settings</button>
-            <p id="settings-status" class="hint" role="status"></p>
-          </form>
-
-          <button id="replay-intro" type="button" data-number="5">5 Replay introduction</button>
-          <section class="shortcut-help" aria-labelledby="shortcut-heading">
-            <h3 id="shortcut-heading">Keyboard shortcuts</h3>
-            <dl id="shortcut-status">
-              <div><dt>Open assistant</dt><dd data-command="open-assistant">Unavailable</dd></div>
-              <div><dt>Listen once</dt><dd data-command="listen-once">Unavailable</dd></div>
-              <div><dt>Close panel</dt><dd data-command="close-assistant">Unavailable</dd></div>
-              <div><dt>Replay introduction</dt><dd data-command="replay-introduction">Unavailable</dd></div>
-            </dl>
-            <ul class="hint">
-              <li>Choose options with Control + Shift + 1–9 on the top row. These keys stay the same when entry shortcuts change.</li>
-              <li>Plain digits stay with your screen reader.</li>
-              <li>Use your screen reader to stop speech already being read.</li>
-            </ul>
-            <p class="hint">View or change bindings at <code>chrome://extensions/shortcuts</code>.</p>
-          </section>
-        </details>
       </section>
     </div>
 

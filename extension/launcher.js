@@ -30,34 +30,35 @@
   style.textContent = `
     :host {
       all: initial;
-      --launcher-accent: #6534d5;
-      --launcher-accent-hover: #5225b5;
-      --launcher-on-accent: #ffffff;
-      --launcher-mark-bg: #ffffff;
-      --launcher-mark-fg: #5225b5;
-      --launcher-focus: #8f2dce;
-      --launcher-shadow: rgba(24, 32, 48, 0.28);
+      /* Coral values, kept in step with extension/tokens.css. */
+      --launcher-board: oklch(22% 0.011 40);
+      --launcher-board-hover: oklch(29% 0.013 40);
+      --launcher-board-type: oklch(96.5% 0.006 70);
+      --launcher-mark-tile: oklch(54% 0.165 29);
+      --launcher-mark-glyph: oklch(98.8% 0.0045 80);
+      --launcher-focus: oklch(54% 0.17 30);
+      --launcher-shadow: oklch(32% 0.03 50 / 0.3);
+      --launcher-font: system-ui, -apple-system, "Segoe UI", sans-serif;
     }
     .launcher-bar {
       display: inline-flex; align-items: center; gap: 8px;
       max-width: calc(100vw - 32px);
     }
     .open-button {
-      display: inline-flex; align-items: center; gap: 8px;
+      display: inline-flex; align-items: center; gap: 10px;
       min-width: 56px; min-height: 56px; max-width: calc(100vw - 32px);
       padding: 0 18px 0 14px;
-      border: 1px solid var(--launcher-accent); border-radius: 28px;
-      background: var(--launcher-accent); color: var(--launcher-on-accent);
-      font: 600 18px/1.2 system-ui, sans-serif;
-      box-shadow: 0 4px 14px var(--launcher-shadow);
+      border: 1px solid var(--launcher-board); border-radius: 8px;
+      background: var(--launcher-board); color: var(--launcher-board-type);
+      font: 600 18px/1.2 var(--launcher-font);
+      box-shadow: 6px 5px 12px -6px var(--launcher-shadow);
       cursor: pointer; touch-action: none; user-select: none;
     }
-    .open-button:hover, .open-button:active { border-color: var(--launcher-accent-hover); background: var(--launcher-accent-hover); }
-    .mark {
-      flex: none; display: grid; place-items: center;
-      width: 28px; height: 28px; border-radius: 9px;
-      background: var(--launcher-mark-bg); color: var(--launcher-mark-fg); font-size: 16px;
-    }
+    .open-button:hover, .open-button:active { border-color: var(--launcher-board-hover); background: var(--launcher-board-hover); }
+    .mark { flex: none; display: block; width: 28px; height: 28px; }
+    .mark-tile { fill: var(--launcher-mark-tile); }
+    .mark-bubble { fill: var(--launcher-mark-glyph); }
+    .mark-bars { fill: none; stroke: var(--launcher-mark-tile); stroke-width: 2.2; stroke-linecap: round; }
     .label { min-width: 0; overflow-wrap: anywhere; text-align: left; }
     .open-button:focus-visible {
       outline: 3px solid var(--launcher-focus); outline-offset: 3px;
@@ -68,35 +69,27 @@
     }
     @media (max-width: 240px) {
       .launcher-bar { flex-direction: column; align-items: stretch; gap: 6px; }
-      .open-button { max-width: 100%; border-radius: 24px; }
+      .open-button { max-width: 100%; }
     }
     @media (prefers-color-scheme: dark) {
       :host {
-        --launcher-accent: #bca1ff;
-        --launcher-accent-hover: #cfbdff;
-        --launcher-on-accent: #201238;
-        --launcher-mark-bg: #201238;
-        --launcher-mark-fg: #f7f9fd;
-        --launcher-focus: #e0b7ff;
-        --launcher-shadow: rgba(0, 0, 0, 0.45);
+        --launcher-board: oklch(92% 0.008 55);
+        --launcher-board-hover: oklch(86% 0.01 55);
+        --launcher-board-type: oklch(20% 0.012 38);
+        --launcher-focus: oklch(78% 0.13 30);
+        --launcher-shadow: oklch(7% 0.01 40 / 0.5);
       }
     }
     @media (prefers-contrast: more) {
       .open-button { border-width: 2px; }
     }
     @media (forced-colors: active) {
-      .open-button {
-        border: 2px solid ButtonText; background: ButtonFace; color: ButtonText;
-        box-shadow: none;
-      }
-      .mark { border: 1px solid ButtonText; background: ButtonText; color: ButtonFace; }
-      .open-button:hover, .open-button:active {
-        border-color: ButtonText; background: ButtonFace;
-      }
+      .open-button { border: 2px solid ButtonText; background: ButtonFace; color: ButtonText; box-shadow: none; }
+      .open-button:hover, .open-button:active { border-color: ButtonText; background: ButtonFace; }
+      .mark-tile { fill: ButtonText; }
+      .mark-bubble { fill: ButtonFace; }
+      .mark-bars { stroke: ButtonText; }
       .open-button:focus-visible { outline: 3px solid Highlight; }
-    }
-    @media (prefers-reduced-motion: reduce) {
-      .open-button { transition: none; }
     }
   `;
 
@@ -107,10 +100,19 @@
   openButton.type = 'button';
   openButton.id = 'launcher-open';
   openButton.className = 'open-button';
-  const mark = document.createElement('span');
-  mark.className = 'mark';
-  mark.setAttribute('aria-hidden', 'true');
-  mark.textContent = 'A';
+  // Same glyph as sidepanel.html .brand-mark and icons/icon.svg.
+  const SVG_NS = 'http://www.w3.org/2000/svg';
+  const svgNode = (tag, attributes) => {
+    const node = document.createElementNS(SVG_NS, tag);
+    for (const [name, value] of Object.entries(attributes)) node.setAttribute(name, value);
+    return node;
+  };
+  const mark = svgNode('svg', { class: 'mark', viewBox: '0 0 32 32', 'aria-hidden': 'true', focusable: 'false' });
+  mark.append(
+    svgNode('rect', { class: 'mark-tile', width: '32', height: '32', rx: '8' }),
+    svgNode('path', { class: 'mark-bubble', d: 'M9 7h14a4 4 0 0 1 4 4v7a4 4 0 0 1-4 4h-7l-6 5v-5H9a4 4 0 0 1-4-4v-7a4 4 0 0 1 4-4z' }),
+    svgNode('path', { class: 'mark-bars', d: 'M12 12.5v4M16 10.5v8M20 12.5v4' }),
+  );
   const label = document.createElement('span');
   label.className = 'label';
   label.textContent = 'Assistant';

@@ -27,7 +27,7 @@ test('extension loads, injects one launcher and opens the panel document', async
 
     const panel = await openPanel(context, extensionId);
     await expect(panel.locator('#page-line')).toContainText('Event schedule');
-    await expect(panel.locator('#settings')).toBeVisible();
+    await expect(panel.locator('#settings-toggle')).toBeVisible();
     await expect(panel.locator('#mode-line')).toContainText('Guide');
   } finally {
     await context.close();

@@ -8,8 +8,34 @@ async function attachScreenshot(page, testInfo, name) {
   });
 }
 
+// The panel's colors are authored in oklch and Chromium serializes computed
+// values in the same space, so the helper resolves oklch before the ratio.
+function oklchToSrgb(lightness, chroma, hue) {
+  const radians = (hue * Math.PI) / 180;
+  const a = chroma * Math.cos(radians);
+  const b = chroma * Math.sin(radians);
+  const l = (lightness + 0.3963377774 * a + 0.2158037573 * b) ** 3;
+  const m = (lightness - 0.1055613458 * a - 0.0638541728 * b) ** 3;
+  const s = (lightness - 0.0894841775 * a - 1.2914855480 * b) ** 3;
+  const linear = [
+    4.0767416621 * l - 3.3077115913 * m + 0.2309699292 * s,
+    -1.2684380046 * l + 2.6097574011 * m - 0.3413193965 * s,
+    -0.0041960863 * l - 0.7034186147 * m + 1.7076147010 * s,
+  ];
+  return linear.map((value) => {
+    const clamped = Math.min(1, Math.max(0, value));
+    return Math.round(255 * (clamped <= 0.0031308 ? 12.92 * clamped : 1.055 * clamped ** (1 / 2.4) - 0.055));
+  });
+}
+
 function contrastRatio(foreground, background) {
-  const parse = (value) => value.match(/[\d.]+/gu).slice(0, 3).map(Number);
+  const parse = (value) => {
+    const oklch = /oklch\(([\d.]+)(%?)\s+([\d.]+)\s+([\d.]+)/u.exec(value);
+    if (oklch) {
+      return oklchToSrgb(Number(oklch[1]) / (oklch[2] === '%' ? 100 : 1), Number(oklch[3]), Number(oklch[4]));
+    }
+    return value.match(/[\d.]+/gu).slice(0, 3).map(Number);
+  };
   const channel = (value) => {
     const amount = value / 255;
     return amount <= 0.03928 ? amount / 12.92 : ((amount + 0.055) / 1.055) ** 2.4;
@@ -31,7 +57,8 @@ test('appearance: conversation scroll keeps the composer reachable', async ({}, 
     await panel.setViewportSize({ width: 391, height: 904 });
     await expect(panel.locator('.conversation-empty')).toBeVisible();
     await expect(panel.locator('.conversation-empty')).toHaveText('Ask about this page, an image, or a task.');
-    await expect(panel.locator('#settings')).not.toHaveJSProperty('open', true);
+    await expect(panel.locator('#settings')).toBeHidden();
+    await expect(panel.locator('#settings-toggle')).toHaveAttribute('aria-expanded', 'false');
     await expect(panel.locator('#voice-help')).not.toHaveJSProperty('open', true);
     await expect(panel.locator('#close-panel')).toHaveCount(1);
     await expect(panel.locator('#close-panel')).toHaveAccessibleName('Close panel');
@@ -109,12 +136,14 @@ test('appearance: conversation scroll keeps the composer reachable', async ({}, 
     await expect(panel.locator('.message-body', { hasText: 'I heard you.' })).toHaveCount(3, { timeout: 30_000 });
     await expect(panel.locator('#transcript')).toHaveAttribute('aria-busy', 'false', { timeout: 30_000 });
 
-    // Settings scroll above the composer; every existing action stays reachable.
-    await panel.locator('#settings > summary').click();
-    await expect(panel.locator('#settings')).toHaveJSProperty('open', true);
+    // Settings replaces the conversation; every existing action stays reachable.
+    await panel.locator('#settings-toggle').click();
+    await expect(panel.locator('#settings')).toBeVisible();
+    await expect(panel.locator('#settings-toggle')).toHaveAttribute('aria-expanded', 'true');
+    await expect(panel.locator('#conversation')).toBeHidden();
     await panel.locator('#api-key').scrollIntoViewIfNeeded();
     await expect(panel.locator('#api-key')).toBeVisible();
-    for (const id of ['listen', 'pause', 'repeat', 'cancel', 'undo', 'close-panel']) {
+    for (const id of ['listen', 'pause', 'repeat', 'cancel', 'undo', 'close-panel', 'settings-toggle']) {
       await expect(panel.locator(`#${id}`)).toBeVisible();
       await expect(panel.locator(`#${id}`)).toBeEnabled();
     }
@@ -177,7 +206,7 @@ test('appearance: shortcut help stays readable and structured', async ({}, testI
     await resetMock();
     await openFixture(context, '/article');
     const panel = await openPanel(context, extensionId);
-    await panel.locator('#settings > summary').click();
+    await panel.locator('#settings-toggle').click();
     await panel.locator('#shortcut-heading').scrollIntoViewIfNeeded();
 
     expect(await panel.locator('#shortcut-status > div').count()).toBe(4);
@@ -273,7 +302,7 @@ test('appearance: shortcut help normalizes browser-localized bindings', async ({
     await resetMock();
     await openFixture(context, '/article');
     const panel = await openPanel(context, extensionId);
-    await panel.locator('#settings > summary').click();
+    await panel.locator('#settings-toggle').click();
     await panel.locator('#shortcut-heading').scrollIntoViewIfNeeded();
 
     await expect(panel.locator('#shortcut-status dd')).toHaveText([
@@ -394,7 +423,7 @@ test('appearance: shortcut help stays unavailable when commands cannot be read',
     await resetMock();
     await openFixture(context, '/article');
     const panel = await openPanel(context, extensionId);
-    await panel.locator('#settings > summary').click();
+    await panel.locator('#settings-toggle').click();
     await expect(panel.locator('#shortcut-status dd')).toHaveText([
       'Unavailable',
       'Unavailable',
@@ -551,6 +580,7 @@ test('appearance: setup and launcher remain usable across display modes', async 
     await expect(setup.locator('body')).toHaveClass(/setup-page/);
     await expect(setup.locator('#composer')).toBeHidden();
     await expect(setup.locator('#settings')).toBeHidden();
+    await expect(setup.locator('#settings-toggle')).toBeHidden();
     await expect(setup.locator('#voice-help')).not.toHaveJSProperty('open', true);
     await expect(setup.locator('#close-panel')).toBeHidden();
     await expect(setup.locator('[data-number-scope="output"]')).toHaveCount(0);
@@ -750,7 +780,7 @@ test('appearance: reasoning effort settings remain reachable across modes', asyn
   try {
     await openFixture(context, '/article');
     const panel = await openPanel(context, extensionId);
-    await panel.locator('#settings > summary').click();
+    await panel.locator('#settings-toggle').click();
     await panel.locator('#advanced-api > summary').click();
     await expect(panel.locator('#effort')).toBeVisible();
     await expect(panel.locator('#effort')).toHaveAccessibleName('Reasoning effort');

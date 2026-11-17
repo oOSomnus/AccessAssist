@@ -1064,9 +1064,11 @@ function numberTarget(scope, key) {
     if (element.dataset.number !== key || numberScopeFor(element) !== scope) continue;
     if (usableNumberTarget(element)) return element;
   }
-  if (scope === 'composer' && key === '8') {
-    const summary = $('settings').querySelector('summary');
-    if (usableNumberTarget(summary)) return summary;
+  // Settings lives in the header, outside every number group; 8 reaches it
+  // from the composer and from inside Settings.
+  if (key === '8' && (scope === 'composer' || scope === 'settings')) {
+    const toggle = $('settings-toggle');
+    if (usableNumberTarget(toggle)) return toggle;
   }
   return null;
 }
@@ -1294,8 +1296,16 @@ function focusListen() {
   if (document.activeElement !== $('listen')) $('listen').focus();
 }
 
+function setSettingsOpen(open) {
+  const settings = $('settings');
+  // Hiding the focused field would drop focus to the body; keep it on the toggle.
+  if (!open && settings.contains(document.activeElement)) $('settings-toggle').focus();
+  settings.hidden = !open;
+  $('settings-toggle').setAttribute('aria-expanded', String(open));
+}
+
 function openSettingsForKey({ advanced = false } = {}) {
-  $('settings').open = true;
+  setSettingsOpen(true);
   if (advanced) $('advanced-api').open = true;
   $('api-key').focus();
 }
@@ -2648,6 +2658,7 @@ function bindEvents() {
   $('cancel').addEventListener('click', () => void cancelFromButton());
   $('undo').addEventListener('click', () => void undoFromButton());
   $('close-panel').addEventListener('click', () => void closePanel());
+  $('settings-toggle').addEventListener('click', () => setSettingsOpen($('settings').hidden));
   $('replay-intro').addEventListener('click', () => {
     interruptOutput();
     void runIntro({ page: false });
