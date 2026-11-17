@@ -6,11 +6,23 @@ import {
   armConsent,
   createSession,
   finishExecution,
-  observationDrift,
+  pointMasked,
   pointsCrossMask,
   validateProposal,
 } from './policy.js';
 import { createExecutionQueue } from './execution.js';
+import {
+  CLICK_FIELDS,
+  CONFLICT_CLICK_FIELDS,
+  KEY_FIELDS,
+  changedSince,
+  conflictFor,
+  differsFromApproved,
+  driftFromObserved,
+  pickState,
+  projectTargetState,
+  roundedRect,
+} from './target-state.js';
 
 const PANEL_URL = chrome.runtime.getURL('sidepanel.html');
 const LAUNCHER_ID = 'accessassist-launcher-host';
@@ -330,7 +342,7 @@ chrome.webNavigation.onHistoryStateUpdated.addListener((details) => {
   chrome.tabs.get(details.tabId).then((tab) => {
     if (!httpUrl(tab.url)) return;
     lastHttpTab.set(tab.windowId, { tabId: tab.id, at: Date.now() });
-    forgetTab(details.tabId);
+    clearTab(details.tabId, 'document');
   }).catch(() => {});
 });
 
@@ -339,7 +351,7 @@ chrome.webNavigation.onCommitted.addListener((details) => {
   chrome.tabs.get(details.tabId).then((tab) => {
     if (!httpUrl(tab.url)) return;
     lastHttpTab.set(tab.windowId, { tabId: tab.id, at: Date.now() });
-    forgetTab(details.tabId);
+    clearTab(details.tabId, 'document');
   }).catch(() => {});
 });
 
@@ -628,10 +640,7 @@ function modelTarget(entry, target) {
     docToken: target.docToken ?? null,
     selected: target.selected,
     options: target.options,
-    rect: {
-      x: Math.round(target.rect.x), y: Math.round(target.rect.y),
-      width: Math.round(target.rect.width), height: Math.round(target.rect.height),
-    },
+    rect: roundedRect(target.rect),
   };
 }
 
@@ -906,28 +915,6 @@ async function expectedState(step, entry, { fullValue = false } = {}) {
   return { state };
 }
 
-function comparable(state) {
-  return {
-    docToken: state.docToken,
-    disabled: state.disabled,
-    visible: state.visible,
-    name: state.name,
-    role: state.role,
-    tag: state.tag,
-    link: state.link,
-    value: state.value,
-    checked: state.checked,
-    ariaChecked: state.ariaChecked,
-    ariaSelected: state.ariaSelected,
-    styleState: state.styleState ?? null,
-    selected: state.selected,
-    alt: state.alt,
-    rect: state.rect
-      ? { x: Math.round(state.rect.x), y: Math.round(state.rect.y), width: Math.round(state.rect.width), height: Math.round(state.rect.height) }
-      : null,
-  };
-}
-
 async function proposeAction(tab, message) {
   const observation = observations.get(tab.id);
   if (!observation) return { ok: false, errors: ['Observe the page first'] };
@@ -971,17 +958,17 @@ async function proposeAction(tab, message) {
     if (!entry || entry.tabId !== tab.id) return { ok: false, errors: ['Snapshot expired; observe the page again'] };
     const state = await expectedState(step, entry, { fullValue: step.type === 'set_value' });
     if (!state.state?.exists) return { ok: false, errors: ['Target no longer exists; observe the page again'] };
-    const drift = observationDrift(step, state.state, entry.targets.get(step.nodeId));
+    const drift = driftFromObserved(step, state.state, entry.targets.get(step.nodeId));
     if (drift) return { ok: false, errors: [`The page changed since it was observed (${drift}); observe the page again`] };
-    expected.set(`${step.snapshotId}:${step.nodeId}`, comparable(state.state));
+    expected.set(`${step.snapshotId}:${step.nodeId}`, projectTargetState(state.state));
     if (step.toNodeId !== undefined) {
       const end = await agentCall(tab.id, entry, {
         op: 'state', snapshotId: step.snapshotId, nodeId: step.toNodeId,
       });
       if (!end?.exists) return { ok: false, errors: ['Drag endpoint no longer exists; observe the page again'] };
-      const endDrift = observationDrift(step, end, entry.targets.get(step.toNodeId));
+      const endDrift = driftFromObserved(step, end, entry.targets.get(step.toNodeId));
       if (endDrift) return { ok: false, errors: [`The page changed since it was observed (${endDrift}); observe the page again`] };
-      expected.set(`${step.snapshotId}:${step.toNodeId}`, comparable(end));
+      expected.set(`${step.snapshotId}:${step.toNodeId}`, projectTargetState(end));
     }
   }
   const proposal = { ...outcome.proposal, tabId: tab.id, windowId: tab.windowId, expected };
@@ -1059,26 +1046,6 @@ async function confirmProposal(tab, message) {
   };
 }
 
-function compareExpected(step, state, expected) {
-  if (!expected) return null;
-  const current = comparable(state);
-  // Raw class/style text is excluded: CSSOM serialization can change while the
-  // rendered target stays identical. Computed styleState, geometry, semantic
-  // state, and the hit test still catch real moves, recolors, and overlays.
-  // A screenshot point is anchored to frozen pixels and re-hit-tested, not to
-  // the synthetic visual region's own geometry.
-  const keys = step.point || step.points
-    ? ['docToken', 'visible']
-    : ['docToken', 'visible', 'disabled', 'name', 'role', 'tag', 'link', 'value', 'checked', 'ariaChecked', 'ariaSelected', 'styleState', 'alt', 'rect'];
-  for (const key of keys) {
-    if (JSON.stringify(current[key]) !== JSON.stringify(expected[key])) return `Page state changed (${key}); observe the page again`;
-  }
-  if (!step.point && !step.points && JSON.stringify(current.selected) !== JSON.stringify(expected.selected)) {
-    return 'Page state changed; observe the page again';
-  }
-  return null;
-}
-
 async function executeProposal(tab, proposal) {
   if (executions.stopped(tab.id)) {
     return {
@@ -1131,7 +1098,7 @@ async function executeProposal(tab, proposal) {
         break;
       }
       const expected = proposal.expected?.get(`${step.snapshotId}:${step.nodeId}`);
-      const stale = compareExpected(step, stateResult, expected);
+      const stale = differsFromApproved(step, stateResult, expected);
       if (stale) {
         failedStep = `Step ${index + 1}: ${stale}`;
         break;
@@ -1143,7 +1110,7 @@ async function executeProposal(tab, proposal) {
         const endState = await agentCall(tab.id, entry, {
           op: 'state', snapshotId: step.snapshotId, nodeId: step.toNodeId,
         });
-        const endStale = endState?.exists ? compareExpected(step, endState, endExpected) : 'Page state changed; observe the page again';
+        const endStale = endState?.exists ? differsFromApproved(step, endState, endExpected) : 'Page state changed; observe the page again';
         if (endStale) {
           failedStep = `Step ${index + 1}: ${endStale}`;
           break;
@@ -1387,17 +1354,7 @@ async function executeStep(tab, step, entry, beforeState, cdp, record) {
         };
       }
       const point = await targetPoint(tab.id, entry, snapshotId, nodeId, cdp);
-      const before = {
-        docToken: beforeState.docToken,
-        textHash: beforeState.textHash,
-        ariaChecked: beforeState.ariaChecked,
-        checked: beforeState.checked,
-        ariaExpanded: beforeState.ariaExpanded,
-        ariaSelected: beforeState.ariaSelected,
-        ariaPressed: beforeState.ariaPressed,
-        styleState: beforeState.styleState ?? null,
-        appearance: beforeState.appearance ?? null,
-      };
+      const before = pickState(beforeState, CLICK_FIELDS);
       await withModifiers(cdp, step.modifiers, () => clickPoint(cdp, point, {
         button: step.button, clickCount: step.clickCount, holdMs: step.holdMs,
         modifiers: step.modifiers, tabId: tab.id,
@@ -1409,16 +1366,7 @@ async function executeStep(tab, step, entry, beforeState, cdp, record) {
       } catch {
         after = { exists: false, docToken: null };
       }
-      const navigated = !after || !after.exists || after.docToken !== before.docToken;
-      const changed = navigated
-        || Boolean(after.textHash && after.textHash !== before.textHash)
-        || after.ariaChecked !== before.ariaChecked
-        || after.checked !== before.checked
-        || after.ariaExpanded !== before.ariaExpanded
-        || after.ariaSelected !== before.ariaSelected
-        || after.ariaPressed !== before.ariaPressed
-        || JSON.stringify(after.styleState ?? null) !== JSON.stringify(before.styleState ?? null)
-        || after.appearance !== before.appearance;
+      const { navigated, changed } = changedSince(before, after, CLICK_FIELDS);
       const verified = step.button === 'left' && step.clickCount === 1 && step.holdMs === 0
         && !step.modifiers.length
         && Boolean(navigated || after.ariaChecked !== before.ariaChecked || after.checked !== before.checked);
@@ -1426,12 +1374,7 @@ async function executeStep(tab, step, entry, beforeState, cdp, record) {
         kind: 'click', snapshotId, nodeId, frameId: entryFrame,
         reversible: step.button === 'left' && step.clickCount === 1 && step.holdMs === 0
           && !step.modifiers.length && !navigated,
-        before, after: after?.exists ? {
-          docToken: after.docToken, textHash: after.textHash, ariaChecked: after.ariaChecked,
-          checked: after.checked, ariaExpanded: after.ariaExpanded,
-          ariaSelected: after.ariaSelected, ariaPressed: after.ariaPressed,
-          styleState: after.styleState ?? null, appearance: after.appearance ?? null,
-        } : { docToken: null },
+        before, after: after?.exists ? pickState(after, CLICK_FIELDS) : { docToken: null },
       });
       return {
         ok: true,
@@ -1542,7 +1485,7 @@ async function executeStep(tab, step, entry, beforeState, cdp, record) {
         }
         const masks = await agentCall(tab.id, entry, { op: 'masks' });
         if (masks?.error) return { ok: false, error: masks.error };
-        if (localPoints.some((point) => maskHit(point, masks.rects))
+        if (localPoints.some((point) => pointMasked(point, masks.rects))
           || pointsCrossMask(localPoints, masks.rects)) {
           return { ok: false, error: 'The drag would cross a masked or embedded area' };
         }
@@ -1614,13 +1557,7 @@ async function executeStep(tab, step, entry, beforeState, cdp, record) {
       } catch {
         after = { exists: false };
       }
-      const navigated = !after?.exists || after.docToken !== before.docToken;
-      const changed = navigated
-        || Boolean(after?.textHash && after.textHash !== before.textHash)
-        || after?.ariaChecked !== before.ariaChecked
-        || after?.checked !== before.checked
-        || after?.ariaExpanded !== before.ariaExpanded
-        || after?.appearance !== before.appearance;
+      const { changed } = changedSince(before, after, KEY_FIELDS);
       return {
         ok: true,
         changed,
@@ -1740,14 +1677,9 @@ async function detectConflict(record) {
       fullValue: field.kind === 'value',
     }).catch(() => null);
     if (!state?.exists) return { conflict: 'Target was replaced; cannot undo safely' };
-    if (field.kind === 'value' && state.value !== field.after) return { conflict: 'Page content changed afterwards; undo would overwrite the new content' };
-    if (field.kind === 'checked' && state.checked !== field.after) return { conflict: 'Checked state changed afterwards' };
-    if (field.kind === 'ariaChecked' && state.ariaChecked !== field.after) return { conflict: 'Option state changed afterwards' };
-    if (field.kind === 'selected' && JSON.stringify(state.selected) !== JSON.stringify(field.after)) return { conflict: 'Selection changed afterwards' };
-    if (field.kind === 'alt' && (state.alt?.value !== field.after?.value || state.alt?.present !== field.after?.present)) {
-      return { conflict: 'Image description changed afterwards' };
-    }
-    expected.set(`${field.snapshotId}:${field.nodeId}`, comparable(state));
+    const conflict = conflictFor(field, state);
+    if (conflict) return { conflict };
+    expected.set(`${field.snapshotId}:${field.nodeId}`, projectTargetState(state));
   }
   for (const click of record.clicks) {
     if (click.reversible !== true) continue;
@@ -1757,23 +1689,17 @@ async function detectConflict(record) {
       op: 'state', snapshotId: click.snapshotId, nodeId: click.nodeId,
     }).catch(() => null);
     if (!state?.exists) return { conflict: 'Target was replaced; cannot undo safely' };
-    const same = (state.docToken ?? null) === (click.after?.docToken ?? null)
-      && (state.ariaChecked ?? null) === (click.after?.ariaChecked ?? null)
-      && (state.checked ?? null) === (click.after?.checked ?? null)
-      && (state.ariaPressed ?? null) === (click.after?.ariaPressed ?? null)
-      && JSON.stringify(state.styleState ?? null) === JSON.stringify(click.after?.styleState ?? null)
-      && (state.appearance ?? null) === (click.after?.appearance ?? null);
-    if (!same) return { conflict: 'Page state changed afterwards; cannot undo safely' };
-    expected.set(`${click.snapshotId}:${click.nodeId}`, comparable(state));
+    if (changedSince(click.after, state, CONFLICT_CLICK_FIELDS).changed) {
+      return { conflict: 'Page state changed afterwards; cannot undo safely' };
+    }
+    expected.set(`${click.snapshotId}:${click.nodeId}`, projectTargetState(state));
   }
   return { conflict: null, expected };
 }
 
 async function resetSession(tabId, { clearSnapshots = false } = {}) {
   if (!Number.isInteger(tabId)) return { ok: true };
-  executions.stop(tabId);
-  for (const [id, entry] of proposals) if (entry.tabId === tabId) proposals.delete(id);
-  if (clearSnapshots) forgetTab(tabId);
+  clearTab(tabId, clearSnapshots ? 'turnPage' : 'turn');
   return { ok: true };
 }
 
@@ -2194,13 +2120,6 @@ async function clickPoint(cdp, point, options = {}) {
 async function hoverPoint(cdp, point, durationMs, tabId) {
   await cdp.send('Input.dispatchMouseEvent', { type: 'mouseMoved', x: point.x, y: point.y, buttons: 0 });
   if (durationMs > 0) await waitSlices(tabId, durationMs);
-}
-
-function maskHit(point, masks) {
-  return Array.isArray(masks) && masks.some((mask) => (
-    point.x >= mask.x && point.x <= mask.x + mask.width
-    && point.y >= mask.y && point.y <= mask.y + mask.height
-  ));
 }
 
 const KEY_DEFS = Object.freeze({

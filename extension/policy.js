@@ -56,27 +56,6 @@ export function undoKindFor(risk) {
   return 'unavailable';
 }
 
-// Same-document changes keep docToken, so compare what the user approved
-// against the live control. Rect is excluded: scrolling moves it, and
-// execution re-hit-tests the live target anyway.
-export function observationDrift(step, live, observed) {
-  if (!live || !observed) return 'target';
-  const keys = step.point || step.points
-    ? ['visible']
-    : ['visible', 'disabled', 'name', 'tag', 'checked', 'ariaChecked', 'value'];
-  for (const key of keys) {
-    let current = live[key];
-    // Observations hold the first 300 characters (whitespace-cleaned for contenteditable).
-    if (key === 'value' && typeof current === 'string') {
-      current = (live.contentEditable
-        ? current.replace(/[\u200b-\u200d\ufeff]/gu, '').replace(/\s+/gu, ' ').trim()
-        : current).slice(0, 300);
-    }
-    if (JSON.stringify(current) !== JSON.stringify(observed[key])) return key;
-  }
-  return null;
-}
-
 // A clock time needs AM/PM only when an hour is 1-12; 0 and 13-23 are already
 // unambiguous 24-hour values. A meridiem covers only its own clause, so
 // "2:00 to 3:00 PM" is clear but "Monday 2:00; Tuesday 3:00 PM" still asks.
@@ -107,7 +86,7 @@ function pointInRect(point, rect) {
     && point.y >= rect.y - 1 && point.y <= rect.y + rect.height + 1;
 }
 
-function pointMasked(point, masks) {
+export function pointMasked(point, masks) {
   return Array.isArray(masks) && masks.some((mask) => rectContains(mask, point));
 }
 
