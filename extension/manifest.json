@@ -1,0 +1,35 @@
+{
+  "manifest_version": 3,
+  "name": "AccessAssist",
+  "version": "0.1.0",
+  "description": "Voice-first web reading and operation assistant for blind users",
+  "minimum_chrome_version": "142",
+  "background": { "service_worker": "background.js", "type": "module" },
+  "side_panel": { "default_path": "sidepanel.html" },
+  "action": { "default_title": "Open AccessAssist voice assistant" },
+  "permissions": ["sidePanel", "scripting", "storage", "debugger", "webNavigation"],
+  "host_permissions": ["http://*/*", "https://*/*"],
+  "content_scripts": [{
+    "matches": ["http://*/*", "https://*/*"],
+    "js": ["launcher.js"],
+    "run_at": "document_idle",
+    "all_frames": false
+  }],
+  "commands": {
+    "open-assistant": {
+      "suggested_key": { "default": "Ctrl+Shift+Space", "mac": "MacCtrl+Shift+Space" },
+      "description": "Open or focus the assistant without listening"
+    },
+    "listen-once": {
+      "suggested_key": { "default": "Ctrl+Shift+Y", "mac": "MacCtrl+Shift+Y" },
+      "description": "Listen once for a voice command"
+    },
+    "close-assistant": {
+      "suggested_key": { "default": "Ctrl+Shift+Period", "mac": "MacCtrl+Shift+Period" },
+      "description": "Close the AccessAssist side panel"
+    },
+    "replay-introduction": {
+      "description": "Replay the AccessAssist introduction"
+    }
+  }
+}

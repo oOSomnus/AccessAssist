@@ -1,0 +1,16 @@
+{
+  "name": "accessassist",
+  "private": true,
+  "version": "0.1.0",
+  "type": "module",
+  "scripts": {
+    "test:unit": "node --test test/unit/*.test.js",
+    "test:e2e": "playwright test test/e2e",
+    "fixtures": "node test/serve-fixtures.mjs",
+    "package": "node scripts/package.mjs",
+    "smoke:ai": "node --env-file=.env scripts/smoke-ai.mjs"
+  },
+  "devDependencies": {
+    "@playwright/test": "^1.65.1"
+  }
+}

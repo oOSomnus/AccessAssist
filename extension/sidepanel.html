@@ -1,0 +1,132 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>AccessAssist</title>
+  <link rel="stylesheet" href="sidepanel.css">
+</head>
+<body>
+  <header class="bar">
+    <div class="bar-heading">
+      <span class="brand-mark" aria-hidden="true">A</span>
+      <h1>AccessAssist</h1>
+      <button id="close-panel" type="button" aria-label="Close panel" data-number-scope="composer">Close</button>
+    </div>
+    <p id="page-line">Checking the current page...</p>
+    <p id="mode-line">Guide mode</p>
+  </header>
+
+  <main>
+    <div class="panel-content">
+      <section id="ask" class="ask" data-number-scope="choice" hidden aria-labelledby="ask-heading">
+        <h2 id="ask-heading">Your choice</h2>
+        <p id="ask-question"></p>
+        <ol id="ask-sites" aria-label="Source sites" hidden></ol>
+        <div id="ask-options" role="group" aria-labelledby="ask-question"></div>
+        <p id="choice-shortcut-hint" class="hint">Press Control plus Shift plus a number to choose. Press Escape to cancel.</p>
+      </section>
+
+      <section id="conversation" aria-labelledby="transcript-heading">
+        <h2 id="transcript-heading" class="visually-hidden">Conversation</h2>
+        <ol id="transcript" class="transcript" aria-label="Conversation"></ol>
+        <p class="conversation-empty">Ask about this page, an image, or a task.</p>
+      </section>
+
+      <section id="voice-setup" class="voice-setup" data-number-scope="voice" aria-labelledby="voice-setup-heading">
+        <h2 id="voice-setup-heading">Set up voice</h2>
+        <p id="voice-status" class="hint" role="status"></p>
+        <div class="voice-buttons">
+          <button id="start-using" type="button" data-number="1">1 Prepare voice</button>
+          <button id="return-assistant" type="button" data-number="1" hidden>1 Return to assistant</button>
+        </div>
+        <details id="voice-help">
+          <summary>About voice and privacy</summary>
+          <p>Voice needs a one-time English speech pack and microphone access. Choose Prepare voice to start. Speech is recognized on this device.</p>
+          <p class="hint">Only the recording stays on this device. Spoken commands and page content you allow are still sent to the AI service you configure.</p>
+        </details>
+        <button id="open-setup" type="button" data-number="2" hidden>2 Open setup tab</button>
+      </section>
+
+      <section class="settings" data-number-scope="settings" aria-label="Settings">
+        <details id="settings">
+          <summary data-number="8">8 Settings</summary>
+          <form id="settings-form" novalidate>
+            <label for="api-key">OpenCode Go API key, kept only for this browser session</label>
+            <input id="api-key" name="apiKey" type="password" autocomplete="off" spellcheck="false">
+            <p class="hint">Billing and access are handled by OpenCode Go. The field clears after saving; the key is never read aloud.</p>
+            <p class="hint"><a href="https://opencode.ai/console" target="_blank" rel="noreferrer" data-number="1">1 Get an API key</a>. Sign in, subscribe to Go if needed, copy the key, then paste it here. <a href="https://opencode.ai/docs/go/" target="_blank" rel="noreferrer" data-number="2">2 Go help</a>.</p>
+
+            <details id="advanced-api">
+              <summary data-number="3">3 Advanced API settings</summary>
+              <label for="protocol">API format</label>
+              <select id="protocol" name="protocol">
+                <option value="openai">1 OpenAI compatible</option>
+                <option value="anthropic">2 Anthropic compatible</option>
+              </select>
+
+              <label for="base-url">API address, without chat/completions or messages</label>
+              <input id="base-url" name="baseUrl" type="url" autocomplete="off" spellcheck="false">
+
+              <label for="model">Model</label>
+              <input id="model" name="model" type="text" autocomplete="off" spellcheck="false">
+
+              <label for="effort">Reasoning effort</label>
+              <select id="effort" name="effort" aria-describedby="effort-hint">
+                <option value="default">Provider default</option>
+                <option value="low">Low</option>
+                <option value="medium">Medium</option>
+                <option value="high">High</option>
+                <option value="max">Maximum</option>
+              </select>
+              <p id="effort-hint" class="hint">Provider default sends no effort parameter. Supported levels depend on the model; some models map levels to the same behavior.</p>
+
+              <label for="anthropic-version" id="anthropic-version-label">Anthropic API version</label>
+              <input id="anthropic-version" name="anthropicVersion" type="text" autocomplete="off" spellcheck="false">
+            </details>
+
+            <button id="save-settings" type="submit" data-number="4">4 Save settings</button>
+            <p id="settings-status" class="hint" role="status"></p>
+          </form>
+
+          <button id="replay-intro" type="button" data-number="5">5 Replay introduction</button>
+          <section class="shortcut-help" aria-labelledby="shortcut-heading">
+            <h3 id="shortcut-heading">Keyboard shortcuts</h3>
+            <dl id="shortcut-status">
+              <div><dt>Open assistant</dt><dd data-command="open-assistant">Unavailable</dd></div>
+              <div><dt>Listen once</dt><dd data-command="listen-once">Unavailable</dd></div>
+              <div><dt>Close panel</dt><dd data-command="close-assistant">Unavailable</dd></div>
+              <div><dt>Replay introduction</dt><dd data-command="replay-introduction">Unavailable</dd></div>
+            </dl>
+            <ul class="hint">
+              <li>Choose options with Control + Shift + 1–9 on the top row. These keys stay the same when entry shortcuts change.</li>
+              <li>Plain digits type text or stay with your screen reader.</li>
+              <li>Use your screen reader to stop speech already being read.</li>
+            </ul>
+            <p class="hint">View or change bindings at <code>chrome://extensions/shortcuts</code>.</p>
+          </section>
+        </details>
+      </section>
+    </div>
+
+    <form id="composer" novalidate>
+      <label for="message">Message</label>
+      <textarea id="message" rows="2" autocomplete="off" spellcheck="false" aria-describedby="composer-hint"></textarea>
+      <p id="composer-hint" class="hint">Control or Command plus Enter sends.</p>
+      <div class="buttons" data-number-scope="composer">
+        <button id="send" type="submit" data-number="1">1 Send</button>
+        <button id="listen" type="button" data-number="2">2 Prepare voice</button>
+        <button id="pause" type="button" data-number="3">3 Stop listening</button>
+        <button id="repeat" type="button" data-number="4">4 Repeat choices</button>
+        <button id="cancel" type="button" data-number="5">5 Cancel</button>
+        <button id="undo" type="button" data-number="6">6 Undo</button>
+      </div>
+    </form>
+  </main>
+
+  <div id="sr-status" role="log" aria-label="Assistant announcements" aria-live="polite" aria-relevant="additions" aria-atomic="false" class="visually-hidden"></div>
+  <div id="sr-alert" role="alert" class="visually-hidden"></div>
+
+  <script type="module" src="sidepanel.js"></script>
+</body>
+</html>
