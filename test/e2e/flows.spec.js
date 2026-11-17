@@ -12,6 +12,7 @@ import {
   openPanel,
   resetMock,
   sendText,
+  undoLastChange,
   voiceState,
 } from './helpers.js';
 
@@ -223,7 +224,6 @@ test('ambiguous time asks for AM or PM, then edits with confirmation and undo', 
 
     await answerWhen(panel, 'AM or PM', 1);
     await answerWhen(panel, 'Run this?', 0);
-    await answerWhen(panel, 'Keep these changes?', 0);
 
     const slot = (day, time) => page.locator(`input[aria-label="${day} ${time}"]`);
     for (const time of ['14:00', '14:15', '14:30', '14:45']) {
@@ -234,6 +234,12 @@ test('ambiguous time asks for AM or PM, then edits with confirmation and undo', 
     await expect(slot('Tuesday', '14:00')).not.toBeChecked();
 
     await expect(panel.locator('#transcript')).toContainText('Selected Monday 2 PM to 3 PM.');
+    await expect.poll(async () => (await announcements(panel)).includes('Confirming.')).toBe(true);
+    const spoken = await announcements(panel);
+    expect(spoken).not.toContain('Let me check');
+    expect(spoken).not.toContain('could not confirm');
+    expect(spoken).not.toContain('Keep these changes?');
+    await expect(panel.locator('#transcript')).not.toContainText('Let me check');
   } finally {
     await context.close();
   }
@@ -314,7 +320,7 @@ test('undo restores the original native checkbox set', async () => {
     await answerWhen(panel, 'page text', 0);
     await answerWhen(panel, 'AM or PM', 1);
     await answerWhen(panel, 'Run this?', 0);
-    await answerWhen(panel, 'Keep these changes?', 1);
+    await undoLastChange(panel);
     await answerWhen(panel, 'Undo this change?', 0);
 
     await expect.poll(async () => (await announcements(panel)).includes('Undone')).toBe(true);
@@ -339,7 +345,7 @@ test('custom grid needs real mouse input and undo asks again', async () => {
     await answerWhen(panel, 'page text', 0);
     await answerWhen(panel, 'AM or PM', 1);
     await answerWhen(panel, 'Run this?', 0);
-    await answerWhen(panel, 'Keep these changes?', 1);
+    await undoLastChange(panel);
 
     const states = () => page.evaluate(() => [...document.querySelectorAll('[role="gridcell"]')]
       .filter((cell) => cell.getAttribute('aria-checked') === 'true')
@@ -363,7 +369,7 @@ test('undo restores the previously chosen radio', async () => {
     await sendText(panel, 'Choice fixture radio.');
     await answerWhen(panel, 'page text', 0);
     await answerWhen(panel, 'Run this?', 0);
-    await answerWhen(panel, 'Keep these changes?', 1);
+    await undoLastChange(panel);
     await answerWhen(panel, 'Undo this change?', 0);
 
     await expect.poll(async () => (await announcements(panel)).includes('Undone')).toBe(true);
@@ -445,7 +451,6 @@ test('form edit is verified and undo stops on a later user change', async () => 
     await sendText(panel, 'Change the name to Alex Morgan.');
     await answerWhen(panel, 'page text', 0);
     await answerWhen(panel, 'Run this?', 0);
-    await answerWhen(panel, 'Keep these changes?', 0);
     await expect(page.locator('#name')).toHaveValue('Alex Morgan');
 
     await page.locator('#name').fill('Jordan Lee');
@@ -514,7 +519,8 @@ test('image choice cancels without upload and AI choice sends a cropped screensh
     await answerWhen(panel, 'Allow these sources', 1);
     await answerWhen(panel, 'How should I describe this image?', 1);
     await answerWhen(panel, 'Which system', 0);
-    for (let step = 0; step < 5; step += 1) await answerWhen(panel, 'Continue?', 0);
+    await expect(panel.locator('#transcript')).toContainText('VO plus Shift plus L');
+    expect(await announcements(panel)).not.toContain('Continue?');
     await expect(panel.locator('#transcript')).toContainText('screen-reader guide');
     requests = await mockRequests();
     expect(requests.some((request) => JSON.stringify(request.body).includes('image_url'))).toBe(false);
@@ -524,7 +530,8 @@ test('image choice cancels without upload and AI choice sends a cropped screensh
     await answerWhen(panel, 'Allow these sources', 1);
     await answerWhen(panel, 'How should I describe this image?', 1);
     await answerWhen(panel, 'Which system', 0);
-    for (let step = 0; step < 5; step += 1) await answerWhen(panel, 'Continue?', 0);
+    await expect(panel.locator('#transcript')).toContainText('VO plus Shift plus L');
+    expect(await announcements(panel)).not.toContain('Continue?');
     await expect(panel.locator('#transcript')).toContainText('screen-reader guide');
     requests = await mockRequests();
     expect(requests.some((request) => JSON.stringify(request.body).includes('image_url'))).toBe(false);
@@ -620,7 +627,6 @@ test('AI image description restores the original missing alt attribute', async (
     const withImage = (await mockRequests()).find((request) => JSON.stringify(request.body).includes('image_url'));
     expect(withImage).toBeTruthy();
     await answerWhen(panel, 'Run this?', 0);
-    await answerWhen(panel, 'Keep these changes?', 0);
     await expect(page.locator('#simple')).toHaveAttribute('alt', 'A red circle to the left of a blue square, with EXIT below.');
 
     await panel.evaluate(() => document.getElementById('undo').click());
@@ -1368,7 +1374,6 @@ test('numbered undo restores the original native checkbox set', async () => {
     await answerWhen(panel, 'page text', 0);
     await answerWhen(panel, 'AM or PM', 1);
     await answerWhen(panel, 'Run this?', 0);
-    await answerWhen(panel, 'Keep these changes?', 0);
     await expect(page.locator('input[aria-label="Monday 14:00"]')).toBeChecked();
 
     await panel.locator('#undo').focus();
@@ -1548,7 +1553,7 @@ test('Anthropic format also edits and undoes a grid', async () => {
     await answerWhen(panel, 'page text', 0);
     await answerWhen(panel, 'AM or PM', 1);
     await answerWhen(panel, 'Run this?', 0);
-    await answerWhen(panel, 'Keep these changes?', 1);
+    await undoLastChange(panel);
     await answerWhen(panel, 'Undo this change?', 0);
     await expect.poll(async () => (await announcements(panel)).includes('Undone')).toBe(true);
 
@@ -1624,7 +1629,6 @@ test('weekday cells in a layout table are selected and verified', async () => {
     await sendText(panel, 'Switch Survey using to Days of the Week. Select Monday and Wednesday only. Leave the event name, times, and all other fields unchanged. Do not create or submit an event.');
     await answerWhen(panel, 'page text', 0);
     await answerWhen(panel, 'Run this?', 0);
-    await answerWhen(panel, 'Keep these changes?', 0);
 
     await answerWhen(panel, 'Run this?', 0);
     await page.bringToFront();

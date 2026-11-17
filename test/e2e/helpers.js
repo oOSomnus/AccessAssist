@@ -545,6 +545,12 @@ export async function answerWhen(panel, questionPart, index = 0) {
   await answer(panel, index);
 }
 
+// Undo is a composer action; it runs after the turn that made the change finishes.
+export async function undoLastChange(panel) {
+  await expect(panel.locator('#transcript')).toHaveAttribute('aria-busy', 'false', { timeout: 30_000 });
+  await panel.evaluate(() => document.getElementById('undo').click());
+}
+
 const DIAGNOSTIC_HEADERS = { 'x-aa-node-test': 'accessassist-fixtures' };
 
 export async function resetMock() {

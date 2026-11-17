@@ -916,6 +916,9 @@ function gridScenario(context) {
   }
   const proposal = lastCall(context, 'propose_action');
   if (proposal) {
+    if (needsReobservation(context)) {
+      return { ...toolReply(context, 'observe_page', {}), text: 'I am not sure the page selected those times. Let me check.' };
+    }
     const result = context.results.get(proposal.id);
     const done = result && !result.isError;
     return { text: done ? 'Selected Monday 2 PM to 3 PM.' : 'The time was not changed.' };

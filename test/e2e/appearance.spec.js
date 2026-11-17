@@ -1,5 +1,5 @@
 import { expect, test } from '@playwright/test';
-import { announcements, launch, openFixture, openPanel, resetMock, sendText, voiceState } from './helpers.js';
+import { announcements, answer, launch, openFixture, openPanel, resetMock, sendText, voiceState } from './helpers.js';
 
 async function attachScreenshot(page, testInfo, name) {
   await testInfo.attach(name, {
@@ -68,7 +68,7 @@ test('appearance: conversation scroll keeps the composer reachable', async ({}, 
     expect(await panel.evaluate(() => {
       const ask = document.getElementById('ask');
       const conversation = document.getElementById('conversation');
-      return Boolean(ask.compareDocumentPosition(conversation) & Node.DOCUMENT_POSITION_FOLLOWING);
+      return Boolean(conversation.compareDocumentPosition(ask) & Node.DOCUMENT_POSITION_FOLLOWING);
     })).toBe(true);
     await attachScreenshot(panel, testInfo, 'conversation-empty-391x904');
 
@@ -820,6 +820,38 @@ test('appearance: reasoning effort settings remain reachable across modes', asyn
       await attachScreenshot(panel, testInfo, mode.name);
     }
     await panel.emulateMedia({ colorScheme: 'light', forcedColors: 'none', reducedMotion: 'no-preference' });
+  } finally {
+    await context.close();
+  }
+});
+
+test('appearance: the panel follows the newest message and open question', async () => {
+  const { context, extensionId } = await launch();
+  try {
+    for (const size of [{ width: 360, height: 700 }, { width: 420, height: 1000 }]) {
+      await resetMock();
+      await openFixture(context, '/grid-native');
+      const panel = await openPanel(context, extensionId);
+      await panel.setViewportSize(size);
+      for (let turn = 1; turn <= 3; turn += 1) {
+        await sendText(panel, 'layout '.repeat(120).trim());
+        await expect(panel.locator('.message-body', { hasText: 'I heard you.' })).toHaveCount(turn, { timeout: 30_000 });
+        await expect(panel.locator('#transcript')).toHaveAttribute('aria-busy', 'false', { timeout: 30_000 });
+      }
+      const inView = (selector) => panel.evaluate((sel) => {
+        const rect = document.querySelector(sel).getBoundingClientRect();
+        return rect.top >= -1 && rect.bottom <= innerHeight + 1;
+      }, selector);
+      expect(await inView('#transcript > li:last-child')).toBe(true);
+      await sendText(panel, 'Select Monday two to three.');
+      await expect(panel.locator('#ask-question')).toContainText('page text');
+      await answer(panel, 0);
+      await expect(panel.locator('#ask-question')).toContainText('AM or PM');
+      expect(await inView('#ask')).toBe(true);
+      expect(await inView('#composer')).toBe(true);
+      if (size.height > 840) expect(await panel.evaluate(() => window.scrollY)).toBe(0);
+      await panel.close();
+    }
   } finally {
     await context.close();
   }

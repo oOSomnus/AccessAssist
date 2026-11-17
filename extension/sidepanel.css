@@ -44,7 +44,8 @@ a:hover { color: var(--color-accent-2); }
 /* Workspace */
 
 main { flex: 1 1 auto; min-height: 0; display: flex; flex-direction: column; gap: var(--space-sm); }
-.panel-content { flex: 1 1 auto; min-height: 0; display: flex; flex-direction: column; gap: var(--space-md); overflow: auto; }
+/* Visually hidden descendants are absolutely positioned; without a containing block they stretch the document's scroll height. */
+.panel-content { position: relative; flex: 1 1 auto; min-height: 0; display: flex; flex-direction: column; gap: var(--space-md); overflow: auto; }
 .bar > *, main > *, .panel-content > *, .buttons > *, #ask-options > *, #ask-sites > * { min-width: 0; }
 .hint { color: var(--color-muted); font-size: 1rem; line-height: 1.45; }
 .hint:empty { display: none; }

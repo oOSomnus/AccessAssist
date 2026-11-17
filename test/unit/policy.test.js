@@ -4,9 +4,7 @@ import {
   PHASE,
   pointsCrossMask,
   acceptConsent,
-  acceptResult,
   armConsent,
-  armResult,
   createSession,
   finishExecution,
   observationDrift,
@@ -427,14 +425,4 @@ test('DOM drag endpoints are validated as one same-frame pair', () => {
   }), ctx);
   assert.equal(mixed.ok, false);
   assert.match(mixed.errors.join(), /fresh observation/u);
-});
-
-test('result confirmation accepts one keep or undo', () => {
-  let session = { ...createSession(), phase: PHASE.result, result: { undoKind: 'local' } };
-  session = armResult(session, { choiceSetId: 'r', now: 1000 }).session;
-  assert.equal(acceptResult(session, { choiceSetId: 'r', optionValue: 'keep', now: 1001 }).action, 'keep');
-  const undo = acceptResult(session, { choiceSetId: 'r', optionValue: 'undo', now: 1001 });
-  assert.equal(undo.action, 'undo');
-  const again = acceptResult(undo.session, { choiceSetId: 'r', optionValue: 'undo', now: 1002 });
-  assert.match(again.error, /no pending result/u);
 });
