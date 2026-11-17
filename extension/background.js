@@ -36,7 +36,7 @@ const observations = new Map();
 const registry = new Map();
 const proposals = new Map();
 const undoRecords = new Map();
-const executions = createExecutionQueue();
+const executions = createExecutionQueue({ session: chrome.storage.session });
 const notices = [];
 const activeExecutions = new Map();
 
@@ -190,15 +190,31 @@ function requireTab(tab) {
   return tab;
 }
 
-function forgetTab(tabId) {
-  for (const [snapshotId, entry] of registry) {
-    if (entry.tabId === tabId) registry.delete(snapshotId);
+// What invalidating a tab destroys, by cause. Snapshots die with the document;
+// the undo record dies only with the tab, so a new turn can still undo.
+// activeExecutions is owned by the running action, never cleared here: a click
+// that navigates would otherwise lose its opened-tab attribution.
+const TAB_CLEAR = {
+  document: { snapshots: true, proposals: true },
+  closed: { snapshots: true, proposals: true, undo: true, pointer: true },
+  turn: { proposals: true, stop: true },
+  turnPage: { proposals: true, stop: true, snapshots: true },
+};
+
+function clearTab(tabId, reason) {
+  const drop = TAB_CLEAR[reason];
+  if (drop.stop) executions.stop(tabId);
+  if (drop.snapshots) {
+    for (const [snapshotId, entry] of registry) if (entry.tabId === tabId) registry.delete(snapshotId);
+    observations.delete(tabId);
+    detach(tabId);
   }
-  observations.delete(tabId);
-  for (const [id, entry] of proposals) {
-    if (entry.tabId === tabId) proposals.delete(id);
+  if (drop.proposals) for (const [id, entry] of proposals) if (entry.tabId === tabId) proposals.delete(id);
+  if (drop.undo) {
+    undoRecords.delete(tabId);
+    chrome.storage.session.remove(`undo:${tabId}`).catch(() => {});
   }
-  detach(tabId);
+  if (drop.pointer) for (const [windowId, entry] of lastHttpTab) if (entry.tabId === tabId) lastHttpTab.delete(windowId);
 }
 
 async function injectLauncher(tabId) {
@@ -306,10 +322,7 @@ chrome.tabs.onActivated.addListener(({ tabId }) => {
 });
 
 chrome.tabs.onRemoved.addListener((tabId) => {
-  forgetTab(tabId);
-  undoRecords.delete(tabId);
-  chrome.storage.session.remove(`undo:${tabId}`).catch(() => {});
-  for (const [windowId, entry] of lastHttpTab) if (entry.tabId === tabId) lastHttpTab.delete(windowId);
+  clearTab(tabId, 'closed');
 });
 
 chrome.webNavigation.onHistoryStateUpdated.addListener((details) => {
@@ -1015,17 +1028,7 @@ async function confirmProposal(tab, message) {
   const proposal = outcome.session.proposal;
   let report;
   try {
-    const run = await executions.run(tab.id, async () => {
-      await chrome.storage.session.set({
-        executing: { proposalId: proposal.id, tabId: tab.id, at: Date.now() },
-      }).catch(() => {});
-      try {
-        return await executeProposal(tab, proposal);
-      } finally {
-        await chrome.storage.session.remove('executing').catch(() => {});
-      }
-    });
-    report = run.value;
+    report = (await executions.run(tab.id, () => executeProposal(tab, proposal))).value;
   } catch (error) {
     report = { completed: 0, failedStep: error?.message ?? 'Execution failed', verified: false, record: null };
   }

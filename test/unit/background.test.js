@@ -25,6 +25,7 @@ const behavior = {
   localSetError: null,
   holdLauncherGet: false,
   releaseLocalGet: null,
+  tab: null,
 };
 
 const listener = () => ({ addListener() {} });
@@ -48,7 +49,10 @@ globalThis.chrome = {
   },
   tabs: {
     query: async () => behavior.activeTabs,
-    get: async () => { throw new Error('No such tab'); },
+    get: async () => {
+      if (behavior.tab) return behavior.tab;
+      throw new Error('No such tab');
+    },
     update: async () => {},
     sendMessage: async (tabId, message) => { calls.tabMessages.push({ tabId, message }); },
     onActivated: listener(),
@@ -166,6 +170,7 @@ function reset() {
   behavior.localSetError = null;
   behavior.holdLauncherGet = false;
   behavior.releaseLocalGet = null;
+  behavior.tab = null;
 }
 
 async function settle() {
@@ -180,6 +185,24 @@ function launcherMessage(message, senderOverrides = {}) {
     url: 'https://example.test/page',
     tab: { id: 7, url: 'https://example.test/page' },
     ...senderOverrides,
+  };
+  return new Promise((resolve) => {
+    let responded = false;
+    const done = (value) => {
+      if (responded) return;
+      responded = true;
+      resolve(value);
+    };
+    const keepOpen = listeners.message(message, sender, done);
+    if (!keepOpen && !responded) done(undefined);
+  });
+}
+
+function panelMessage(message) {
+  const sender = {
+    id: 'test-extension',
+    frameId: 0,
+    url: 'chrome-extension://test-extension/sidepanel.html',
   };
   return new Promise((resolve) => {
     let responded = false;
@@ -467,4 +490,17 @@ test('a queued launcher save wins over a delayed startup migration read', async 
   assert.deepEqual(await pendingGet, { position: { x: 1, y: 1 } });
   assert.deepEqual(await pendingSet, { ok: true, position: { x: 0.2, y: 0.3 } });
   assert.deepEqual(behavior.localState.launcherPosition, { x: 0.2, y: 0.3 });
+});
+
+test('a local undo is marked as an execution', async () => {
+  reset();
+  behavior.tab = { id: 7, windowId: 3, url: 'https://example.test/page' };
+  const response = await panelMessage({ type: 'UNDO_REQUEST', tabId: 7 });
+  assert.deepEqual(response, { unavailable: true, reason: 'No action to undo' });
+  // A worker killed mid-undo must be reported on restart, so the undo door
+  // writes the same crash marker as a confirmed proposal.
+  const markers = calls.sessionSet.filter((value) => 'executing' in value);
+  assert.equal(markers.length, 1);
+  assert.equal(markers[0].executing.tabId, 7);
+  assert.equal('executing' in behavior.sessionState, false);
 });
