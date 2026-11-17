@@ -198,7 +198,7 @@ test('programmatic completion leaves unrelated settings focus alone', async () =
     await resetMock();
     await openFixture(context, '/grid-native');
     const panel = await openPanel(context, extensionId);
-    await panel.locator('#settings > summary').click();
+    await panel.locator('#settings-toggle').click();
     await sendText(panel, 'Select Monday two to three.');
     await expect(panel.locator('#ask-sites')).toBeVisible({ timeout: 30_000 });
     await panel.locator('#api-key').focus();
@@ -483,7 +483,7 @@ test('authentication failure is spoken and focuses the key form', async () => {
     const panel = await openPanel(context, extensionId, { baseUrl: 'http://127.0.0.1:4174/deny/v1' });
     await sendText(panel, 'What is this page about?');
     await expect.poll(async () => (await announcements(panel)).includes('The key was rejected')).toBe(true);
-    await expect(panel.locator('#settings')).toHaveJSProperty('open', true);
+    await expect(panel.locator('#settings')).toBeVisible();
     await expect(panel.locator('#api-key')).toBeFocused();
     expect(await page.title()).toBe('Event schedule');
     const requests = await mockRequests();
@@ -903,8 +903,8 @@ test('reasoning effort saves without clearing the key and reaches each protocol'
     expect(keyBefore.apiKey.value).toBe('test-key');
 
     const openAdvanced = async () => {
-      if (!(await panel.locator('#settings').evaluate((details) => details.open))) {
-        await panel.locator('#settings > summary').click();
+      if (await panel.locator('#settings').isHidden()) {
+        await panel.locator('#settings-toggle').click();
       }
       if (!(await panel.locator('#advanced-api').evaluate((details) => details.open))) {
         await panel.locator('#advanced-api > summary').click();
@@ -1281,13 +1281,20 @@ test('composer number keys prepare, pause, repeat, cancel, and open settings', a
     await panel.keyboard.press('Control+Shift+4');
     await expect(panel.locator('#ask')).toBeHidden();
 
-    await expect(panel.locator('#settings')).toHaveJSProperty('open', false);
+    await expect(panel.locator('#settings')).toBeHidden();
     await panel.locator('#listen').focus();
     await panel.keyboard.press('Control+Shift+8');
-    await expect(panel.locator('#settings')).toHaveJSProperty('open', true);
-    // Focus followed the click; 8 in the settings group closes it again.
+    await expect(panel.locator('#settings')).toBeVisible();
+    // Focus stays on Listen; 8 from the composer closes it again.
     await panel.keyboard.press('Control+Shift+8');
-    await expect(panel.locator('#settings')).toHaveJSProperty('open', false);
+    await expect(panel.locator('#settings')).toBeHidden();
+
+    await panel.keyboard.press('Control+Shift+8');
+    await expect(panel.locator('#settings')).toBeVisible();
+    await panel.locator('#api-key').focus();
+    await panel.keyboard.press('Control+Shift+8');
+    await expect(panel.locator('#settings')).toBeHidden();
+    await expect(panel.locator('#settings-toggle')).toBeFocused();
   } finally {
     await context.close();
   }
@@ -1301,7 +1308,7 @@ test('settings number keys save, expand, replay, and follow links', async () => 
     const panel = await openPanel(context, extensionId);
     await panel.locator('#listen').focus();
     await panel.keyboard.press('Control+Shift+8');
-    await expect(panel.locator('#settings')).toHaveJSProperty('open', true);
+    await expect(panel.locator('#settings')).toBeVisible();
 
     await panel.locator('#save-settings').focus();
     await panel.keyboard.press('Control+Shift+3');
@@ -1320,7 +1327,7 @@ test('settings number keys save, expand, replay, and follow links', async () => 
     const stored = await panel.evaluate(() => chrome.storage.session.get('apiKey'));
     expect(stored.apiKey.value).toBe('number-key');
 
-    await panel.locator('#settings').evaluate((details) => { details.open = true; });
+    await expect(panel.locator('#settings')).toBeVisible();
     await panel.locator('#replay-intro').focus();
     await panel.keyboard.press('Control+Shift+5');
     await expect.poll(async () => await announcements(panel)).toContain('Hi, I am AccessAssist');
@@ -1514,7 +1521,7 @@ test('changing the API origin clears the old key', async () => {
     const page = await openFixture(context, '/article');
     const panel = await openPanel(context, extensionId);
     await panel.evaluate(() => {
-      document.getElementById('settings').open = true;
+      document.getElementById('settings-toggle').click();
       document.getElementById('api-key').value = 'old-form-key';
       document.getElementById('base-url').value = 'http://127.0.0.1:4175/v1';
       document.getElementById('settings-form').requestSubmit();

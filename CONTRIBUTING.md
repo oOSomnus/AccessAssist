@@ -29,4 +29,4 @@ The check calls OpenCode Go with `deepseek-v4.1-flash` only. It covers one tool 
 npm run package
 ```
 
-Writes `accessassist.zip` with `manifest.json` at the archive root. The script needs the system `zip` and packs only `extension/`; `.env`, tests, and `node_modules` are outside it. Extract the archive and load the folder containing `manifest.json`. Store submission also expects a 128×128 PNG `icons` entry, which the repo does not ship yet.
+Writes `accessassist.zip` with `manifest.json` at the archive root. The script needs the system `zip` and packs only `extension/`; `.env`, tests, and `node_modules` are outside it. Extract the archive and load the folder containing `manifest.json`. The `icons` entry ships as `extension/icons/icon-{16,32,48,128}.png`, rendered from `icon.svg`.
