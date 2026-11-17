@@ -66,11 +66,15 @@ test('the injected launcher reports a voice intent for its own page', async () =
       return { tabId: tab.id, windowId: tab.windowId };
     });
 
+    await worker.evaluate((windowId) => {
+      globalThis.__aaIntents = [];
+      chrome.storage.session.onChanged.addListener((changes) => {
+        const value = changes[`intent:${windowId}`]?.newValue;
+        if (value) globalThis.__aaIntents.push(value);
+      });
+    }, target.windowId);
     await page.locator('#accessassist-launcher-host #launcher-open').click();
-    await expect.poll(() => worker.evaluate(async (windowId) => {
-      const key = `intent:${windowId}`;
-      return (await chrome.storage.session.get(key))[key] ?? null;
-    }, target.windowId), { timeout: 5_000 }).toMatchObject({
+    await expect.poll(() => worker.evaluate(() => globalThis.__aaIntents[0] ?? null), { timeout: 5_000 }).toMatchObject({
       mode: 'voice',
       source: 'launcher',
       tabId: target.tabId,

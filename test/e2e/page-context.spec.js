@@ -63,6 +63,31 @@ test('a window opened by the page is also offered and adopted', async () => {
   }
 });
 
+test('observe_page continues from the returned cursor', async () => {
+  const { context, extensionId } = await launch();
+  try {
+    await resetMock();
+    const page = await openFixture(context, '/article');
+    await page.evaluate(() => {
+      const filler = 'x '.repeat(1500);
+      for (let index = 0; index < 20; index += 1) {
+        const paragraph = document.createElement('p');
+        paragraph.textContent = filler;
+        document.body.append(paragraph);
+      }
+      const marker = document.createElement('p');
+      marker.textContent = 'Far marker after the first page.';
+      document.body.append(marker);
+    });
+    const panel = await openPanel(context, extensionId);
+    await sendText(panel, 'observe twice');
+    await answerWhen(panel, 'page text', 0);
+    await expect(panel.locator('#transcript')).toContainText('Read the far marker.', { timeout: 30_000 });
+  } finally {
+    await context.close();
+  }
+});
+
 test('staying keeps the opened page and the original binding', async () => {
   const { context, worker, extensionId } = await launch();
   try {

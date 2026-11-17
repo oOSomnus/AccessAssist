@@ -40,14 +40,14 @@ test('the first introduction is claimed before delivery and is not replayed afte
     await expect.poll(async () => worker.evaluate(
       async () => (await chrome.storage.local.get('introSeen')).introSeen,
     )).toBe(true);
-    expect(await announcements(panel)).toContain('Hi, I am AccessAssist');
-
+    await expect.poll(() => announcements(panel)).toContain('Hi, I am AccessAssist');
     await sendIntent(worker, { id: 'stop-intro', mode: 'typing', source: 'command', tabId: 0, at: Date.now() });
     await expect(panel.locator('#message')).toBeFocused();
     await panel.close();
 
     const reopened = await openFirstUsePanel(context, extensionId);
     await expect(reopened.locator('#page-line')).toBeVisible();
+    await expect.poll(() => announcements(reopened)).toContain('hear the introduction again');
     const heard = await announcements(reopened);
     expect(heard).not.toContain('Hi, I am AccessAssist');
     expect(heard).toContain('hear the introduction again');

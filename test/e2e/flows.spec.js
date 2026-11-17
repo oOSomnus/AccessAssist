@@ -396,6 +396,88 @@ test('custom grid needs real mouse input and undo asks again', async () => {
   }
 });
 
+test('undo restores the previously chosen radio', async () => {
+  const { context, extensionId } = await launch();
+  try {
+    await resetMock();
+    const page = await openFixture(context, '/choices');
+    const panel = await openPanel(context, extensionId);
+    await sendText(panel, 'Choice fixture radio.');
+    await answerWhen(panel, 'page text', 0);
+    await answerWhen(panel, 'Run this?', 0);
+    await answerWhen(panel, 'Keep these changes?', 1);
+    await answerWhen(panel, 'Undo this change?', 0);
+
+    await expect.poll(async () => (await announcements(panel)).includes('Undone')).toBe(true);
+    const checked = await page.evaluate(() => [...document.querySelectorAll('input[name="plan"]')]
+      .filter((input) => input.checked)
+      .map((input) => input.getAttribute('aria-label')));
+    expect(checked).toEqual(['Basic plan']);
+  } finally {
+    await context.close();
+  }
+});
+
+test('an already-checked custom checkbox is not toggled', async () => {
+  const { context, extensionId } = await launch();
+  try {
+    await resetMock();
+    const page = await openFixture(context, '/choices');
+    const panel = await openPanel(context, extensionId);
+    await expect(panel.locator('#page-line')).toContainText('Plan choices');
+    await sendText(panel, 'Choice fixture checkbox.');
+    await answerWhen(panel, 'page text', 0);
+    await answerWhen(panel, 'Run this?', 0);
+    await expect(panel.locator('#transcript')).toContainText('Done with the choice.', { timeout: 30_000 });
+    await expect(page.locator('#toggles')).toHaveText('0');
+    await expect(page.locator('#updates')).toHaveAttribute('aria-checked', 'true');
+  } finally {
+    await context.close();
+  }
+});
+
+test('a parent overlay over an iframe blocks the click', async () => {
+  const { context, extensionId } = await launch();
+  try {
+    await resetMock();
+    const page = await openFixture(context, '/frame-overlay');
+    const panel = await openPanel(context, extensionId);
+    await expect(panel.locator('#page-line')).toContainText('Frame overlay');
+    await sendText(panel, 'Click the same-origin button.');
+    await answerWhen(panel, 'page text', 0);
+    await answerWhen(panel, 'Run this?', 0);
+    await answerWhen(panel, 'Run anyway?', 0);
+
+    await expect.poll(async () => announcements(panel), { timeout: 30_000 }).toContain('covered');
+    await expect(page.locator('#frame-clicks')).toHaveText('0');
+  } finally {
+    await context.close();
+  }
+});
+
+test('a synthetic launcher click does not open the assistant', async () => {
+  const { context, worker } = await launch();
+  try {
+    await resetMock();
+    const page = await openFixture(context, '/article');
+    await waitForLauncher(page);
+    await clearIntents(worker);
+    await watchIntentEvents(worker);
+
+    await page.evaluate(() => {
+      document.getElementById('accessassist-launcher-host').shadowRoot.querySelector('#launcher-open').click();
+    });
+    await page.waitForTimeout(200);
+    await launcherOpen(page).click();
+    const sets = async () => (await intentEvents(worker)).filter((event) => event === 'set');
+    await expect.poll(sets, { timeout: 5_000 }).toHaveLength(1);
+    await page.waitForTimeout(500);
+    expect(await sets()).toHaveLength(1);
+  } finally {
+    await context.close();
+  }
+});
+
 test('form edit is verified and undo stops on a later user change', async () => {
   const { context, extensionId } = await launch();
   try {
@@ -1498,7 +1580,7 @@ test('a background close notification performs cleanup without closing natively'
     );
     await expect.poll(async () => await announcements(panel))
       .toContain('Could not close the assistant. native close failed');
-    expect(await panel.locator('#sr-alert')).toHaveText('Could not close the assistant. native close failed');
+    await expect(panel.locator('#sr-alert')).toHaveText('Could not close the assistant. native close failed');
     expect(await panel.evaluate(() => window.__closeCalls.length)).toBe(0);
   } finally {
     await context.close();
@@ -1872,7 +1954,7 @@ test('cancelling visual consent sends no image and performs no action', async ()
     const state = await page.evaluate(() => ({ ...document.body.dataset }));
     expect(state.painted).toBeUndefined();
     const requests = await mockRequests();
-    expect(requests.every((entry) => !JSON.stringify(entry.body).includes('"type":"image"'))).toBe(true);
+    expect(requests.every((entry) => !JSON.stringify(entry.body).includes('"type":"image'))).toBe(true);
   } finally {
     await context.close();
   }

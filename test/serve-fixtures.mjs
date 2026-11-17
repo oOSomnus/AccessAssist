@@ -150,6 +150,44 @@ const CROSS_FRAME = `<!doctype html>
 <button id="frame-button" onclick="parent.postMessage({source:'frame-click'}, '*')">Cross-origin button</button>
 </main></body></html>`;
 
+const FRAME_OVERLAY = `<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><title>Frame overlay</title></head>
+<body><main>
+<h1>Frame overlay</h1>
+<p>Frame clicks: <span id="frame-clicks">0</span></p>
+<div style="position:relative;width:300px;height:90px"><iframe src="/frame" width="300" height="90" style="border:0" title="Same-origin frame"></iframe><div id="cover" style="position:absolute;inset:0;background:rgba(0,0,0,0.01)"></div></div>
+</main>
+<script>
+window.addEventListener('message', (event) => {
+  if (event.data?.source !== 'frame-click') return;
+  const span = document.getElementById('frame-clicks');
+  span.textContent = String(Number(span.textContent) + 1);
+});
+</script></body></html>`;
+
+const CHOICES = `<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><title>Plan choices</title>
+<style>#updates{display:block;padding:8px;border:2px solid #111;max-width:240px;margin:8px 0;cursor:pointer}</style>
+</head>
+<body><main>
+<h1>Plan choices</h1>
+<fieldset><legend>Plan</legend>
+<label><input type="radio" name="plan" aria-label="Basic plan" checked> Basic plan</label>
+<label><input type="radio" name="plan" aria-label="Pro plan"> Pro plan</label>
+</fieldset>
+<p>Updates:</p>
+<div id="updates" role="checkbox" tabindex="0" aria-checked="true" aria-label="Email updates">Email updates</div>
+<p>Toggles: <span id="toggles">0</span></p>
+</main>
+<script>
+document.getElementById('updates').addEventListener('click', () => {
+  const box = document.getElementById('updates');
+  box.setAttribute('aria-checked', box.getAttribute('aria-checked') === 'true' ? 'false' : 'true');
+  const span = document.getElementById('toggles');
+  span.textContent = String(Number(span.textContent) + 1);
+});
+</script></body></html>`;
+
 const SHAPE = `<svg xmlns="http://www.w3.org/2000/svg" width="320" height="200">
 <rect width="320" height="200" fill="#ffffff"/>
 <circle cx="80" cy="90" r="55" fill="#d40000"/>
@@ -476,7 +514,7 @@ const INTERACTION_POINTER = `<!doctype html>
 #rename,#menu-anchor,#hover-anchor,#hold,.pick,.row{display:block;min-height:32px;padding:4px;margin:4px 0;border:1px solid #333;max-width:420px;cursor:pointer}
 .row{min-height:24px}.pick{min-height:28px}.pick.selected{background:#113355;color:#fff}
 #secret{display:block;width:400px;margin:4px 0}
-#submenu{margin-left:24px;display:block}</style></head>
+#submenu{margin-left:24px}</style></head>
 <body><main>
 <h1>Interaction pointer</h1>
 <div id="rename" role="button" tabindex="0" aria-label="Report name">Quarterly report</div>
@@ -714,6 +752,8 @@ const PAGES = new Map([
   ['/shadow', SHADOW],
   ['/frame', FRAME],
   ['/frame-duplicate', FRAME_DUPLICATE],
+  ['/frame-overlay', FRAME_OVERLAY],
+  ['/choices', CHOICES],
   ['/interaction-inputs', INTERACTION_INPUTS],
   ['/interaction-pointer', INTERACTION_POINTER],
   ['/interaction-scroll', INTERACTION_SCROLL],
@@ -936,8 +976,33 @@ function intermediateScenario(context) {
 
 function observeTwiceScenario(context) {
   const observes = context.calls.filter((call) => call.name === 'observe_page').length;
-  if (observes < 2) return toolReply(context, 'observe_page', {});
-  return { text: 'Saw both observations.' };
+  const observation = observationOf(context);
+  if (observes < 2) {
+    return toolReply(context, 'observe_page', observation?.nextCursor ? { cursor: observation.nextCursor } : {});
+  }
+  const seen = (observation?.sections ?? []).some((section) => (section.items ?? [])
+    .some((item) => (item.text ?? '').includes('Far marker')));
+  return { text: seen ? 'Read the far marker.' : 'The second page did not arrive.' };
+}
+
+function choicesScenario(context) {
+  const observation = observationOf(context);
+  if (!observation) return toolReply(context, 'observe_page', {});
+  const proposal = lastCall(context, 'propose_action');
+  if (proposal) {
+    const result = context.results.get(proposal.id);
+    const done = result && !result.isError;
+    return { text: done ? 'Done with the choice.' : 'The choice was not changed.' };
+  }
+  const name = /radio/iu.test(context.lastUser ?? '') ? 'Pro plan' : 'Email updates';
+  const target = targetNamed(observation, name);
+  if (!target) return { text: `I could not find ${name}.` };
+  return toolReply(context, 'propose_action', {
+    summary: `Check ${name}`,
+    steps: [{ type: 'set_checked', snapshotId: target.snapshotId, nodeId: target.nodeId, checked: true }],
+    requirements: [],
+    missingFields: [],
+  });
 }
 
 function imageScenario(context) {
@@ -1623,6 +1688,7 @@ function decide(context) {
   }
   if (/intermediate message/iu.test(current)) return intermediateScenario(context);
   if (/observe twice/iu.test(current)) return observeTwiceScenario(context);
+  if (/choice fixture/iu.test(current)) return choicesScenario(context);
   if (/interaction (double click|right click|hover options|hold confirm|cancel hold|single click|shift click|drag rows|drag moved|drag across secret|drag into frame)/iu.test(current)) {
     return interactionPointerScenario(context);
   }
