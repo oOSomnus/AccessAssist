@@ -3,6 +3,7 @@ import { closeChoiceSet, createChoiceSet, formatChoices, parseChoiceNumber, reso
 import { keyBinding, keyForBinding, configFingerprint, configOrigin, DEFAULT_API_CONFIG, grantUpload, needsUpload, uploadConsentFor } from './settings.js';
 import { Speech, spokenSites } from './speech.js';
 import { detectPlatform, guideFor } from './screen-reader-guide.js';
+import { createTurns } from './turn.js';
 
 const $ = (id) => document.getElementById(id);
 const uid = () => crypto.randomUUID();
@@ -107,14 +108,10 @@ const state = {
   frameSkipped: new Set(),
   visionLimited: false,
   apiSessionId: uid(),
-  abort: null,
-  toolAbort: null,
-  userCancelled: false,
   listening: null,
   listenRequest: null,
   entrySeq: 0,
   pendingMessages: [],
-  epoch: 0,
   windowId: null,
   pendingIntent: null,
   consumedIntents: new Set(),
@@ -123,7 +120,7 @@ const state = {
   deferChoiceFocus: false,
   setupTabId: null,
   setupWindowId: null,
-  turnEpoch: 0,
+  runningTurn: null,
   turnTask: null,
   pendingInput: null,
   sayPending: false,
@@ -135,6 +132,8 @@ const state = {
 
 const speech = new Speech({ lang: 'en-US' });
 speech.attach({ statusEl: $('sr-status'), alertEl: $('sr-alert') });
+
+const turns = createTurns();
 
 const SHORTCUT_MODIFIERS = new Map([
   ['ctrl', 'Ctrl'], ['control', 'Ctrl'], ['macctrl', 'Ctrl'], ['⌃', 'Ctrl'],
@@ -428,13 +427,13 @@ async function onVoiceResult(text, info, choiceSetId) {
   }
   if (!state.choice && choiceSetId) return;
   const generation = state.voiceGeneration;
-  const epoch = state.epoch;
+  const turn = turns.current;
   // Automatic follow-up must not move focus away while the confirmation is
   // being spoken; a real user action clears this flag.
   state.deferChoiceFocus = true;
   const readback = await say(`I heard: ${text}`);
   const unchanged = generation === state.voiceGeneration
-    && epoch === state.epoch
+    && turn.isCurrent()
     && (state.choice?.set.id ?? null) === choiceSetId;
   if (!unchanged) return;
   if (!readback.delivered) {
@@ -1404,33 +1403,28 @@ function stripImages() {
 
 const MAX_MODEL_CALLS_PER_TURN = 16;
 
-async function requestModel(epoch, { retried = false } = {}) {
+async function requestModel(turn, { retried = false } = {}) {
   if (!(await apiReady())) return null;
-  if (epoch !== state.epoch) return null;
+  if (!turn.isCurrent()) return null;
   syncWorking();
-  const controller = new AbortController();
-  state.abort = controller;
   try {
-    const result = await requestTurn({
+    return await requestTurn({
       config: state.config,
       apiKey: state.apiKey,
       sessionId: state.apiSessionId,
       system: `${SYSTEM_PROMPT}\n${state.tab ? `Current page: ${state.tab.title || ''}; address: ${state.tab.url}` : 'Current page unknown'}`,
       messages: state.history,
-      signal: controller.signal,
+      signal: turn.signal,
     });
-    return result;
   } catch (error) {
-    if (state.userCancelled || epoch !== state.epoch) {
-      if (epoch === state.epoch) state.userCancelled = false;
-      return null;
-    }
+    // A user abort surfaces from ai.js as a timeout; it must not be announced.
+    if (turn.stale) return null;
     if (error?.code === 'image_rejected' && !retried) {
       state.visionLimited = true;
       stripImages();
       await say('The model service did not accept the screenshot. I will continue with page text.');
-      if (epoch !== state.epoch) return null;
-      return requestModel(epoch, { retried: true });
+      if (!turn.isCurrent()) return null;
+      return requestModel(turn, { retried: true });
     }
     await announceFailure(error);
     if (['no_key', 'config', 'auth'].includes(error?.code)) {
@@ -1438,16 +1432,14 @@ async function requestModel(epoch, { retried = false } = {}) {
       openSettingsForKey({ advanced: error?.code === 'config' });
     }
     return null;
-  } finally {
-    if (state.abort === controller) state.abort = null;
   }
 }
 
-async function advance(epoch) {
+async function advance(turn) {
   while (state.callsThisTurn < MAX_MODEL_CALLS_PER_TURN) {
-    if (epoch !== state.epoch) return;
-    const response = await requestModel(epoch);
-    if (!response || epoch !== state.epoch) return;
+    if (!turn.isCurrent()) return;
+    const response = await requestModel(turn);
+    if (!response || !turn.isCurrent()) return;
     state.callsThisTurn += 1;
     // After "Confirming.", text attached to the re-check only repeats uncertainty; the result reply is spoken.
     const quiet = state.confirming && response.toolCalls.length > 0
@@ -1461,8 +1453,6 @@ async function advance(epoch) {
       await say(response.text || 'There is no more information.');
       return;
     }
-    const toolBatch = new AbortController();
-    state.toolAbort = toolBatch;
     const results = [];
     let nextCall = 0;
     let runningCall = -1;
@@ -1491,22 +1481,20 @@ async function advance(epoch) {
       }
     };
     const onAbort = () => recordResults();
-    toolBatch.signal.addEventListener('abort', onAbort, { once: true });
+    turn.signal.addEventListener('abort', onAbort, { once: true });
     if (response.text && !quiet) {
       const spoken = await say(response.text);
-      if (epoch !== state.epoch || toolBatch.signal.aborted) {
+      if (!turn.isCurrent() || turn.signal.aborted) {
         recordResults();
-        toolBatch.signal.removeEventListener('abort', onAbort);
-        if (state.toolAbort === toolBatch) state.toolAbort = null;
+        turn.signal.removeEventListener('abort', onAbort);
         state.pendingMessages = [];
         return;
       }
       if (!spoken.delivered) {
         blockedBySpeech = !spoken.interrupted;
         recordResults();
-        toolBatch.signal.removeEventListener('abort', onAbort);
-        if (state.toolAbort === toolBatch) state.toolAbort = null;
-        if (blockedBySpeech && epoch === state.epoch) {
+        turn.signal.removeEventListener('abort', onAbort);
+        if (blockedBySpeech && turn.isCurrent()) {
           speech.writeStatus(
             'The assistant message could not be spoken. This turn stopped before its next tool.',
             true,
@@ -1517,18 +1505,17 @@ async function advance(epoch) {
       }
     }
     for (const call of response.toolCalls) {
-      if (toolBatch.signal.aborted) break;
+      if (turn.signal.aborted) break;
       runningCall = nextCall;
-      const result = await handleToolCall(call, epoch, toolBatch.signal);
-      if (toolBatch.signal.aborted) break;
+      const result = await handleToolCall(call, turn);
+      if (turn.signal.aborted) break;
       results.push(result);
       nextCall += 1;
       runningCall = -1;
     }
     recordResults();
-    toolBatch.signal.removeEventListener('abort', onAbort);
-    if (state.toolAbort === toolBatch) state.toolAbort = null;
-    if (toolBatch.signal.aborted || epoch !== state.epoch) {
+    turn.signal.removeEventListener('abort', onAbort);
+    if (turn.signal.aborted || !turn.isCurrent()) {
       state.pendingMessages = [];
       return;
     }
@@ -1543,10 +1530,7 @@ async function advance(epoch) {
 // Invalidates the running turn without erasing effects already executed.
 function preemptTurn() {
   state.pendingInput = null;
-  state.epoch += 1;
-  state.userCancelled = true;
-  state.abort?.abort();
-  state.toolAbort?.abort();
+  turns.next();
   state.actionContext = null;
   interruptOutput();
   void send('RESET_SESSION', { tabId: state.tab?.tabId }).catch(() => {});
@@ -1554,11 +1538,10 @@ function preemptTurn() {
 }
 
 async function runTurn(text) {
-  const epoch = ++state.epoch;
-  state.turnEpoch = epoch;
+  const turn = turns.next();
+  state.runningTurn = turn;
   state.busy = true;
   state.audioPaused = false;
-  state.userCancelled = false;
   state.userText = text;
   state.confirmedChoices = [];
   state.frameSkipped = new Set();
@@ -1570,19 +1553,19 @@ async function runTurn(text) {
   syncWorking();
   try {
     if (!(await apiReady())) return;
-    if (epoch !== state.epoch) return;
+    if (!turn.isCurrent()) return;
     // The word must finish before any model request or page action starts.
     const spoken = await say('working');
-    if (epoch !== state.epoch) return;
+    if (!turn.isCurrent()) return;
     if (!spoken.delivered) {
       if (!spoken.interrupted) announceWorkingFailed();
       return;
     }
-    await advance(epoch);
+    await advance(turn);
   } catch (error) {
-    if (epoch === state.epoch) await announceFailure(error);
+    if (turn.isCurrent()) await announceFailure(error);
   } finally {
-    if (state.turnEpoch === epoch) {
+    if (state.runningTurn === turn) {
       state.busy = false;
       syncWorking();
     }
@@ -1651,22 +1634,22 @@ async function submitMessage(raw) {
     return;
   }
   if (/^(undo|undo last step|undo last)[.!?]?$/iu.test(text)) {
-    const epoch = state.epoch;
+    const turn = turns.next();
     state.busy = true;
     syncWorking();
     try {
       const spoken = await say('working');
-      if (epoch !== state.epoch) return;
+      if (!turn.isCurrent()) return;
       if (!spoken.delivered) {
         if (!spoken.interrupted) announceWorkingFailed();
         return;
       }
-      const outcome = await performUndo(epoch);
-      if (epoch === state.epoch) addTranscript('assistant', outcome);
+      const outcome = await performUndo(turn);
+      if (turn.isCurrent()) addTranscript('assistant', outcome);
     } catch (error) {
-      if (epoch === state.epoch) await announceFailure(error);
+      if (turn.isCurrent()) await announceFailure(error);
     } finally {
-      if (epoch === state.epoch) {
+      if (turn.isCurrent()) {
         state.busy = false;
         syncWorking();
       }
@@ -1697,29 +1680,22 @@ async function discoverPageOrigins(context) {
   return listed;
 }
 
-function turnStale(epoch, signal) {
-  return epoch !== state.epoch || signal?.aborted === true;
-}
-
-async function ensureUploadConsent(part, question, epoch, signal = null) {
+async function ensureUploadConsent(part, question, turn) {
   const tab = state.tab;
   if (!tab?.origin || !Number.isInteger(tab.tabId)) {
     await say('This page has no usable site address.', { alert: true });
     return false;
   }
-  if (turnStale(epoch, signal)) return false;
+  if (turn.stale) return false;
   const context = {
     tabId: tab.tabId,
     documentId: tab.documentId,
     url: tab.url,
     origin: tab.origin,
     fingerprint: configFingerprint(state.config),
-    epoch,
     refreshSeq: state.refreshSeq,
   };
-  const samePage = () => state.epoch === context.epoch
-    && !state.userCancelled
-    && !signal?.aborted
+  const samePage = () => !turn.stale
     && state.refreshSeq === context.refreshSeq
     && state.tab?.tabId === context.tabId
     && state.tab?.documentId === context.documentId
@@ -1787,9 +1763,9 @@ async function ensureUploadConsent(part, question, epoch, signal = null) {
   return false;
 }
 
-async function toolObserve(call, ok, fail, epoch, signal) {
-  const allowed = await ensureUploadConsent('text', 'Reading this page sends page text to the model service.', epoch, signal);
-  if (turnStale(epoch, signal)) return fail('The user interrupted; the page was not read.');
+async function toolObserve(call, ok, fail, turn) {
+  const allowed = await ensureUploadConsent('text', 'Reading this page sends page text to the model service.', turn);
+  if (turn.stale) return fail('The user interrupted; the page was not read.');
   if (!allowed) return fail('The user did not allow page text upload.');
   const wantsVisual = call.args?.visual === true;
   const observation = await send('OBSERVE_PAGE', {
@@ -1798,7 +1774,7 @@ async function toolObserve(call, ok, fail, epoch, signal) {
     allowedFrameOrigins: [...state.frameConsent],
     cursor: call.args?.cursor,
   });
-  if (turnStale(epoch, signal)) return fail('The user interrupted; the page was not read.');
+  if (turn.stale) return fail('The user interrupted; the page was not read.');
   const shape = (value) => ({
     snapshotId: value.snapshotId,
     title: value.title,
@@ -1819,10 +1795,9 @@ async function toolObserve(call, ok, fail, epoch, signal) {
   const imageAllowed = await ensureUploadConsent(
     'image',
     'Reading this page visually sends a screenshot to the model service.',
-    epoch,
-    signal,
+    turn,
   );
-  if (turnStale(epoch, signal)) return fail('The user interrupted; no screenshot was sent.');
+  if (turn.stale) return fail('The user interrupted; no screenshot was sent.');
   if (!imageAllowed) {
     return ok({ ...shape(observation), visual: { allowed: false, reason: 'The user did not allow screenshot upload.' } });
   }
@@ -1833,14 +1808,14 @@ async function toolObserve(call, ok, fail, epoch, signal) {
     visual: true,
     cursor: call.args?.cursor,
   });
-  if (turnStale(epoch, signal)) return fail('The user interrupted; no screenshot was sent.');
+  if (turn.stale) return fail('The user interrupted; no screenshot was sent.');
   if (seen.error) return fail(seen.error);
   const metadata = seen.visual;
   if (!metadata || metadata.allowed === false) {
     return ok({ ...shape(seen), visual: metadata ?? { allowed: false, reason: 'The screenshot could not be taken.' } });
   }
   if (!metadata.dataUrl) return ok({ ...shape(seen), visual: { allowed: false, reason: 'The screenshot could not be taken.' } });
-  if (turnStale(epoch, signal)) return fail('The user interrupted; no screenshot was sent.');
+  if (turn.stale) return fail('The user interrupted; no screenshot was sent.');
   state.pendingMessages.push({
     role: 'user',
     content: [
@@ -1856,9 +1831,9 @@ async function toolObserve(call, ok, fail, epoch, signal) {
   return ok({ ...shape(seen), visual: visible });
 }
 
-async function toolReadTarget(call, ok, fail, epoch, signal) {
-  const allowed = await ensureUploadConsent('text', 'Reading this part sends its text to the model service.', epoch, signal);
-  if (turnStale(epoch, signal)) return fail('The user interrupted; the text was not read.');
+async function toolReadTarget(call, ok, fail, turn) {
+  const allowed = await ensureUploadConsent('text', 'Reading this part sends its text to the model service.', turn);
+  if (turn.stale) return fail('The user interrupted; the text was not read.');
   if (!allowed) return fail('The user did not allow page text upload.');
   const outcome = await send('READ_TARGET', {
     tabId: state.tab.tabId,
@@ -1866,26 +1841,26 @@ async function toolReadTarget(call, ok, fail, epoch, signal) {
     nodeId: call.args?.nodeId,
     cursor: call.args?.cursor,
   });
-  if (turnStale(epoch, signal)) return fail('The user interrupted; the text was not read.');
+  if (turn.stale) return fail('The user interrupted; the text was not read.');
   if (outcome.error) return fail(outcome.error);
   return ok({ name: outcome.name, role: outcome.role, text: outcome.text, nextCursor: outcome.nextCursor });
 }
 
-async function toolFocusTarget(call, ok, fail, epoch, signal) {
-  const allowed = await ensureUploadConsent('text', 'Focusing a target sends page content to the model service.', epoch, signal);
-  if (turnStale(epoch, signal)) return fail('The user interrupted; focus did not change.');
+async function toolFocusTarget(call, ok, fail, turn) {
+  const allowed = await ensureUploadConsent('text', 'Focusing a target sends page content to the model service.', turn);
+  if (turn.stale) return fail('The user interrupted; focus did not change.');
   if (!allowed) return fail('The user did not allow page text upload.');
   const outcome = await send('FOCUS_TARGET', {
     tabId: state.tab.tabId,
     snapshotId: call.args?.snapshotId,
     nodeId: call.args?.nodeId,
   });
-  if (turnStale(epoch, signal)) return fail('The user interrupted; focus did not change.');
+  if (turn.stale) return fail('The user interrupted; focus did not change.');
   if (outcome.error) return fail(outcome.error);
   return ok('Located the target.');
 }
 
-async function toolAskUser(call, ok, fail, epoch, signal) {
+async function toolAskUser(call, ok, fail, turn) {
   const args = call.args ?? {};
   const options = Array.isArray(args.options) ? args.options : [];
   if (options.length < 2) return fail('At least two choices are needed.');
@@ -1903,12 +1878,12 @@ async function toolAskUser(call, ok, fail, epoch, signal) {
     return fail(`Invalid choices: ${error.message}`);
   }
   const choice = await presentSet(set);
-  if (turnStale(epoch, signal)) return fail('The turn was replaced before the question was answered.');
+  if (turn.stale) return fail('The turn was replaced before the question was answered.');
   if (!choice) return fail('The user cancelled this choice.');
   return ok(`User choice: ${choice.label}.`);
 }
 
-async function toolDescribeImage(call, ok, fail, epoch, signal) {
+async function toolDescribeImage(call, ok, fail, turn) {
   const choice = await askChoice({
     question: 'How should I describe this image?',
     options: [
@@ -1917,7 +1892,7 @@ async function toolDescribeImage(call, ok, fail, epoch, signal) {
       { label: 'Cancel', value: 'cancel' },
     ],
   });
-  if (turnStale(epoch, signal)) return fail('The turn was replaced before image reading started.');
+  if (turn.stale) return fail('The turn was replaced before image reading started.');
   if (!choice || choice.value === 'cancel') return fail('The user cancelled image reading.');
   if (choice.value === 'guide') {
     await runGuide();
@@ -1927,8 +1902,8 @@ async function toolDescribeImage(call, ok, fail, epoch, signal) {
     await say('Screenshots are unavailable in this conversation. Page text still works.');
     return ok('Visual reading is unavailable because the model service did not accept images.');
   }
-  const allowed = await ensureUploadConsent('image', 'Reading this image sends a screenshot to the model service.', epoch, signal);
-  if (turnStale(epoch, signal)) return fail('The user interrupted; no screenshot was sent.');
+  const allowed = await ensureUploadConsent('image', 'Reading this image sends a screenshot to the model service.', turn);
+  if (turn.stale) return fail('The user interrupted; no screenshot was sent.');
   if (!allowed) return fail('The user did not allow screenshot upload.');
   const shot = await send('CAPTURE_TARGET', {
     tabId: state.tab.tabId,
@@ -1937,9 +1912,9 @@ async function toolDescribeImage(call, ok, fail, epoch, signal) {
     nodeId: call.args?.nodeId,
     allowedFrameOrigins: [...state.frameConsent],
   });
-  if (turnStale(epoch, signal)) return fail('The user interrupted; no screenshot was sent.');
+  if (turn.stale) return fail('The user interrupted; no screenshot was sent.');
   if (shot.error) return fail(shot.error);
-  if (turnStale(epoch, signal)) return fail('The user interrupted; no screenshot was sent.');
+  if (turn.stale) return fail('The user interrupted; no screenshot was sent.');
   state.pendingMessages.push({
     role: 'user',
     content: [
@@ -1951,22 +1926,22 @@ async function toolDescribeImage(call, ok, fail, epoch, signal) {
   return ok('The user allowed AI reading; the image is attached to the next user message.');
 }
 
-async function consentForProposal(proposed, epoch, signal) {
+async function consentForProposal(proposed, turn) {
   const limit = proposed.risk === 'irreversible'
     ? 'This may submit or send content, and it may not be undoable.'
     : 'The page may save this change automatically.';
   await say(`About to run: ${proposed.summary}. ${limit}`);
   // A replaced turn must not arm or confirm an older proposal.
-  if (turnStale(epoch, signal)) return { cancelled: true, stale: true };
+  if (turn.stale) return { cancelled: true, stale: true };
   let set = createChoiceSet({
     id: uid(),
     question: 'Run this?',
     options: [{ label: 'Run', value: 'execute' }, { label: 'Cancel', value: 'cancel' }],
   });
   await send('ARM_CONSENT', { proposalId: proposed.proposalId, choiceSetId: set.id });
-  if (turnStale(epoch, signal)) return { cancelled: true, stale: true };
+  if (turn.stale) return { cancelled: true, stale: true };
   let choice = await presentSet(set, { timeoutMs: 120_000 });
-  if (turnStale(epoch, signal)) return { cancelled: true, stale: true };
+  if (turn.stale) return { cancelled: true, stale: true };
   if (!choice) {
     await send('CONFIRM_PROPOSAL', {
       tabId: state.tab.tabId, proposalId: proposed.proposalId, choiceSetId: set.id, optionValue: 'cancel',
@@ -1979,18 +1954,18 @@ async function consentForProposal(proposed, epoch, signal) {
   });
   if (state.actionContext) state.actionContext.phase = response.report ? 'settling' : 'arming';
   if (response.action === 'risk') {
-    if (turnStale(epoch, signal)) return { cancelled: true, stale: true };
+    if (turn.stale) return { cancelled: true, stale: true };
     await say('Please confirm again: this action may not be undoable.');
-    if (turnStale(epoch, signal)) return { cancelled: true, stale: true };
+    if (turn.stale) return { cancelled: true, stale: true };
     set = createChoiceSet({
       id: uid(),
       question: 'Run anyway?',
       options: [{ label: 'Run anyway', value: 'execute' }, { label: 'Cancel', value: 'cancel' }],
     });
     await send('ARM_CONSENT', { proposalId: proposed.proposalId, choiceSetId: set.id });
-    if (turnStale(epoch, signal)) return { cancelled: true, stale: true };
+    if (turn.stale) return { cancelled: true, stale: true };
     choice = await presentSet(set, { timeoutMs: 120_000 });
-    if (turnStale(epoch, signal)) return { cancelled: true, stale: true };
+    if (turn.stale) return { cancelled: true, stale: true };
     if (state.actionContext) state.actionContext.phase = 'executing';
     response = await send('CONFIRM_PROPOSAL', {
       tabId: state.tab.tabId,
@@ -2001,13 +1976,13 @@ async function consentForProposal(proposed, epoch, signal) {
     if (state.actionContext) state.actionContext.phase = response.report ? 'settling' : 'arming';
   }
   if (response.action === 'cancel' || !response.report) {
-    if (!turnStale(epoch, signal)) await say('Cancelled.');
+    if (!turn.stale) await say('Cancelled.');
     return { cancelled: true };
   }
   return { report: response.report };
 }
 
-async function finishProposal(report, epoch) {
+async function finishProposal(report, turn) {
   const evidence = [...(report.record?.clicks ?? [])].at(-1);
   const bounded = (value) => JSON.stringify(value ?? null).slice(0, 300);
   const observed = report.verified
@@ -2018,7 +1993,7 @@ async function finishProposal(report, epoch) {
   const undoAvailable = report.undoKind !== 'unavailable';
   if (!report.completed) {
     const failed = `Operation not completed: ${report.failedStep ?? 'no confirmable result'}`;
-    if (epoch !== state.epoch) return `${failed} The turn was replaced before this result could be confirmed.`;
+    if (!turn.isCurrent()) return `${failed} The turn was replaced before this result could be confirmed.`;
     await say(report.failedStep ?? 'The operation did not complete.', { alert: true });
     return failed;
   }
@@ -2029,18 +2004,18 @@ async function finishProposal(report, epoch) {
     undoAvailable ? 'The user can undo it with the Undo button or by saying undo.' : 'This action cannot be undone automatically.',
     'The user heard "Confirming."; observe the page now and report the confirmed result.',
   ].filter(Boolean).join(' ');
-  if (epoch !== state.epoch) return `${resultText} The turn was replaced before this result could be confirmed.`;
+  if (!turn.isCurrent()) return `${resultText} The turn was replaced before this result could be confirmed.`;
   await say(undoAvailable ? 'Confirming.' : 'Confirming. This action cannot be undone automatically.');
-  if (epoch === state.epoch) state.confirming = true;
+  if (turn.isCurrent()) state.confirming = true;
   return resultText;
 }
 
 // Never announces the working prompt: every caller already did. A newer
 // instruction or page switch during the confirmation abandons the undo.
-async function performUndo(epoch) {
+async function performUndo(turn) {
   if (!state.tab) return 'There is nothing to undo.';
   const tabId = state.tab.tabId;
-  const stale = () => epoch !== state.epoch || state.tab?.tabId !== tabId;
+  const stale = () => !turn.isCurrent() || state.tab?.tabId !== tabId;
   const replaced = 'The turn was replaced before undo could finish.';
   const result = await send('UNDO_REQUEST', { tabId });
   if (stale()) return replaced;
@@ -2087,7 +2062,7 @@ function beginActionContext(proposalId) {
     proposalId,
     sourceTabId: state.tab?.tabId ?? null,
     windowId: state.tab?.windowId ?? state.windowId,
-    epoch: state.epoch,
+    turn: turns.current,
     phase: 'arming',
     deferredTabId: null,
   };
@@ -2126,7 +2101,7 @@ async function handleRemoved(tabId) {
 
 async function restoreOriginalPage(opened) {
   const context = state.actionContext;
-  if (!context || context.epoch !== state.epoch) return;
+  if (!context || !context.turn.isCurrent()) return;
   const deferred = context.deferredTabId;
   if (!Number.isInteger(deferred) || !opened.some((tab) => tab.tabId === deferred)) return;
   if (!Number.isInteger(context.sourceTabId)) return;
@@ -2135,12 +2110,12 @@ async function restoreOriginalPage(opened) {
 
 // Only pages opened by this action, and only after the user chooses one, are
 // adopted; the still-running turn then continues with a fresh observation.
-async function followOpenedPages(report, epoch, signal) {
+async function followOpenedPages(report, turn) {
   const opened = Array.isArray(report.openedTabs) ? report.openedTabs : [];
   if (!opened.length) return '';
   const context = state.actionContext;
   if (!context) return '';
-  const owned = () => state.actionContext === context && !turnStale(epoch, signal);
+  const owned = () => state.actionContext === context && !turn.stale;
   if (!owned()) return '';
   const deferred = context.deferredTabId;
   if (Number.isInteger(deferred) && !opened.some((tab) => tab.tabId === deferred)) {
@@ -2248,7 +2223,7 @@ async function followOpenedPages(report, epoch, signal) {
   return 'Switched to the page the user chose. Observe it again before acting; earlier snapshots no longer work.';
 }
 
-async function toolProposeAction(call, ok, fail, epoch, signal) {
+async function toolProposeAction(call, ok, fail, turn) {
   // The re-observation and the spoken result each need one more model call; never say "Confirming." without them.
   if (MAX_MODEL_CALLS_PER_TURN - state.callsThisTurn < 2) {
     return fail('Not run: this turn has too few model calls left to confirm the result. Ask the user to give the instruction again.');
@@ -2259,30 +2234,30 @@ async function toolProposeAction(call, ok, fail, epoch, signal) {
     userText: state.userText,
     confirmedChoices: state.confirmedChoices,
   });
-  if (turnStale(epoch, signal)) return ok('The turn was replaced before this action was confirmed.');
+  if (turn.stale) return ok('The turn was replaced before this action was confirmed.');
   if (!proposed.ok) {
     const message = [proposed.message, ...(proposed.errors ?? [])].filter(Boolean).join(': ');
     return fail(message || 'invalid proposal');
   }
   beginActionContext(proposed.proposalId);
   try {
-    const consent = await consentForProposal(proposed, epoch, signal);
-    if (turnStale(epoch, signal)) return ok('The turn was replaced before this action was confirmed.');
+    const consent = await consentForProposal(proposed, turn);
+    if (turn.stale) return ok('The turn was replaced before this action was confirmed.');
     if (consent.cancelled) {
       return ok(consent.stale
         ? 'The turn was replaced before this action was confirmed.'
         : 'The user cancelled this action.');
     }
-    const finished = await finishProposal(consent.report, epoch);
-    if (turnStale(epoch, signal)) return ok(finished);
-    const follow = await followOpenedPages(consent.report, epoch, signal);
+    const finished = await finishProposal(consent.report, turn);
+    if (turn.stale) return ok(finished);
+    const follow = await followOpenedPages(consent.report, turn);
     return ok(follow ? `${finished} ${follow}` : finished);
   } finally {
     endActionContext();
   }
 }
 
-async function handleToolCall(call, epoch, signal) {
+async function handleToolCall(call, turn) {
   const ok = (data) => ({
     id: call.id,
     name: call.name,
@@ -2292,9 +2267,9 @@ async function handleToolCall(call, epoch, signal) {
   const fail = (message) => ({ id: call.id, name: call.name, content: String(message), isError: true });
   try {
     switch (call.name) {
-      case 'observe_page': return await toolObserve(call, ok, fail, epoch, signal);
-      case 'read_target': return await toolReadTarget(call, ok, fail, epoch, signal);
-      case 'focus_target': return await toolFocusTarget(call, ok, fail, epoch, signal);
+      case 'observe_page': return await toolObserve(call, ok, fail, turn);
+      case 'read_target': return await toolReadTarget(call, ok, fail, turn);
+      case 'focus_target': return await toolFocusTarget(call, ok, fail, turn);
       case 'scroll_page': {
         const outcome = await send('SCROLL_PAGE', {
           tabId: state.tab.tabId,
@@ -2302,7 +2277,7 @@ async function handleToolCall(call, epoch, signal) {
           snapshotId: call.args?.snapshotId,
           nodeId: call.args?.nodeId,
         });
-        if (turnStale(epoch, signal)) return fail('The user interrupted; the page was not scrolled.');
+        if (turn.stale) return fail('The user interrupted; the page was not scrolled.');
         if (outcome.error) return fail(outcome.error);
         return ok({
           moved: outcome.moved,
@@ -2312,9 +2287,9 @@ async function handleToolCall(call, epoch, signal) {
           scrollTop: outcome.scrollTop,
         });
       }
-      case 'describe_image': return await toolDescribeImage(call, ok, fail, epoch, signal);
-      case 'propose_action': return await toolProposeAction(call, ok, fail, epoch, signal);
-      case 'ask_user': return await toolAskUser(call, ok, fail, epoch, signal);
+      case 'describe_image': return await toolDescribeImage(call, ok, fail, turn);
+      case 'propose_action': return await toolProposeAction(call, ok, fail, turn);
+      case 'ask_user': return await toolAskUser(call, ok, fail, turn);
       default: return fail(`Unknown tool: ${call.name}`);
     }
   } catch (error) {
@@ -2324,10 +2299,10 @@ async function handleToolCall(call, epoch, signal) {
 
 async function runGuide() {
   cancelVoice();
-  const epoch = state.epoch;
+  const turn = turns.current;
   const tabId = state.tab?.tabId ?? null;
   // Choosing an option cancels voice, so generation must not end the guide.
-  const alive = () => state.epoch === epoch && (state.tab?.tabId ?? null) === tabId;
+  const alive = () => turn.isCurrent() && (state.tab?.tabId ?? null) === tabId;
   let platform = detectPlatform();
   if (!platform) {
     const choice = await askChoice({
@@ -2396,14 +2371,10 @@ async function refreshTab({ announce = false, reason = '', windowId = null } = {
 function resetConversation() {
   interruptOutput();
   state.deferChoiceFocus = false;
-  state.epoch += 1;
+  turns.next();
   state.pendingInput = null;
   state.actionContext = null;
   if (state.choice) finishChoice(state.choice.set.id, null, 'reset');
-  state.abort?.abort();
-  state.toolAbort?.abort();
-  state.toolAbort = null;
-  state.userCancelled = true;
   state.history = [];
   state.userText = '';
   state.confirmedChoices = [];
@@ -2536,8 +2507,8 @@ async function saveSettings(event) {
   const previousFingerprint = configFingerprint(state.config);
   const next = normalized.config;
   const originChanged = previousOrigin !== configOrigin(next);
-  state.abort?.abort();
-  state.userCancelled = true;
+  // Page text consented for the old receiver must not reach a newly configured one.
+  turns.current.cancel();
   await chrome.storage.local.set({ apiConfig: next });
   if (originChanged) {
     await chrome.storage.session.remove('apiKey');
@@ -2662,7 +2633,7 @@ function bindEvents() {
     cancelVoice();
     stopLocalWatch();
     speech.stopWorking();
-    state.abort?.abort();
+    turns.current.cancel();
     if (state.tab?.tabId) {
       chrome.runtime.sendMessage({ type: 'RESET_SESSION', tabId: state.tab.tabId }).catch(() => {});
     }
@@ -2728,9 +2699,7 @@ async function cancelFromButton() {
   if (state.busy) {
     preemptTurn();
   } else {
-    state.abort?.abort();
-    state.toolAbort?.abort();
-    state.userCancelled = true;
+    turns.current.cancel();
   }
   cancelVoice();
   interruptOutput();
@@ -2746,24 +2715,24 @@ async function undoFromButton() {
   state.audioPaused = false;
   if (state.busy) preemptTurn();
   else interruptOutput();
-  const epoch = state.epoch;
+  const turn = turns.next();
   await state.turnTask;
-  if (epoch !== state.epoch) return;
+  if (!turn.isCurrent()) return;
   state.busy = true;
   syncWorking();
   try {
     const spoken = await say('working');
-    if (epoch !== state.epoch) return;
+    if (!turn.isCurrent()) return;
     if (!spoken.delivered) {
       if (!spoken.interrupted) announceWorkingFailed();
       return;
     }
-    const outcome = await performUndo(epoch);
-    if (epoch === state.epoch) addTranscript('assistant', outcome);
+    const outcome = await performUndo(turn);
+    if (turn.isCurrent()) addTranscript('assistant', outcome);
   } catch (error) {
-    if (epoch === state.epoch) await announceFailure(error);
+    if (turn.isCurrent()) await announceFailure(error);
   } finally {
-    if (epoch === state.epoch) {
+    if (turn.isCurrent()) {
       state.busy = false;
       syncWorking();
     }
@@ -2786,9 +2755,6 @@ function preparePanelClose() {
   interruptOutput();
   cancelVoice();
   stopLocalWatch();
-  state.abort?.abort();
-  state.toolAbort?.abort();
-  state.userCancelled = true;
   state.pendingInput = null;
   state.busy = false;
   // Presenting and pending input expire; API settings and undo records do not.
