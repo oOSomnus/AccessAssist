@@ -7,7 +7,7 @@ const EXT = path.resolve('extension');
 
 // The profile directory is owned by this run; remove it even when setup fails
 // or the context reports a close error.
-export async function runInstall({ launch = chromium.launchPersistentContext } = {}) {
+export async function runInstall({ launch = (...args) => chromium.launchPersistentContext(...args) } = {}) {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'aa-autoinstall-'));
   let context;
   try {
