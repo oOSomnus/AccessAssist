@@ -1,7 +1,7 @@
 export const GUIDES = Object.freeze({
   voiceover: {
     name: 'VoiceOver',
-    intro: 'Here are the VoiceOver keys for exploring this image. While a choice is open, use Next, Repeat, or Back. Press Escape to leave this guide.',
+    intro: 'Here are the VoiceOver keys for exploring this image. They stay in the conversation if you need them again.',
     steps: [
       'VoiceOver uses Control plus Option by default; it may also be set to Caps Lock.',
       'Return to the page and press VO plus Command plus G for the next image, or VO plus Command plus Shift plus G for the previous image.',
@@ -12,7 +12,7 @@ export const GUIDES = Object.freeze({
   },
   narrator: {
     name: 'Narrator',
-    intro: 'Here are the Narrator keys for exploring this image. While a choice is open, use Next, Repeat, or Back. Press Escape to leave this guide.',
+    intro: 'Here are the Narrator keys for exploring this image. They stay in the conversation if you need them again.',
     steps: [
       'The Narrator key is Caps Lock by default; it may also be Insert.',
       'Move Narrator focus to the target image and confirm where it is.',

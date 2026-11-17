@@ -916,6 +916,9 @@ function gridScenario(context) {
   }
   const proposal = lastCall(context, 'propose_action');
   if (proposal) {
+    if (needsReobservation(context)) {
+      return { ...toolReply(context, 'observe_page', {}), text: 'I am not sure the page selected those times. Let me check.' };
+    }
     const result = context.results.get(proposal.id);
     const done = result && !result.isError;
     return { text: done ? 'Selected Monday 2 PM to 3 PM.' : 'The time was not changed.' };
@@ -961,6 +964,21 @@ function nameScenario(context) {
     requirements: [{ name: 'Name', value: 'Alex Morgan', source: 'user', quote: 'Alex Morgan' }],
     missingFields: [],
   });
+}
+
+// Pads the turn with observations so the action is proposed by model call N.
+function lateNameScenario(context, proposeAt) {
+  const proposal = lastCall(context, 'propose_action');
+  if (!proposal) {
+    const observes = context.calls.filter((call) => call.name === 'observe_page').length;
+    if (observes < proposeAt - 1) return toolReply(context, 'observe_page', {});
+    return nameScenario(context);
+  }
+  const result = context.results.get(proposal.id);
+  // OpenAI tool results never carry isError, so read the refusal message instead.
+  if (result && /^Not run:/u.test(result.content)) return { text: `Refused: ${result.content}` };
+  if (needsReobservation(context)) return toolReply(context, 'observe_page', {});
+  return { text: 'Done: the name is Alex Morgan.' };
 }
 
 function intermediateScenario(context) {
@@ -1688,6 +1706,8 @@ function decide(context) {
   }
   if (/intermediate message/iu.test(current)) return intermediateScenario(context);
   if (/observe twice/iu.test(current)) return observeTwiceScenario(context);
+  const late = /late name change at (\d+)/iu.exec(current);
+  if (late) return lateNameScenario(context, Number(late[1]));
   if (/choice fixture/iu.test(current)) return choicesScenario(context);
   if (/interaction (double click|right click|hover options|hold confirm|cancel hold|single click|shift click|drag rows|drag moved|drag across secret|drag into frame)/iu.test(current)) {
     return interactionPointerScenario(context);

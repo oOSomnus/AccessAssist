@@ -9,6 +9,7 @@ import {
   openPanel,
   resetMock,
   sendText,
+  undoLastChange,
 } from './helpers.js';
 
 // Two-step confirmation for an irreversible proposal.
@@ -17,10 +18,9 @@ async function run(panel) {
   await answerWhen(panel, 'Run anyway?', 0);
 }
 
-// One confirmation, then keep the compensating change.
+// One confirmation for a reversible change.
 async function edit(panel) {
   await answerWhen(panel, 'Run this?', 0);
-  await answerWhen(panel, 'Keep these changes?', 0);
 }
 
 test('browser text entry commits a new value and clearing does not submit', async () => {
@@ -81,7 +81,7 @@ test('a long field is replaced fully and undo restores every character', async (
     await sendText(panel, 'Interaction long note');
     await answerWhen(panel, 'page text', 0);
     await answerWhen(panel, 'Run this?', 0);
-    await answerWhen(panel, 'Keep these changes?', 1);
+    await undoLastChange(panel);
     await answerWhen(panel, 'Undo this change?', 0);
 
     await expect(page.locator('#notes')).toHaveValue(initial);
@@ -100,8 +100,7 @@ test('a later edit blocks undo of a long field', async () => {
     await sendText(panel, 'Interaction long note');
     await answerWhen(panel, 'page text', 0);
     await edit(panel);
-    const replaced = await page.locator('#notes').inputValue();
-    expect(replaced.startsWith('Replacement text')).toBe(true);
+    await expect(page.locator('#notes')).toHaveValue(/^Replacement text/u, { timeout: 30_000 });
 
     await page.evaluate(() => {
       const field = document.getElementById('notes');

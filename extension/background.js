@@ -3,9 +3,7 @@
 import {
   PHASE,
   acceptConsent,
-  acceptResult,
   armConsent,
-  armResult,
   createSession,
   finishExecution,
   observationDrift,
@@ -480,8 +478,6 @@ async function route(message) {
     case 'PROPOSE_ACTION': return proposeAction(requireTab(await targetTab(message.tabId)), message);
     case 'ARM_CONSENT': return armProposalConsent(message);
     case 'CONFIRM_PROPOSAL': return confirmProposal(requireTab(await targetTab(message.tabId)), message);
-    case 'ARM_RESULT': return armProposalResult(message);
-    case 'CONFIRM_RESULT': return confirmResult(message);
     case 'UNDO_REQUEST': return requestUndo(requireTab(await targetTab(message.tabId)));
     case 'CAPTURE_TARGET': return captureTarget(requireTab(await targetTab(message.tabId)), message);
     case 'ACTIVATE_TAB': return activateTab(message);
@@ -1001,26 +997,6 @@ function armProposalConsent(message) {
   return { ok: true };
 }
 
-function armProposalResult(message) {
-  const stored = proposals.get(message.proposalId);
-  if (!stored) return { error: 'Result confirmation expired' };
-  const outcome = armResult(stored.session, { choiceSetId: message.choiceSetId });
-  if (outcome.error) return { error: outcome.error };
-  proposals.set(message.proposalId, { ...stored, session: outcome.session });
-  return { ok: true };
-}
-
-function confirmResult(message) {
-  const stored = proposals.get(message.proposalId);
-  if (!stored) return { error: 'Result confirmation expired' };
-  const outcome = acceptResult(stored.session, {
-    choiceSetId: message.choiceSetId, optionValue: message.optionValue,
-  });
-  if (outcome.error) return { error: outcome.error };
-  proposals.delete(message.proposalId);
-  return { ok: true, action: outcome.action };
-}
-
 async function confirmProposal(tab, message) {
   const stored = proposals.get(message.proposalId);
   if (!stored) return { error: 'Confirmation expired; propose the action again' };
@@ -1038,7 +1014,6 @@ async function confirmProposal(tab, message) {
 
   const proposal = outcome.session.proposal;
   let report;
-  let stopped = false;
   try {
     const run = await executions.run(tab.id, async () => {
       await chrome.storage.session.set({
@@ -1051,7 +1026,6 @@ async function confirmProposal(tab, message) {
       }
     });
     report = run.value;
-    stopped = run.stopped;
   } catch (error) {
     report = { completed: 0, failedStep: error?.message ?? 'Execution failed', verified: false, record: null };
   }
@@ -1062,10 +1036,8 @@ async function confirmProposal(tab, message) {
     changed: report.changed ?? report.verified,
     undoKind: report.record?.undoKind ?? 'unavailable',
   });
-  // A reset during execution owns the tab now; do not revive the old proposal.
-  if (stopped) proposals.delete(message.proposalId);
-  else proposals.set(message.proposalId, { ...stored, session: finished.session });
-  if (finished.phase !== PHASE.result || proposal.isUndo) proposals.delete(message.proposalId);
+  // Execution ends the proposal; undo works from the tab's undo record.
+  proposals.delete(message.proposalId);
   return {
     ok: true,
     action: 'execute',

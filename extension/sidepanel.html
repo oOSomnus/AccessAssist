@@ -23,6 +23,12 @@
 
   <main>
     <div class="panel-content">
+      <section id="conversation" aria-labelledby="transcript-heading">
+        <h2 id="transcript-heading" class="visually-hidden">Conversation</h2>
+        <ol id="transcript" class="transcript" aria-label="Conversation"></ol>
+        <p class="conversation-empty">Ask about this page, an image, or a task.</p>
+      </section>
+
       <section id="ask" class="ask" data-number-scope="choice" hidden aria-labelledby="ask-heading">
         <h2 id="ask-heading">Your choice</h2>
         <p id="ask-question"></p>
@@ -87,12 +93,6 @@
           </ul>
           <p class="hint">View or change bindings at <code>chrome://extensions/shortcuts</code>.</p>
         </section>
-      </section>
-
-      <section id="conversation" aria-labelledby="transcript-heading">
-        <h2 id="transcript-heading" class="visually-hidden">Conversation</h2>
-        <ol id="transcript" class="transcript" aria-label="Conversation"></ol>
-        <p class="conversation-empty">Ask about this page, an image, or a task.</p>
       </section>
 
       <section id="voice-setup" class="voice-setup" data-number-scope="voice" aria-labelledby="voice-setup-heading">

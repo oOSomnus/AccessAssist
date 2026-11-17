@@ -536,26 +536,6 @@ export function acceptConsent(session, { choiceSetId, optionValue, now = Date.no
   return { session: { ...used, phase: PHASE.executing, consent: null }, action: 'execute' };
 }
 
-export function armResult(session, { choiceSetId, now = Date.now() }) {
-  if (session.phase !== PHASE.result) return { error: 'There is no pending result to confirm' };
-  return {
-    session: {
-      ...session,
-      consent: { choiceSetId, expiresAt: now + CONSENT_TIMEOUT_MS, used: false },
-    },
-  };
-}
-
-export function acceptResult(session, { choiceSetId, optionValue, now = Date.now() }) {
-  if (session.phase !== PHASE.result) return { error: 'There is no pending result to confirm' };
-  const consent = session.consent;
-  if (!consent || consent.choiceSetId !== choiceSetId) return { error: 'This confirmation expired; choose again' };
-  if (consent.used) return { error: 'This confirmation was already used' };
-  if (now > consent.expiresAt) return { error: 'Confirmation timed out' };
-  if (optionValue !== 'keep' && optionValue !== 'undo') return { error: 'Invalid result option' };
-  return { session: cancelToGuide(session), action: optionValue };
-}
-
 export function finishExecution(session, { completedSteps, failedStep = null, verified = true, changed = verified, undoKind }) {
   if (session.phase !== PHASE.executing) return { error: 'No action is executing' };
   if (completedSteps <= 0) {
