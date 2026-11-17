@@ -2,7 +2,7 @@ import { normalizeConfig, requestTurn } from './ai.js';
 import { consentRound } from './consent-round.js';
 import { closeChoiceSet, createChoiceSet, formatChoices, parseChoiceNumber, resolveChoice } from './protocol.js';
 import { keyBinding, keyForBinding, configFingerprint, configOrigin, DEFAULT_API_CONFIG, grantUpload, needsUpload, uploadConsentFor } from './settings.js';
-import { Speech, spokenSites } from './speech.js';
+import { Speech, spokenSites, voiceSetupView } from './speech.js';
 import { detectPlatform, guideFor } from './screen-reader-guide.js';
 import { createTurns } from './turn.js';
 
@@ -87,7 +87,6 @@ const state = {
   voiceReady: false,
   voiceRetry: false,
   micState: 'unknown',
-  micDenied: false,
   voiceGeneration: 0,
   preparing: null,
   prepareAbort: null,
@@ -402,7 +401,6 @@ async function listenOnce(requestId, seq) {
         state.voiceRetry = true;
         if (error?.code === 'not-allowed' || error?.code === 'service-not-allowed') {
           state.micState = 'denied';
-          state.micDenied = true;
         }
         updateVoiceSetup({ local: speech.localStatus, mic: state.micState, ready: false });
         focusVoiceSetup();
@@ -521,66 +519,22 @@ function voiceStartError(error) {
   }
 }
 
-function voiceBlockedMessage({ local, mic }) {
-  if (local === 'unavailable') return 'Local speech recognition is not available in this Chrome.';
-  if (local === 'error') return 'Chrome could not check the English speech pack. Choose Retry.';
-  if (mic === 'denied') return `Microphone access is denied. Allow it in Chrome and system settings. ${listenAction()} to try again.`;
-  if (local === 'available' && mic === 'granted') {
-    return `${listenSentence()}.`;
-  }
-  return 'Microphone access is required before voice can start. Choose Prepare voice and allow Chrome to use the microphone.';
-}
-
 function updateVoiceSetup({ local, mic, ready, preparing = Boolean(state.preparing) }) {
-  const section = $('voice-setup');
-  const downloading = !ready && (preparing || local === 'downloadable' || local === 'downloading');
-  const retry = !ready && (state.voiceRetry || mic === 'denied' || local === 'unavailable' || local === 'error');
-  if (SETUP_PAGE) {
-    section.hidden = false;
-    $('return-assistant').hidden = !ready;
-    // Keep the preparation entry visible whenever it is not already running,
-    // so a first-time user can start the pack download without a shortcut.
-    $('start-using').hidden = ready || preparing || local === 'downloading';
-    $('start-using').textContent = retry ? '1 Retry' : '1 Prepare voice';
-    if (ready) setVoiceStatus('Microphone access is granted. Speech is ready on this device.');
-    else if (local === 'unavailable') setVoiceStatus('This Chrome cannot recognize speech on this device.');
-    else if (local === 'error') setVoiceStatus('Chrome could not check the English speech pack. Choose Retry.');
-    else if (mic === 'denied') setVoiceStatus('Microphone access is denied. Allow it in Chrome site settings and system settings, then choose Retry.');
-    else if (preparing) setVoiceStatus('Chrome is preparing the English speech pack and will ask for the microphone. Allow it when Chrome asks.');
-    else if (local === 'downloadable' || local === 'downloading') {
-      setVoiceStatus('Chrome needs the English speech pack. Choose Prepare voice to start.');
-    } else if (mic === 'granted') setVoiceStatus('Waiting for the English speech pack.');
-    else if (retry) setVoiceStatus('Voice is not ready. Choose Retry to try again.');
-    else setVoiceStatus('Press Prepare voice to check the microphone and prepare speech.');
-    return;
-  }
-  if (ready) {
-    section.hidden = true;
-    return;
-  }
-  section.hidden = false;
-  $('return-assistant').hidden = true;
-  $('start-using').hidden = (preparing || local === 'downloading') && !retry;
-  $('start-using').textContent = retry ? '1 Retry' : '1 Prepare voice';
-  if (local === 'unavailable') {
-    setVoiceStatus('This Chrome cannot recognize speech on this device. Choose Retry after enabling local speech.');
-  } else if (local === 'error') {
-    setVoiceStatus('Chrome could not check the English speech pack. Choose Retry.');
-  } else if (mic === 'denied') {
-    setVoiceStatus('Microphone access is denied. Allow it in Chrome site settings and system settings, then choose Retry.');
-  } else if (preparing) {
-    setVoiceStatus('Chrome is preparing the English speech pack and will ask for the microphone.');
-  } else if (local === 'downloadable' || local === 'downloading') {
-    setVoiceStatus('The English speech pack is not ready. Choose Prepare voice to start.');
-  } else if (mic === 'granted') {
-    setVoiceStatus(retry
-      ? 'Voice is not ready. Choose Retry to try again.'
-      : `Speech is ready. ${listenSentence()}.`);
-  } else {
-    setVoiceStatus(retry
-      ? 'Voice is not ready. Choose Retry to try again.'
-      : 'Voice needs microphone permission. Choose Prepare voice to start.');
-  }
+  const view = voiceSetupView({
+    surface: SETUP_PAGE ? 'setup' : 'panel',
+    local,
+    mic,
+    ready,
+    preparing,
+    failed: state.voiceRetry,
+    listen: listenSentence(),
+  });
+  $('voice-setup').hidden = view.sectionHidden;
+  if (view.sectionHidden) return;
+  $('return-assistant').hidden = view.returnHidden;
+  $('start-using').hidden = view.startHidden;
+  $('start-using').textContent = view.startLabel;
+  setVoiceStatus(view.status);
 }
 
 function focusVoiceSetup() {
@@ -602,9 +556,7 @@ async function microphoneState() {
 
 async function refreshVoiceStatus() {
   const mic = await microphoneState();
-  const local = await speech.getLocalRecognitionStatus();
-  speech.localStatus = local;
-  speech.localAvailable = local === 'available';
+  const local = await speech.refreshLocalStatus();
   state.micState = mic;
   // Capability alone decides readiness; a session failure is retried by the
   // next listen request instead of locking voice until a reload.
@@ -632,8 +584,6 @@ function ensureLocalWatch() {
       setVoiceStatus('The English speech pack is still downloading. It continues in the background.');
     },
     onStatus: (local) => {
-      speech.localStatus = local;
-      speech.localAvailable = local === 'available';
       if (local === 'available' && state.micState === 'granted' && !state.preparing) {
         state.voiceReady = true;
         state.voiceRetry = false;
@@ -667,8 +617,6 @@ function startPreparation({ setup = false, force = false } = {}) {
     },
     onStatus: (status) => {
       if (generation !== state.voiceGeneration) return;
-      speech.localStatus = status;
-      speech.localAvailable = status === 'available';
       updateVoiceSetup({ local: status, mic: state.micState, ready: false, preparing: true });
     },
   });
@@ -757,7 +705,6 @@ async function finishPreparation({ generation, install, local, microphone, waitT
       else {
         micGranted = true;
         state.micState = 'granted';
-        state.micDenied = false;
         retryInstallAfterMic();
         if (readyEnough()) {
           events.clear();
@@ -807,9 +754,8 @@ async function finishPreparation({ generation, install, local, microphone, waitT
     const permission = await microphoneState();
     if (generation !== state.voiceGeneration) return false;
     state.micState = permission === 'denied' ? 'denied' : permission === 'granted' ? 'granted' : 'prompt';
-    state.micDenied = permission === 'denied';
     if (deniedError) {
-      if (state.micDenied) {
+      if (permission === 'denied') {
         return stopPreparation({
           generation,
           message: 'Microphone access is denied. Allow it in Chrome site settings and system settings, then choose Retry.',
@@ -864,9 +810,6 @@ async function finishPreparation({ generation, install, local, microphone, waitT
   state.voiceReady = true;
   state.voiceRetry = false;
   state.micState = 'granted';
-  state.micDenied = false;
-  speech.localStatus = 'available';
-  speech.localAvailable = true;
   updateVoiceSetup({ local: 'available', mic: 'granted', ready: true, preparing: false });
   if (setup) {
     setVoiceStatus('Microphone access is granted. Speech is ready on this device.');
@@ -2653,13 +2596,11 @@ function bindEvents() {
           state.voiceReady = false;
           state.voiceRetry = true;
           state.micState = 'denied';
-          state.micDenied = true;
           updateModeLine();
           updateVoiceSetup({ local: speech.localStatus, mic: 'denied', ready: false });
           speech.writeStatus(`Microphone permission was revoked. Restore it in browser and system settings. ${listenAction()} to try again.`, true);
         } else if (status.state === 'granted') {
           state.micState = 'granted';
-          state.micDenied = false;
           void refreshVoiceStatus().catch(() => {});
         }
       };

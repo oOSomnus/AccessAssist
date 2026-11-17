@@ -75,6 +75,37 @@ export function localRecognitionSupported(Recognition) {
   return typeof Recognition?.available === 'function';
 }
 
+// The voice-setup section for one surface: which controls show and the one status sentence.
+export function voiceSetupView({ surface, local, mic, ready, preparing, failed, listen }) {
+  const retry = !ready && (failed || mic === 'denied' || local === 'unavailable' || local === 'error');
+  const startLabel = retry ? '1 Retry' : '1 Prepare voice';
+  const pack = local === 'downloadable' || local === 'downloading';
+  if (surface === 'setup') {
+    // Keep the preparation entry visible whenever it is not already running,
+    // so a first-time user can start the pack download without a shortcut.
+    const status = ready ? 'Microphone access is granted. Speech is ready on this device.'
+      : local === 'unavailable' ? 'This Chrome cannot recognize speech on this device.'
+        : local === 'error' ? 'Chrome could not check the English speech pack. Choose Retry.'
+          : mic === 'denied' ? 'Microphone access is denied. Allow it in Chrome site settings and system settings, then choose Retry.'
+            : preparing ? 'Chrome is preparing the English speech pack and will ask for the microphone. Allow it when Chrome asks.'
+              : pack ? 'Chrome needs the English speech pack. Choose Prepare voice to start.'
+                : mic === 'granted' ? 'Waiting for the English speech pack.'
+                  : retry ? 'Voice is not ready. Choose Retry to try again.'
+                    : 'Press Prepare voice to check the microphone and prepare speech.';
+    return { sectionHidden: false, returnHidden: !ready, startHidden: ready || preparing || local === 'downloading', startLabel, status };
+  }
+  if (ready) return { sectionHidden: true };
+  const status = local === 'unavailable' ? 'This Chrome cannot recognize speech on this device. Choose Retry after enabling local speech.'
+    : local === 'error' ? 'Chrome could not check the English speech pack. Choose Retry.'
+      : mic === 'denied' ? 'Microphone access is denied. Allow it in Chrome site settings and system settings, then choose Retry.'
+        : preparing ? 'Chrome is preparing the English speech pack and will ask for the microphone.'
+          : pack ? 'The English speech pack is not ready. Choose Prepare voice to start.'
+            : retry ? 'Voice is not ready. Choose Retry to try again.'
+              : mic === 'granted' ? `Speech is ready. ${listen}.`
+                : 'Voice needs microphone permission. Choose Prepare voice to start.';
+  return { sectionHidden: false, returnHidden: true, startHidden: (preparing || local === 'downloading') && !retry, startLabel, status };
+}
+
 export class Speech {
   constructor({ lang = 'en-US' } = {}) {
     this.lang = lang;
