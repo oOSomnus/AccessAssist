@@ -29,7 +29,7 @@ export function redact(value, secrets = [], depth = 0) {
     return {
       name: redactString(value.name ?? 'Error', secrets),
       message: redactString(value.message ?? '', secrets),
-      code: value.code,
+      code: redact(value.code, secrets, depth + 1),
       stack: value.stack ? redactString(value.stack, secrets) : undefined,
     };
   }
@@ -38,12 +38,13 @@ export function redact(value, secrets = [], depth = 0) {
   }
   const out = {};
   for (const [key, item] of Object.entries(value)) {
+    const name = redactString(key, secrets);
     if (SECRET_KEYS.has(key.toLowerCase())) {
-      out[key] = '[redacted]';
+      out[name] = '[redacted]';
     } else if (key === 'data' && value.type === 'image' && typeof item === 'string') {
-      out[key] = `[screenshot omitted, ${item.length} base64 chars]`;
+      out[name] = `[screenshot omitted, ${item.length} base64 chars]`;
     } else {
-      out[key] = redact(item, secrets, depth + 1);
+      out[name] = redact(item, secrets, depth + 1);
     }
   }
   return out;

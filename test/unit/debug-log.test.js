@@ -46,3 +46,12 @@ test('cycles stop at the depth limit instead of overflowing', () => {
   assert.equal(out.name, 'loop');
   assert.equal(out.self.self.self.name, 'loop');
 });
+
+test('secrets are removed from property names and error codes', () => {
+  const error = Object.assign(new Error('boom'), { code: 'bad key sk-secret-1' });
+  const out = redact({ 'sk-secret-1': { apiKey: 'y' }, numbered: Object.assign(new Error('x'), { code: 429 }), error }, ['sk-secret-1']);
+  assert.equal(JSON.stringify(out).includes('sk-secret-1'), false);
+  assert.equal(out['[redacted]'].apiKey, '[redacted]');
+  assert.equal(out.error.code, 'bad key [redacted]');
+  assert.equal(out.numbered.code, 429);
+});
