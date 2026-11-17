@@ -41,8 +41,8 @@ test('the first introduction is claimed before delivery and is not replayed afte
       async () => (await chrome.storage.local.get('introSeen')).introSeen,
     )).toBe(true);
     await expect.poll(() => announcements(panel)).toContain('Hi, I am AccessAssist');
-    await sendIntent(worker, { id: 'stop-intro', mode: 'typing', source: 'command', tabId: 0, at: Date.now() });
-    await expect(panel.locator('#message')).toBeFocused();
+    await sendIntent(worker, { id: 'stop-intro', mode: 'open', source: 'command', tabId: 0, at: Date.now() });
+    await expect(panel.locator('#listen')).toBeFocused();
     await panel.close();
 
     const reopened = await openFirstUsePanel(context, extensionId);
@@ -61,7 +61,7 @@ test('the first introduction is claimed before delivery and is not replayed afte
   }
 });
 
-test('replaying the introduction keeps the draft and does not request the microphone', async () => {
+test('replaying the introduction does not request the microphone', async () => {
   const { context, extensionId, worker } = await launch({
     voice: { available: 'available', permission: 'granted', gum: 'grant' },
   });
@@ -70,8 +70,6 @@ test('replaying the introduction keeps the draft and does not request the microp
     const panel = await openPanel(context, extensionId);
     expect((await voiceState(panel)).starts).toBe(0);
 
-    await panel.locator('#message').fill('half written');
-    await expect(panel.locator('#mode-line')).toContainText('input: typing');
     const before = await voiceState(panel);
     await sendIntent(worker, { id: 'replay', mode: 'intro', source: 'command', tabId: 0, at: Date.now() });
     await expect.poll(async () => await announcements(panel)).toContain('Hi, I am AccessAssist');
@@ -81,8 +79,6 @@ test('replaying the introduction keeps the draft and does not request the microp
     expect(after.installCalls.length).toBe(before.installCalls.length);
     expect(after.starts).toBe(before.starts);
     expect(after.active).toBe(false);
-    expect(await panel.locator('#message').inputValue()).toBe('half written');
-    await expect(panel.locator('#mode-line')).toContainText('input: typing');
     expect(await announcements(panel)).not.toContain('Current page:');
   } finally {
     await context.close();
@@ -142,7 +138,7 @@ test('an older completed marker migrates to the claimed introduction state', asy
 });
 
 
-test('replaying the introduction preserves an open choice and draft', async () => {
+test('replaying the introduction preserves an open choice', async () => {
   const { context, extensionId, worker } = await launch({
     voice: { available: 'available', permission: 'granted', gum: 'grant' },
   });
@@ -153,13 +149,11 @@ test('replaying the introduction preserves an open choice and draft', async () =
     await sendText(panel, 'Select Monday two to three.');
     await answerWhen(panel, 'page text', 0);
     await expect(panel.locator('#ask-question')).toContainText('AM or PM');
-    await panel.locator('#message').fill('draft text');
     const before = await voiceState(panel);
     await sendIntent(worker, { id: 'replay-choice', mode: 'intro', source: 'command', tabId: 0, at: Date.now() });
     await expect.poll(async () => await announcements(panel)).toContain('Hi, I am AccessAssist');
     await expect(panel.locator('#ask-question')).toContainText('AM or PM');
     await expect(panel.locator('#ask')).toBeVisible();
-    expect(await panel.locator('#message').inputValue()).toBe('draft text');
     expect((await voiceState(panel)).gumCalls).toBe(before.gumCalls);
   } finally {
     await context.close();

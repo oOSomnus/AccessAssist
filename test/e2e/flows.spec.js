@@ -16,12 +16,10 @@ import {
 } from './helpers.js';
 
 const launcherOpen = (page) => page.locator('#accessassist-launcher-host #launcher-open');
-const launcherMove = (page) => page.locator('#accessassist-launcher-host #launcher-move');
-const launcherPanel = (page) => page.locator('#accessassist-launcher-host #launcher-move-controls');
 
 async function waitForLauncher(page) {
   await expect(launcherOpen(page)).toHaveCount(1);
-  await expect(launcherMove(page)).toBeEnabled();
+  await expect(page.locator('#accessassist-launcher-host')).toHaveAttribute('data-loaded', 'true');
 }
 
 async function launcherState(page) {
@@ -36,7 +34,6 @@ async function launcherState(page) {
       bar: { x: rect.x, y: rect.y, width: rect.width, height: rect.height },
       viewport: { width: innerWidth, height: innerHeight },
       active: root.activeElement?.id || root.activeElement?.getAttribute('aria-label') || '',
-      moveOpen: !root.querySelector('#launcher-move-controls').hidden,
       status: root.querySelector('[role="status"]').textContent,
     };
   });
@@ -119,7 +116,7 @@ test('read flow speaks the real paragraph and does not submit the form', async (
   }
 });
 
-test('a real option click returns focus to Message, not the document', async () => {
+test('a real option click returns focus to Listen, not the document', async () => {
   const { context, extensionId } = await launch();
   try {
     await resetMock();
@@ -130,37 +127,10 @@ test('a real option click returns focus to Message, not the document', async () 
 
     await panel.locator('#ask-options button').first().click();
     await expect(panel.locator('#ask-question')).toContainText('AM or PM', { timeout: 30_000 });
-    await expect(panel.locator('#message')).toBeFocused();
+    await expect(panel.locator('#listen')).toBeFocused();
     expect(await panel.evaluate(() => document.activeElement === document.body)).toBe(false);
-    await panel.keyboard.press('2');
-    await expect(panel.locator('#message')).toHaveValue('2');
     await expect.poll(async () => await announcements(panel)).toContain('Selected option 1:');
-    expect((await voiceState(panel)).starts).toBe(0);
-  } finally {
-    await context.close();
-  }
-});
-
-test('restoring Message after a choice keeps the draft and selection', async () => {
-  const { context, extensionId } = await launch();
-  try {
-    await resetMock();
-    await openFixture(context, '/grid-native');
-    const panel = await openPanel(context, extensionId);
-    await panel.locator('#message').focus();
-    await sendText(panel, 'Select Monday two to three.');
-    await expect(panel.locator('#ask-sites')).toBeVisible({ timeout: 30_000 });
-
-    await panel.locator('#message').fill('keep this draft');
-    await panel.evaluate(() => document.getElementById('message').setSelectionRange(2, 6));
-    await panel.locator('#ask-options button').first().click();
-    await expect(panel.locator('#ask-question')).toContainText('AM or PM', { timeout: 30_000 });
-    await expect(panel.locator('#message')).toBeFocused();
-    expect(await panel.locator('#message').evaluate((element) => ({
-      value: element.value,
-      start: element.selectionStart,
-      end: element.selectionEnd,
-    }))).toEqual({ value: 'keep this draft', start: 2, end: 6 });
+    expect((await voiceState(panel)).starts).toBe(1);
   } finally {
     await context.close();
   }
@@ -182,7 +152,7 @@ test('choice completion returns to a stable trigger outside the question', async
   }
 });
 
-test('an unusable saved trigger falls back to Message', async () => {
+test('an unusable saved trigger falls back to Listen', async () => {
   const { context, extensionId } = await launch();
   try {
     await resetMock();
@@ -193,7 +163,7 @@ test('an unusable saved trigger falls back to Message', async () => {
     await expect(panel.locator('#ask-sites')).toBeVisible({ timeout: 30_000 });
     await panel.evaluate(() => { document.getElementById('close-panel').disabled = true; });
     await panel.locator('#ask-options button').first().click();
-    await expect(panel.locator('#message')).toBeFocused();
+    await expect(panel.locator('#listen')).toBeFocused();
   } finally {
     await context.close();
   }
@@ -251,14 +221,7 @@ test('ambiguous time asks for AM or PM, then edits with confirmation and undo', 
     await answerWhen(panel, 'page text', 0);
     await expect(panel.locator('#ask-question')).toContainText('AM or PM');
 
-    // Digits typed in the editor stay text and do not answer the question.
-    await panel.locator('#message').focus();
-    await panel.locator('#message').press('2');
-    await expect(panel.locator('#message')).toHaveValue('2');
-    await expect(panel.locator('#ask')).toBeVisible();
-    await panel.locator('#message').press('Control+Enter');
-    await expect(panel.locator('#message')).toHaveValue('');
-
+    await answerWhen(panel, 'AM or PM', 1);
     await answerWhen(panel, 'Run this?', 0);
     await answerWhen(panel, 'Keep these changes?', 0);
 
@@ -294,11 +257,6 @@ test('bare digits stay native while the master combination chooses', async () =>
     await expect(panel.locator('#ask')).toBeVisible();
     await expect(panel.locator('#ask-question')).toHaveText(question);
 
-    // The same digit in the message box is ordinary text.
-    await panel.locator('#message').press('2');
-    await expect(panel.locator('#message')).toHaveValue('2');
-    await expect(panel.locator('#ask')).toBeVisible();
-
     // An unavailable number is not consumed and changes nothing.
     await panel.keyboard.press('Control+Shift+9');
     await panel.waitForTimeout(150);
@@ -316,7 +274,7 @@ test('bare digits stay native while the master combination chooses', async () =>
     await expect(panel.locator('#ask-question')).toHaveText(question);
 
     // Shift turns the key label into a symbol; the physical digit still works.
-    await panel.locator('#message').press('Control+Shift+2');
+    await panel.keyboard.press('Control+Shift+2');
     await expect(panel.locator('#ask-question')).toContainText('Run this?');
   } finally {
     await context.close();
@@ -1111,7 +1069,7 @@ test('the Assistant launcher drags, persists, and never opens the panel', async 
   }
 });
 
-test('launcher movement has non-drag controls and drag cannot click through', async () => {
+test('launcher drag cannot click through; Shift+Arrow moves it, and focus returns to the open button', async () => {
   const { context, extensionId, worker } = await launch();
   try {
     await resetMock();
@@ -1190,63 +1148,8 @@ test('launcher movement has non-drag controls and drag cannot click through', as
       open.dispatchEvent(new PointerEvent('pointerdown', { ...base, button: 0, buttons: 1 }));
       open.dispatchEvent(new PointerEvent('pointermove', { ...base, button: -1, buttons: 1, clientX: rect.left - 100 }));
       open.dispatchEvent(new PointerEvent('pointerup', { ...base, button: 0, buttons: 0, clientX: rect.left - 100 }));
-      document.getElementById('accessassist-launcher-host').shadowRoot.querySelector('#launcher-move').click();
     });
     expect(await storedLauncher(worker)).toEqual(savedStart);
-    expect((await launcherState(page)).moveOpen).toBe(false);
-
-    await launcherMove(page).click();
-    await expect(launcherPanel(page)).toBeVisible();
-    await expect(page.locator('#accessassist-launcher-host button[aria-label="Move up"]')).toBeFocused();
-    const beforeMove = await launcherState(page);
-    await page.locator('#accessassist-launcher-host button[aria-label="Move left"]').click();
-    const afterMove = await launcherState(page);
-    expect(beforeMove.left - afterMove.left).toBeGreaterThan(15);
-    expect(await storedLauncher(worker)).toEqual(savedStart);
-    await launcherMove(page).click();
-    await expect(launcherPanel(page)).toBeHidden();
-    await expect(launcherMove(page)).toBeFocused();
-    const afterDone = await storedLauncher(worker);
-    expect(afterDone.x).toBeLessThan(savedStart.x);
-
-    await launcherMove(page).click();
-    await page.locator('#accessassist-launcher-host button[aria-label="Move right"]').click();
-    await page.locator('#accessassist-launcher-host #launcher-move-controls button', { hasText: 'Cancel' }).click();
-    await expect(launcherPanel(page)).toBeHidden();
-    await expect(launcherMove(page)).toBeFocused();
-    expect(await storedLauncher(worker)).toEqual(afterDone);
-
-    await launcherMove(page).click();
-    const beforeArrow = await launcherState(page);
-    await page.keyboard.press('ArrowLeft');
-    const afterArrow = await launcherState(page);
-    expect(beforeArrow.left - afterArrow.left).toBeGreaterThan(15);
-    expect(await storedLauncher(worker)).toEqual(afterDone);
-    await page.keyboard.press('Escape');
-    await expect(launcherPanel(page)).toBeHidden();
-    await expect(launcherMove(page)).toBeFocused();
-    expect(await storedLauncher(worker)).toEqual(afterDone);
-
-    await launcherMove(page).click();
-    await page.keyboard.press('ArrowUp');
-    await page.locator('#accessassist-launcher-host #launcher-move-controls button', { hasText: 'Done' }).click();
-    await expect(launcherPanel(page)).toBeHidden();
-    await expect(launcherMove(page)).toBeFocused();
-    const afterDoneButton = await storedLauncher(worker);
-    expect(afterDoneButton.y).toBeLessThan(afterDone.y);
-
-    await page.evaluate(() => {
-      window.__aaPageKeys = [];
-      window.addEventListener('keydown', (event) => window.__aaPageKeys.push(event.key));
-    });
-    await launcherMove(page).click();
-    await page.locator('#name').click();
-    await expect(launcherPanel(page)).toBeHidden();
-    await expect(page.locator('#name')).toBeFocused();
-    await page.keyboard.press('ArrowRight');
-    await page.keyboard.press('1');
-    expect(await page.evaluate(() => window.__aaPageKeys)).toEqual(['ArrowRight', '1']);
-    expect(await storedLauncher(worker)).toEqual(afterDoneButton);
 
     const tabId = await worker.evaluate(async () => {
       const tabs = await chrome.tabs.query({});
@@ -1254,6 +1157,19 @@ test('launcher movement has non-drag controls and drag cannot click through', as
     });
     await worker.evaluate((id) => chrome.tabs.sendMessage(id, { type: 'FOCUS_LAUNCHER' }), tabId);
     await expect.poll(async () => (await launcherState(page)).active).toBe('launcher-open');
+    const keyStart = await storedLauncher(worker);
+    await page.evaluate(() => {
+      window.__aaPageKeys = [];
+      window.addEventListener('keydown', (event) => window.__aaPageKeys.push(event.key));
+    });
+    const beforeKey = await launcherState(page);
+    await page.keyboard.press('Shift+ArrowLeft');
+    await expect.poll(async () => (await storedLauncher(worker)).x).toBeLessThan(keyStart.x);
+    const afterKey = await launcherState(page);
+    expect(beforeKey.left - afterKey.left).toBeGreaterThan(15);
+    expect(afterKey.active).toBe('launcher-open');
+    expect(await page.evaluate(() => window.__aaPageKeys)).not.toContain('ArrowLeft');
+    expect(await sessionIntents(worker)).toEqual([]);
     await clearIntents(worker);
     await watchIntentEvents(worker);
     await page.keyboard.press('Enter');
@@ -1263,7 +1179,7 @@ test('launcher movement has non-drag controls and drag cannot click through', as
   }
 });
 
-test('launcher broadcasts and hides its controls from page observation', async ({}, testInfo) => {
+test('launcher broadcasts its position and hides from page observation', async ({}, testInfo) => {
   const { context, extensionId, worker } = await launch();
   try {
     await resetMock();
@@ -1274,11 +1190,8 @@ test('launcher broadcasts and hides its controls from page observation', async (
     const panel = await openPanel(context, extensionId);
 
     await other.bringToFront();
-    await launcherMove(other).click();
-    await other.locator('#accessassist-launcher-host button[aria-label="Move left"]').click();
-    await other.locator('#accessassist-launcher-host button[aria-label="Move up"]').click();
-    await other.locator('#accessassist-launcher-host #launcher-move-controls button', { hasText: 'Done' }).click();
-    await expect.poll(async () => (await launcherState(other)).moveOpen).toBe(false);
+    await dragLauncher(other, { dx: -200, dy: -150 });
+    await expect.poll(async () => (await storedLauncher(worker)).x).toBeLessThan(1);
     const saved = await storedLauncher(worker);
     expect(saved.x).toBeLessThan(1);
     expect(saved.y).toBeLessThan(1);
@@ -1288,9 +1201,6 @@ test('launcher broadcasts and hides its controls from page observation', async (
       (await launcherState(page)).viewport.width - (await launcherState(page)).bar.width - 32
     ), 0);
 
-    await launcherMove(page).click();
-    await page.keyboard.press('ArrowLeft');
-    expect((await launcherState(page)).moveOpen).toBe(true);
     const beforeBroadcast = await storedLauncher(worker);
     const otherTabId = await worker.evaluate(async () => {
       const tabs = await chrome.tabs.query({});
@@ -1304,17 +1214,9 @@ test('launcher broadcasts and hides its controls from page observation', async (
         args: [position],
       });
     }, { tabId: otherTabId, position: broadcast });
-    await expect.poll(async () => (await launcherState(page)).moveOpen).toBe(false);
     await expect.poll(() => storedLauncher(worker)).toEqual(broadcast);
     expect(await storedLauncher(worker)).not.toEqual(beforeBroadcast);
-    await expect.poll(async () => (await launcherState(page)).active).toBe('launcher-move');
 
-    await launcherMove(page).click();
-    await page.keyboard.press('ArrowRight');
-    await testInfo.attach('launcher-move-open', {
-      body: await page.screenshot({ path: testInfo.outputPath('launcher-move-open.png') }),
-      contentType: 'image/png',
-    });
     const observation = await panel.evaluate(async () => {
       const tabs = await chrome.tabs.query({});
       const tab = tabs.find((candidate) => candidate.url?.includes('/article'));
@@ -1330,8 +1232,6 @@ test('launcher broadcasts and hides its controls from page observation', async (
     expect(observation.visual?.dataUrl).toMatch(/^data:image\/png;base64,/u);
     const serialized = JSON.stringify(observation);
     expect(serialized).not.toContain('Open the AccessAssist assistant');
-    expect(serialized).not.toContain('Move Assistant button');
-    expect(serialized).not.toContain('Choose Done to save or Cancel to restore');
     const observationPng = Buffer.from(observation.visual.dataUrl.split(',')[1], 'base64');
     fs.writeFileSync(testInfo.outputPath('launcher-observation.png'), observationPng);
     await testInfo.attach('launcher-observation', {
@@ -1346,7 +1246,7 @@ test('launcher broadcasts and hides its controls from page observation', async (
 });
 
 
-test('composer number keys send, prepare, pause, repeat, cancel, and open settings', async () => {
+test('composer number keys prepare, pause, repeat, cancel, and open settings', async () => {
   const { context, extensionId } = await launch({
     voice: { available: 'downloadable', permission: 'prompt', gum: 'grant' },
   });
@@ -1357,34 +1257,32 @@ test('composer number keys send, prepare, pause, repeat, cancel, and open settin
     expect((await voiceState(panel)).starts).toBe(0);
 
     await panel.locator('#listen').focus();
-    await expect(panel.locator('#listen')).toHaveText('2 Prepare voice');
-    await panel.keyboard.press('Control+Shift+2');
+    await expect(panel.locator('#listen')).toHaveText('1 Prepare voice');
+    await panel.keyboard.press('Control+Shift+1');
     await expect.poll(async () => await announcements(panel), { timeout: 10_000 })
       .toContain('Voice ready.');
     expect((await voiceState(panel)).starts).toBe(0);
 
     await panel.locator('#pause').focus();
-    await panel.keyboard.press('Control+Shift+3');
+    await panel.keyboard.press('Control+Shift+2');
     await expect.poll(async () => await announcements(panel)).toContain('Paused.');
     await expect.poll(async () => (await voiceState(panel)).active).toBe(false);
 
-    await panel.locator('#message').fill('What is this page about? Read the second paragraph.');
-    await panel.locator('#send').focus();
-    await panel.keyboard.press('Control+Shift+1');
+    await sendText(panel, 'What is this page about? Read the second paragraph.');
     await expect(panel.locator('#ask-question')).toContainText('page text', { timeout: 15_000 });
 
     const beforeRepeat = await announcements(panel);
     await panel.locator('#repeat').focus();
-    await panel.keyboard.press('Control+Shift+4');
+    await panel.keyboard.press('Control+Shift+3');
     await expect.poll(async () => (await announcements(panel)).length).toBeGreaterThan(beforeRepeat.length);
     await expect(panel.locator('#ask-question')).toContainText('page text');
 
     await panel.locator('#cancel').focus();
-    await panel.keyboard.press('Control+Shift+5');
+    await panel.keyboard.press('Control+Shift+4');
     await expect(panel.locator('#ask')).toBeHidden();
 
     await expect(panel.locator('#settings')).toHaveJSProperty('open', false);
-    await panel.locator('#send').focus();
+    await panel.locator('#listen').focus();
     await panel.keyboard.press('Control+Shift+8');
     await expect(panel.locator('#settings')).toHaveJSProperty('open', true);
     // Focus followed the click; 8 in the settings group closes it again.
@@ -1401,7 +1299,7 @@ test('settings number keys save, expand, replay, and follow links', async () => 
     await resetMock();
     await openFixture(context, '/article');
     const panel = await openPanel(context, extensionId);
-    await panel.locator('#send').focus();
+    await panel.locator('#listen').focus();
     await panel.keyboard.press('Control+Shift+8');
     await expect(panel.locator('#settings')).toHaveJSProperty('open', true);
 
@@ -1467,7 +1365,7 @@ test('numbered undo restores the original native checkbox set', async () => {
     await expect(page.locator('input[aria-label="Monday 14:00"]')).toBeChecked();
 
     await panel.locator('#undo').focus();
-    await panel.keyboard.press('Control+Shift+6');
+    await panel.keyboard.press('Control+Shift+5');
     await expect(panel.locator('#ask-question')).toContainText('Undo this change?');
     // Screen-reader mode keeps the user's focus so the announcement is not cut
     // off; the first number still answers the open question.

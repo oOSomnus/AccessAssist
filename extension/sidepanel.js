@@ -50,7 +50,7 @@ function introText() {
 function helpText() {
   return [
     'You can ask what this page is about, have me read a section, or ask me to operate the page.',
-    'When there are choices, say one or press Control plus Shift plus a number key. In the message box numbers only type text, and Control plus Enter sends.',
+    'When there are choices, say one or press Control plus Shift plus a number key.',
     `${listenSentence()} for one new command; I listen only then.`,
     'Say cancel to drop the current question, or undo to undo your last change.',
     replaySentence(),
@@ -223,9 +223,8 @@ function replaySentence() {
 }
 
 function updateModeLine() {
-  const input = state.mode === 'voice' ? 'voice' : 'typing';
-  $('mode-line').textContent = `Guide mode; input: ${input}`;
-  $('listen').textContent = state.voiceReady ? '2 Listen' : '2 Prepare voice';
+  $('mode-line').textContent = 'Guide mode';
+  $('listen').textContent = state.voiceReady ? '1 Listen' : '1 Prepare voice';
 }
 
 function setVoiceStatus(text) {
@@ -434,7 +433,7 @@ async function onVoiceResult(text, info, choiceSetId) {
   if (!readback.delivered) {
     if (!readback.interrupted) {
       speech.writeStatus(
-        `Your spoken input was not used because its readback could not finish. Check that your screen reader is working. ${listenAction()} to try again, or type instead.`,
+        `Your spoken input was not used because its readback could not finish. Check that your screen reader is working. ${listenAction()} to try again.`,
         true,
       );
     }
@@ -478,12 +477,12 @@ async function onVoiceError(error) {
     state.voiceReady = false;
     state.voiceRetry = true;
     updateVoiceSetup({ local: 'unavailable', mic: state.micState, ready: false });
-    await say('Chrome cannot recognize English on this device. You can type instead.', { alert: true });
+    await say('Chrome cannot recognize English on this device.', { alert: true });
   } else {
     state.voiceReady = false;
     state.voiceRetry = true;
     updateVoiceSetup({ local: speech.localStatus, mic: state.micState, ready: false });
-    await say(`Speech recognition stopped: ${error}. ${listenAction()} to try again, or type instead.`, { alert: true });
+    await say(`Speech recognition stopped: ${error}. ${listenAction()} to try again.`, { alert: true });
   }
   updateModeLine();
 }
@@ -492,14 +491,14 @@ function voiceStartError(error) {
   switch (error?.code) {
     case 'unsupported':
     case 'local':
-      return 'Local speech recognition is unavailable in this Chrome. You can type instead.';
+      return 'Local speech recognition is unavailable in this Chrome.';
     case 'unavailable':
     case 'install':
-      return 'The English speech pack is not ready yet. Choose Retry, or type instead.';
+      return 'The English speech pack is not ready yet. Choose Retry.';
     case 'audio-capture':
-      return 'System audio cancellation is unavailable for this recording. Speech did not start. You can type instead.';
+      return 'System audio cancellation is unavailable for this recording. Speech did not start.';
     case 'unsupported-input':
-      return 'This system cannot isolate the microphone for local recognition. You can type instead.';
+      return 'This system cannot isolate the microphone for local recognition.';
     case 'not-allowed':
     case 'service-not-allowed':
       return `Microphone permission was denied. Allow it in Chrome and system settings. ${listenAction()} to try again.`;
@@ -509,18 +508,18 @@ function voiceStartError(error) {
       return `Listening did not start because its prompt could not be delivered. Check that your screen reader is working. ${listenAction()} to try again.`;
     case 'start':
     case 'start-timeout':
-      return `Chrome could not start speech recognition. ${listenAction()} to try again, or type instead.`;
+      return `Chrome could not start speech recognition. ${listenAction()} to try again.`;
     default:
       return `Voice unavailable: ${error?.message ?? 'try again'}`;
   }
 }
 
 function voiceBlockedMessage({ local, mic }) {
-  if (local === 'unavailable') return 'Local speech recognition is not available in this Chrome. You can type instead.';
-  if (local === 'error') return 'Chrome could not check the English speech pack. Choose Retry, or type instead.';
+  if (local === 'unavailable') return 'Local speech recognition is not available in this Chrome.';
+  if (local === 'error') return 'Chrome could not check the English speech pack. Choose Retry.';
   if (mic === 'denied') return `Microphone access is denied. Allow it in Chrome and system settings. ${listenAction()} to try again.`;
   if (local === 'available' && mic === 'granted') {
-    return `${listenSentence()}, or type instead.`;
+    return `${listenSentence()}.`;
   }
   return 'Microphone access is required before voice can start. Choose Prepare voice and allow Chrome to use the microphone.';
 }
@@ -537,13 +536,13 @@ function updateVoiceSetup({ local, mic, ready, preparing = Boolean(state.prepari
     $('start-using').hidden = ready || preparing || local === 'downloading';
     $('start-using').textContent = retry ? '1 Retry' : '1 Prepare voice';
     if (ready) setVoiceStatus('Microphone access is granted. Speech is ready on this device.');
-    else if (local === 'unavailable') setVoiceStatus('This Chrome cannot recognize speech on this device. Use the assistant another way.');
+    else if (local === 'unavailable') setVoiceStatus('This Chrome cannot recognize speech on this device.');
     else if (local === 'error') setVoiceStatus('Chrome could not check the English speech pack. Choose Retry.');
     else if (mic === 'denied') setVoiceStatus('Microphone access is denied. Allow it in Chrome site settings and system settings, then choose Retry.');
     else if (preparing) setVoiceStatus('Chrome is preparing the English speech pack and will ask for the microphone. Allow it when Chrome asks.');
     else if (local === 'downloadable' || local === 'downloading') {
       setVoiceStatus('Chrome needs the English speech pack. Choose Prepare voice to start.');
-    } else if (mic === 'granted') setVoiceStatus('Waiting for the English speech pack. You can type in the main panel meanwhile.');
+    } else if (mic === 'granted') setVoiceStatus('Waiting for the English speech pack.');
     else if (retry) setVoiceStatus('Voice is not ready. Choose Retry to try again.');
     else setVoiceStatus('Press Prepare voice to check the microphone and prepare speech.');
     return;
@@ -557,22 +556,22 @@ function updateVoiceSetup({ local, mic, ready, preparing = Boolean(state.prepari
   $('start-using').hidden = (preparing || local === 'downloading') && !retry;
   $('start-using').textContent = retry ? '1 Retry' : '1 Prepare voice';
   if (local === 'unavailable') {
-    setVoiceStatus('This Chrome cannot recognize speech on this device. Choose Retry after enabling local speech, or type instead.');
+    setVoiceStatus('This Chrome cannot recognize speech on this device. Choose Retry after enabling local speech.');
   } else if (local === 'error') {
-    setVoiceStatus('Chrome could not check the English speech pack. Choose Retry, or type instead.');
+    setVoiceStatus('Chrome could not check the English speech pack. Choose Retry.');
   } else if (mic === 'denied') {
     setVoiceStatus('Microphone access is denied. Allow it in Chrome site settings and system settings, then choose Retry.');
   } else if (preparing) {
-    setVoiceStatus('Chrome is preparing the English speech pack and will ask for the microphone. You can type while it finishes.');
+    setVoiceStatus('Chrome is preparing the English speech pack and will ask for the microphone.');
   } else if (local === 'downloadable' || local === 'downloading') {
     setVoiceStatus('The English speech pack is not ready. Choose Prepare voice to start.');
   } else if (mic === 'granted') {
     setVoiceStatus(retry
-      ? 'Voice is not ready. Choose Retry to try again, or type instead.'
+      ? 'Voice is not ready. Choose Retry to try again.'
       : `Speech is ready. ${listenSentence()}.`);
   } else {
     setVoiceStatus(retry
-      ? 'Voice is not ready. Choose Retry to try again, or type instead.'
+      ? 'Voice is not ready. Choose Retry to try again.'
       : 'Voice needs microphone permission. Choose Prepare voice to start.');
   }
 }
@@ -623,7 +622,7 @@ function ensureLocalWatch() {
     signal: controller.signal,
     onSlow: () => {
       if (controller.signal.aborted) return;
-      setVoiceStatus('The English speech pack is still downloading. You can type while it continues in the background.');
+      setVoiceStatus('The English speech pack is still downloading. It continues in the background.');
     },
     onStatus: (local) => {
       speech.localStatus = local;
@@ -656,7 +655,7 @@ function startPreparation({ setup = false, force = false } = {}) {
     signal: abort.signal,
     onSlow: () => {
       if (generation === state.voiceGeneration && !state.voiceReady) {
-        setVoiceStatus('The English speech pack is still downloading. You can type while the panel keeps checking.');
+        setVoiceStatus('The English speech pack is still downloading. The panel keeps checking.');
       }
     },
     onStatus: (status) => {
@@ -684,8 +683,8 @@ function startPreparation({ setup = false, force = false } = {}) {
   const waitTimer = setTimeout(() => {
     if (generation !== state.voiceGeneration) return;
     setVoiceStatus(state.micState === 'granted'
-      ? 'Waiting for the English speech pack. You can type meanwhile.'
-      : 'Waiting for Chrome microphone permission. You can type meanwhile.');
+      ? 'Waiting for the English speech pack.'
+      : 'Waiting for Chrome microphone permission.');
     $('open-setup').hidden = false;
   }, START_ACTIVATION_TIMEOUT_MS);
   const pending = finishPreparation({ generation, install, local, microphone, waitTimer, setup, abort })
@@ -830,10 +829,10 @@ async function finishPreparation({ generation, install, local, microphone, waitT
   if (failure?.kind === 'local') {
     abort.abort();
     const message = failure.status === 'unavailable'
-      ? 'This Chrome cannot recognize speech on this device. You can type instead.'
+      ? 'This Chrome cannot recognize speech on this device.'
       : failure.status === 'error'
-        ? 'Chrome could not check the English speech pack. Choose Retry, or type instead.'
-        : 'Chrome could not finish preparing the English speech pack. Choose Retry, or type instead.';
+        ? 'Chrome could not check the English speech pack. Choose Retry.'
+        : 'Chrome could not finish preparing the English speech pack. Choose Retry.';
     return stopPreparation({
       generation,
       message,
@@ -845,7 +844,7 @@ async function finishPreparation({ generation, install, local, microphone, waitT
   if (failure?.kind === 'install') {
     abort.abort();
     const message = failure.error?.code === 'unsupported'
-      ? 'This Chrome does not support local speech recognition. You can type instead.'
+      ? 'This Chrome does not support local speech recognition.'
       : `The English speech pack could not be prepared: ${failure.error?.message ?? 'Chrome did not accept the download'}`;
     return stopPreparation({
       generation,
@@ -869,7 +868,7 @@ async function finishPreparation({ generation, install, local, microphone, waitT
     return true;
   }
   if (!state.apiKey) {
-    state.mode = 'typing';
+    state.mode = 'idle';
     updateModeLine();
     await say('Voice is ready. Paste your OpenCode Go API key. The service and model are already set.');
     openSettingsForKey();
@@ -911,7 +910,7 @@ async function requestVoice() {
   }
   const prepared = await prepareVoice({ force: true });
   if (!prepared) return false;
-  // Missing API key switches to typing and already explains what to paste.
+  // A missing API key leaves voice idle and already explains what to paste.
   if (state.mode !== 'voice') return true;
   enterVoice();
   await say(`Voice ready. ${listenSentence()}.`);
@@ -951,8 +950,8 @@ function choiceKeyboardHint() {
   return `${base} once the assistant has keyboard focus. ${cycle}, then Tab into the assistant. Press Escape to cancel.`;
 }
 
-// Programmatic focus is safe only when the user is not typing or changing
-// settings and no voice recovery button needs the keyboard.
+// Programmatic focus is safe only when the user is not editing a field and no
+// voice recovery button needs the keyboard.
 function choiceFocusAllowed() {
   if (state.deferChoiceFocus || !document.hasFocus()) return false;
   const active = document.activeElement;
@@ -1029,17 +1028,11 @@ function hideChoice() {
   // makes a screen reader reannounce the panel instead of naming a control.
   if (restore && document.visibilityState === 'visible' && document.hasFocus()) {
     const target = trigger && usableNumberTarget(trigger) && choiceTriggerFor(trigger);
-    // The Message focus listener would otherwise enter focusComposer and reset
-    // a draft's selection; setting typing first keeps the existing caret.
-    if (target === $('message')) {
-      state.mode = 'typing';
-      updateModeLine();
-    }
     if (target) target.focus();
     if (document.activeElement !== target) {
-      state.mode = 'typing';
+      state.mode = 'idle';
       updateModeLine();
-      $('message').focus({ preventScroll: true });
+      $('listen').focus({ preventScroll: true });
     }
   }
   $('ask').hidden = true;
@@ -1110,7 +1103,7 @@ function handleNumberShortcut(event) {
   // Native selects keep their own type-ahead.
   if (target instanceof HTMLElement && target.matches('select')) return;
   // A text field has no own number group, so an open question stays answerable
-  // from the message box; other focused groups keep their own numbers.
+  // from a settings field; other focused groups keep their own numbers.
   const editable = target instanceof HTMLElement && (
     target.matches('textarea, [contenteditable="true"]')
     || (target.matches('input') && !target.matches('input[type="radio"], input[type="checkbox"], input[type="button"], input[type="submit"]'))
@@ -1267,7 +1260,6 @@ async function handleChoiceText(raw, choiceSetId) {
   if (!current) return;
   if (choiceSetId && current.set.id !== choiceSetId) return;
   const text = String(raw ?? '').trim();
-  clearComposer();
   if (!text) {
     await say('Please choose one of the choices.');
     repeatChoice();
@@ -1294,18 +1286,12 @@ async function handleChoiceText(raw, choiceSetId) {
   repeatChoice();
 }
 
-function clearComposer() {
-  $('message').value = '';
-}
-
-function focusComposer() {
+function focusListen() {
   interruptOutput();
   cancelVoice();
-  state.mode = 'typing';
+  state.mode = 'idle';
   updateModeLine();
-  if (document.activeElement === $('message')) return;
-  $('message').focus();
-  $('message').setSelectionRange($('message').value.length, $('message').value.length);
+  if (document.activeElement !== $('listen')) $('listen').focus();
 }
 
 function openSettingsForKey({ advanced = false } = {}) {
@@ -1558,7 +1544,6 @@ async function runTurn(text) {
   state.callsThisTurn = 0;
   state.history.push({ role: 'user', content: text });
   addTranscript('user', text);
-  clearComposer();
   syncWorking();
   try {
     if (!(await apiReady())) return;
@@ -1619,7 +1604,7 @@ async function submitMessage(raw) {
   }
   const text = String(raw ?? '').trim();
   if (!text) {
-    await say('The message is empty. Type something.');
+    await say('I did not hear a command.');
     return;
   }
   state.audioPaused = false;
@@ -2444,8 +2429,8 @@ function resetConversation() {
   syncWorking();
 }
 
-// An unanswered question wins focus; otherwise the composer does. This never
-// prepares voice or opens the microphone.
+// An unanswered question wins focus; otherwise the Listen button does. This
+// never prepares voice or opens the microphone.
 function focusEntryTarget({ requestWindowFocus = true } = {}) {
   // An explicit open shortcut is the one request allowed to take keyboard focus
   // from the page; automatic replies keep deferring to the current control.
@@ -2454,13 +2439,13 @@ function focusEntryTarget({ requestWindowFocus = true } = {}) {
   if (!$('ask').hidden) {
     const first = $('ask-options').querySelector('button');
     if (first) {
-      state.mode = 'typing';
+      state.mode = 'idle';
       updateModeLine();
       if (document.activeElement !== first) first.focus();
       return;
     }
   }
-  focusComposer();
+  focusListen();
 }
 
 async function handleEntryIntent(intent) {
@@ -2471,12 +2456,12 @@ async function handleEntryIntent(intent) {
   cancelVoice();
   // A warm open notification already transferred keyboard focus before the
   // serialized claim; asking the window again would repeat its announcement.
-  const notified = intent.mode === 'typing' && intent.source === 'command'
+  const notified = intent.mode === 'open' && intent.source === 'command'
     && state.requestedIntents.has(intent.id);
   focusEntryTarget({ requestWindowFocus: !notified });
   state.audioPaused = false;
   state.voiceRetry = false;
-  if (intent.mode === 'typing') {
+  if (intent.mode === 'open') {
     return;
   }
   if (intent.mode === 'intro') {
@@ -2628,7 +2613,7 @@ function bindEvents() {
     const target = event.target;
     if (!(target instanceof Element)) return;
     if (event.type === 'keydown' && /^(Control|Shift|Alt|Meta)$/u.test(event.key)) return;
-    const control = target.closest('button, input, select, textarea, summary, a[href], [contenteditable="true"]');
+    const control = target.closest('button, input, select, summary, a[href], [contenteditable="true"]');
     if (!control) return;
     // Choice buttons validate their own set before consuming anything.
     if (!$('ask').hidden && $('ask').contains(control)) return;
@@ -2638,22 +2623,12 @@ function bindEvents() {
   document.addEventListener('keydown', interruptFrom, true);
   document.addEventListener('focusin', (event) => {
     if (!(event.target instanceof Element)) return;
-    if (!event.target.matches('input, textarea, select, [contenteditable="true"]')) return;
+    if (!event.target.matches('input, select, [contenteditable="true"]')) return;
     interruptOutput();
-  });
-  $('composer').addEventListener('submit', (event) => {
-    event.preventDefault();
-    const text = $('message').value;
-    void (state.choice ? handleChoiceText(text, state.choice.set.id) : submitMessage(text));
-  });
-  $('message').addEventListener('focus', () => {
-    if (state.mode !== 'typing') {
-      focusComposer();
-    }
   });
   $('api-key').addEventListener('focus', () => {
     cancelVoice();
-    state.mode = 'typing';
+    state.mode = 'idle';
     updateModeLine();
   });
   $('listen').addEventListener('click', () => {
@@ -2681,20 +2656,13 @@ function bindEvents() {
   $('protocol').addEventListener('change', toggleAnthropicFields);
   document.addEventListener('keydown', handleNumberShortcut);
   document.addEventListener('keydown', (event) => {
-    if ((event.ctrlKey || event.metaKey) && event.key === 'Enter') {
-      if (event.target === $('message')) {
-        event.preventDefault();
-        $('composer').requestSubmit();
-      }
-      return;
-    }
-    if (event.key === 'Escape') {
-      const handle = Boolean(state.choice) || event.target === $('message');
-      if (handle) {
-        event.preventDefault();
-        void handleEscape(event.target);
-      }
-      return;
+    if (event.key !== 'Escape') return;
+    if (state.choice) {
+      event.preventDefault();
+      finishChoice(state.choice.set.id, null, 'cancelled');
+    } else if (state.busy) {
+      event.preventDefault();
+      void cancelFromButton();
     }
   });
   document.addEventListener('pointerdown', () => void speech.resumeAudio(), { once: true });
@@ -2812,32 +2780,6 @@ async function undoFromButton() {
   }
 }
 
-async function handleEscape(target) {
-  if (state.choice) {
-    finishChoice(state.choice.set.id, null, 'cancelled');
-    return;
-  }
-  if (state.busy) {
-    await cancelFromButton();
-    return;
-  }
-  if (!(target instanceof HTMLElement) || target.id !== 'message') return;
-  await returnToVoice();
-}
-
-function returnToVoice() {
-  if (state.busy) preemptTurn();
-  state.abort?.abort();
-  state.toolAbort?.abort();
-  state.userCancelled = true;
-  interruptOutput();
-  cancelVoice();
-  state.mode = 'voice';
-  state.audioPaused = false;
-  updateModeLine();
-  speech.writeStatus(`Voice mode. ${listenSentence()}.`);
-}
-
 // Restores the page entrance only when that page still exists in this window
 // and is its active tab; protected or vanished pages simply keep their focus.
 async function restoreLauncherFocus() {
@@ -2933,7 +2875,7 @@ function receiveEntryIntent(intent) {
   // Act on the explicit open before the serialized claim resolves; waiting for
   // storage would leave keyboard focus on the page. Cold-start handling in
   // handleEntryIntent still focuses again after initialization.
-  if (intent.mode === 'typing' && intent.source === 'command') focusEntryTarget();
+  if (intent.mode === 'open' && intent.source === 'command') focusEntryTarget();
   claimEntry(intent.id);
 }
 
@@ -2968,6 +2910,7 @@ async function initializePanel() {
     openSettingsForKey();
   }
   state.ready = true;
+  document.body.dataset.ready = 'true';
   intent = latestIntent(intent, state.pendingIntent);
   state.pendingIntent = null;
   if (!isForThisWindow(intent)) intent = null;

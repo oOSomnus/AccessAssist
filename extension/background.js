@@ -288,7 +288,7 @@ chrome.commands.onCommand.addListener(async (command, tab) => {
   }
   // Only the declared entry shortcuts create intents; only listen-once may
   // authorize a microphone session.
-  const mode = command === 'open-assistant' ? 'typing'
+  const mode = command === 'open-assistant' ? 'open'
     : command === 'listen-once' ? 'voice'
       : command === 'replay-introduction' ? 'intro'
         : null;

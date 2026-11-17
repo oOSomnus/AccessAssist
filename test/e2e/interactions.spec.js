@@ -333,6 +333,23 @@ test('Cancel releases a held press and later actions still work', async () => {
   }
 });
 
+test('Escape cancels a busy turn when no choice is open', async () => {
+  const { context, extensionId } = await launch();
+  try {
+    await resetMock();
+    const page = await openFixture(context, '/interaction-pointer');
+    const panel = await openPanel(context, extensionId);
+    await sendText(panel, 'Interaction cancel hold');
+    await answerWhen(panel, 'page text', 0);
+    await run(panel);
+    await panel.keyboard.press('Escape');
+    await expect.poll(() => announcements(panel)).toContain('Cancelled the current action.');
+    await expect(page.locator('#held')).toHaveText('0');
+  } finally {
+    await context.close();
+  }
+});
+
 test('Shift extends the selection and does not stick to the next click', async () => {
   const { context, extensionId } = await launch();
   try {

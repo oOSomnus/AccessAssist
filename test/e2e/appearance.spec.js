@@ -1,5 +1,5 @@
 import { expect, test } from '@playwright/test';
-import { announcements, launch, openFixture, openPanel, resetMock, voiceState } from './helpers.js';
+import { announcements, launch, openFixture, openPanel, resetMock, sendText, voiceState } from './helpers.js';
 
 async function attachScreenshot(page, testInfo, name) {
   await testInfo.attach(name, {
@@ -36,8 +36,8 @@ test('appearance: conversation scroll keeps the composer reachable', async ({}, 
     await expect(panel.locator('#close-panel')).toHaveCount(1);
     await expect(panel.locator('#close-panel')).toHaveAccessibleName('Close panel');
     await expect(panel.locator('#close-panel')).toHaveText('Close');
-    await expect(panel.locator('#composer-hint')).toHaveText('Control or Command plus Enter sends.');
-    await expect(panel.locator('#pause')).toHaveText('3 Stop listening');
+    await expect(panel.locator('textarea')).toHaveCount(0);
+    await expect(panel.locator('#pause')).toHaveText('2 Stop listening');
     expect(await panel.evaluate(() => {
       const ask = document.getElementById('ask');
       const conversation = document.getElementById('conversation');
@@ -45,13 +45,11 @@ test('appearance: conversation scroll keeps the composer reachable', async ({}, 
     })).toBe(true);
     await attachScreenshot(panel, testInfo, 'conversation-empty-391x904');
 
-    await panel.locator('#message').fill('UI layout sample');
-    await panel.locator('#send').click();
+    await sendText(panel, 'UI layout sample');
     await expect(panel.locator('.message-body', { hasText: 'I heard you.' })).toHaveCount(1, { timeout: 30_000 });
     await expect(panel.locator('.message-body').filter({ hasText: 'UI layout sample' })).toHaveCount(1);
 
-    await panel.locator('#message').fill('layout '.repeat(500).trim());
-    await panel.locator('#send').click();
+    await sendText(panel, 'layout '.repeat(500).trim());
     await expect(panel.locator('.message-body', { hasText: 'I heard you.' })).toHaveCount(2, { timeout: 30_000 });
     await expect(panel.locator('#transcript')).toHaveAttribute('aria-busy', 'false', { timeout: 30_000 });
     await expect(panel.locator('.conversation-empty')).toBeHidden();
@@ -60,8 +58,8 @@ test('appearance: conversation scroll keeps the composer reachable', async ({}, 
     const layout = await panel.evaluate(() => {
       const list = document.getElementById('transcript');
       const content = document.querySelector('.panel-content');
-      const message = document.getElementById('message').getBoundingClientRect();
-      const send = document.getElementById('send').getBoundingClientRect();
+      const listen = document.getElementById('listen').getBoundingClientRect();
+      const undo = document.getElementById('undo').getBoundingClientRect();
       const items = [...list.children].map((item) => {
         const rect = item.getBoundingClientRect();
         const body = item.querySelector('.message-body');
@@ -85,8 +83,8 @@ test('appearance: conversation scroll keeps the composer reachable', async ({}, 
         scrollable: content.scrollHeight > content.clientHeight,
         panelTop: content.getBoundingClientRect().top,
         panelBottom: content.getBoundingClientRect().bottom,
-        messageTop: message.top,
-        sendBottom: send.bottom,
+        listenTop: listen.top,
+        undoBottom: undo.bottom,
         viewportHeight: window.innerHeight,
         user,
         assistant,
@@ -103,12 +101,11 @@ test('appearance: conversation scroll keeps the composer reachable', async ({}, 
     for (const item of layout.items) expect(item.overflow).toBeLessThanOrEqual(0);
     expect(layout.assistant.top).toBeGreaterThanOrEqual(layout.panelTop - 1);
     expect(layout.assistant.bottom).toBeLessThanOrEqual(layout.panelBottom + 1);
-    expect(layout.messageTop).toBeGreaterThanOrEqual(0);
-    expect(layout.sendBottom).toBeLessThanOrEqual(layout.viewportHeight);
+    expect(layout.listenTop).toBeGreaterThanOrEqual(0);
+    expect(layout.undoBottom).toBeLessThanOrEqual(layout.viewportHeight);
 
     // The composer still sends after the transcript has grown and scrolled.
-    await panel.locator('#message').fill('Again');
-    await panel.locator('#send').click();
+    await sendText(panel, 'Again');
     await expect(panel.locator('.message-body', { hasText: 'I heard you.' })).toHaveCount(3, { timeout: 30_000 });
     await expect(panel.locator('#transcript')).toHaveAttribute('aria-busy', 'false', { timeout: 30_000 });
 
@@ -117,7 +114,7 @@ test('appearance: conversation scroll keeps the composer reachable', async ({}, 
     await expect(panel.locator('#settings')).toHaveJSProperty('open', true);
     await panel.locator('#api-key').scrollIntoViewIfNeeded();
     await expect(panel.locator('#api-key')).toBeVisible();
-    for (const id of ['send', 'listen', 'pause', 'repeat', 'cancel', 'undo', 'close-panel']) {
+    for (const id of ['listen', 'pause', 'repeat', 'cancel', 'undo', 'close-panel']) {
       await expect(panel.locator(`#${id}`)).toBeVisible();
       await expect(panel.locator(`#${id}`)).toBeEnabled();
     }
@@ -125,12 +122,12 @@ test('appearance: conversation scroll keeps the composer reachable', async ({}, 
 
     const readTheme = () => panel.evaluate(() => {
       const body = getComputedStyle(document.body);
-      const input = getComputedStyle(document.getElementById('message'));
+      const control = getComputedStyle(document.getElementById('pause'));
       const composer = getComputedStyle(document.getElementById('composer'));
       return {
         text: body.color,
         background: body.backgroundColor,
-        border: input.borderTopColor,
+        border: control.borderTopColor,
         surface: composer.backgroundColor,
       };
     });
@@ -144,7 +141,7 @@ test('appearance: conversation scroll keeps the composer reachable', async ({}, 
     expect(contrastRatio(dark.text, dark.background)).toBeGreaterThanOrEqual(4.5);
     expect(contrastRatio(dark.border, dark.surface)).toBeGreaterThanOrEqual(3);
     await panel.keyboard.press('Tab');
-    await panel.locator('#message').focus();
+    await panel.locator('#listen').focus();
     await attachScreenshot(panel, testInfo, 'sidebar-dark-391x904');
 
     await panel.emulateMedia({ forcedColors: 'active', reducedMotion: 'reduce' });
@@ -167,7 +164,7 @@ test('appearance: conversation scroll keeps the composer reachable', async ({}, 
     await panel.locator('.panel-content').evaluate((element) => { element.scrollTop = 0; });
     await attachScreenshot(panel, testInfo, 'sidebar-1000x760');
 
-    expect((await voiceState(panel)).starts).toBe(0);
+    expect((await voiceState(panel)).starts).toBe(3);
     await expect(page.locator('#submits')).toHaveText('0');
   } finally {
     await context.close();
@@ -339,14 +336,10 @@ test('appearance: shortcut help normalizes browser-localized bindings', async ({
         .observe(document.querySelector('.shortcut-help'), {
           subtree: true, childList: true, characterData: true, attributes: true,
         });
-      document.getElementById('message').value = 'draft';
-      document.getElementById('message').setSelectionRange(1, 3);
     });
     await panel.evaluate(() => window.dispatchEvent(new Event('focus')));
     await panel.waitForTimeout(200);
     expect(await panel.evaluate(() => window.__aaHelpMutations)).toBe(0);
-    expect(await panel.locator('#message').evaluate((element) => [element.value, element.selectionStart, element.selectionEnd]))
-      .toEqual(['draft', 1, 3]);
 
     await panel.evaluate(() => {
       window.__aaCommandsFail = true;
@@ -436,8 +429,7 @@ test('appearance: narrow source consent preserves complete origins and keyboard 
       document.body.append(frame);
     }), longOrigin);
 
-    await panel.locator('#message').fill(question);
-    await panel.locator('#message').press('Control+Enter');
+    await sendText(panel, question);
     await expect(panel.locator('#ask-sites')).toBeVisible({ timeout: 30_000 });
     await expect(panel.locator('#ask-sites li')).toHaveCount(2);
     await expect(panel.locator('#ask-sites li').first().locator('span[aria-hidden="true"]'))
@@ -507,12 +499,6 @@ test('appearance: narrow source consent preserves complete origins and keyboard 
     }
 
     await panel.setViewportSize({ width: 391, height: 904 });
-    // Digits typed into the textarea stay text and never consume the choice.
-    await panel.locator('#message').focus();
-    await panel.keyboard.press('2');
-    await expect(panel.locator('#message')).toHaveValue('2');
-    await expect(panel.locator('#ask')).toBeVisible();
-    await expect(panel.locator('#ask-options button')).toHaveCount(3);
 
     await panel.locator('#ask-options button').first().focus();
     // The cancelled turn immediately asks again; record the state restored by
@@ -520,7 +506,7 @@ test('appearance: narrow source consent preserves complete origins and keyboard 
     await panel.evaluate(() => {
       window.__aaEscapeState = null;
       document.addEventListener('focusin', (event) => {
-        if (!window.__aaEscapeState && event.target?.id === 'message') {
+        if (!window.__aaEscapeState && event.target?.id === 'listen') {
           queueMicrotask(() => {
             if (window.__aaEscapeState) return;
             window.__aaEscapeState = {
@@ -540,8 +526,7 @@ test('appearance: narrow source consent preserves complete origins and keyboard 
     await panel.close();
     panel = await openPanel(context, extensionId);
     await panel.setViewportSize({ width: 391, height: 904 });
-    await panel.locator('#message').fill(question);
-    await panel.locator('#message').press('Control+Enter');
+    await sendText(panel, question);
     await expect(panel.locator('#ask-sites')).toBeVisible({ timeout: 30_000 });
     await expect(panel.locator('#ask-sites li')).toHaveCount(2);
     await panel.locator('#ask-options button').first().click();
@@ -672,15 +657,11 @@ test('appearance: setup and launcher remain usable across display modes', async 
       document.getElementById('accessassist-launcher-host')?.shadowRoot?.querySelector('#launcher-open'),
     ))).toBe(true);
     const launcher = page.locator('#accessassist-launcher-host #launcher-open');
-    const moveControl = page.locator('#accessassist-launcher-host #launcher-move');
     await expect(launcher).toHaveAccessibleName(/AccessAssist assistant/);
-    await expect(moveControl).toHaveAccessibleName('Move Assistant button');
+    await expect(page.locator('#accessassist-launcher-host button')).toHaveCount(1);
     const box = await launcher.boundingBox();
     expect(box.width).toBeGreaterThanOrEqual(56);
     expect(box.height).toBeGreaterThanOrEqual(56);
-    const moveBox = await moveControl.boundingBox();
-    expect(moveBox.width).toBeGreaterThanOrEqual(44);
-    expect(moveBox.height).toBeGreaterThanOrEqual(44);
 
     await page.keyboard.press('Tab');
     await launcher.focus();
@@ -727,48 +708,6 @@ test('appearance: setup and launcher remain usable across display modes', async 
     await attachScreenshot(page, testInfo, 'launcher-forced');
     await page.emulateMedia({ forcedColors: 'none', reducedMotion: 'no-preference' });
 
-    await page.setViewportSize({ width: 391, height: 904 });
-    await moveControl.click();
-    await expect(page.locator('#accessassist-launcher-host #launcher-move-controls')).toBeVisible();
-    const moveLayout = await page.evaluate(() => {
-      const host = document.getElementById('accessassist-launcher-host');
-      const root = host.shadowRoot;
-      const panel = root.querySelector('#launcher-move-controls').getBoundingClientRect();
-      const buttons = [...root.querySelectorAll('#launcher-move-controls button')].map((button) => {
-        const rect = button.getBoundingClientRect();
-        return { width: rect.width, height: rect.height, left: rect.left, right: rect.right };
-      });
-      return { panel, buttons, viewport: innerWidth };
-    });
-    expect(moveLayout.panel.left).toBeGreaterThanOrEqual(15);
-    expect(moveLayout.panel.right).toBeLessThanOrEqual(moveLayout.viewport - 15);
-    expect(moveLayout.buttons).toHaveLength(6);
-    for (const button of moveLayout.buttons) {
-      expect(button.width).toBeGreaterThanOrEqual(44);
-      expect(button.height).toBeGreaterThanOrEqual(44);
-      expect(button.left).toBeGreaterThanOrEqual(0);
-      expect(button.right).toBeLessThanOrEqual(moveLayout.viewport);
-    }
-    await attachScreenshot(page, testInfo, 'launcher-move-391x904');
-    await page.emulateMedia({ forcedColors: 'active', reducedMotion: 'reduce' });
-    const forcedMove = await page.evaluate(() => {
-      const root = document.getElementById('accessassist-launcher-host').shadowRoot;
-      const panel = root.querySelector('#launcher-move-controls');
-      const button = root.querySelector('#launcher-move-controls button');
-      return {
-        panelShadow: getComputedStyle(panel).boxShadow,
-        panelBorder: parseFloat(getComputedStyle(panel).borderTopWidth),
-        buttonBorder: parseFloat(getComputedStyle(button).borderTopWidth),
-      };
-    });
-    expect(forcedMove.panelShadow).toBe('none');
-    expect(forcedMove.panelBorder).toBeGreaterThanOrEqual(2);
-    expect(forcedMove.buttonBorder).toBeGreaterThanOrEqual(2);
-    await attachScreenshot(page, testInfo, 'launcher-move-forced');
-    await page.emulateMedia({ forcedColors: 'none', reducedMotion: 'no-preference' });
-    await page.keyboard.press('Escape');
-    await expect(page.locator('#accessassist-launcher-host #launcher-move-controls')).toBeHidden();
-
     await page.setViewportSize({ width: 160, height: 640 });
     const narrowBar = page.locator('#accessassist-launcher-host .launcher-bar');
     // The launcher reapplies its normalized position in the next animation
@@ -781,32 +720,9 @@ test('appearance: setup and launcher remain usable across display modes', async 
     expect(narrow.x).toBeGreaterThanOrEqual(0);
     expect(narrow.x + narrow.width).toBeLessThanOrEqual(160);
     expect(narrow.width).toBeLessThanOrEqual(128);
-    expect(narrow.height).toBeGreaterThanOrEqual(100);
-    expect((await moveControl.boundingBox()).height).toBeGreaterThanOrEqual(44);
+    expect(narrow.height).toBeGreaterThanOrEqual(56);
     expect(await page.evaluate(() => document.querySelectorAll('#accessassist-launcher-host').length)).toBe(1);
     await attachScreenshot(page, testInfo, 'launcher-160x640');
-    await moveControl.click();
-    const narrowMove = await page.evaluate(() => {
-      const root = document.getElementById('accessassist-launcher-host').shadowRoot;
-      const panel = root.querySelector('#launcher-move-controls').getBoundingClientRect();
-      const buttons = [...root.querySelectorAll('#launcher-move-controls button')].map((button) => {
-        const rect = button.getBoundingClientRect();
-        return { width: rect.width, height: rect.height, left: rect.left, right: rect.right };
-      });
-      return { panel, buttons, viewport: innerWidth };
-    });
-    expect(narrowMove.panel.left).toBeGreaterThanOrEqual(15);
-    expect(narrowMove.panel.right).toBeLessThanOrEqual(narrowMove.viewport - 15);
-    expect(narrowMove.panel.width).toBeLessThanOrEqual(narrowMove.viewport - 32);
-    for (const button of narrowMove.buttons) {
-      expect(button.width).toBeGreaterThanOrEqual(44);
-      expect(button.height).toBeGreaterThanOrEqual(44);
-      expect(button.left).toBeGreaterThanOrEqual(0);
-      expect(button.right).toBeLessThanOrEqual(narrowMove.viewport);
-    }
-    await attachScreenshot(page, testInfo, 'launcher-move-160x640');
-    await page.keyboard.press('Escape');
-    await expect(page.locator('#accessassist-launcher-host #launcher-move-controls')).toBeHidden();
 
     await page.setViewportSize({ width: 1000, height: 760 });
     const target = await worker.evaluate(async () => {

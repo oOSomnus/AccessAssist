@@ -27,7 +27,7 @@ const WORKING_FAILURES = 3;
 // Chrome only honors the track overload on these platforms; elsewhere the
 // extra argument can be dropped and the default microphone used instead.
 const ISOLATED_INPUT_OS = new Set(['win', 'mac', 'linux']);
-const ISOLATION_UNAVAILABLE = 'System audio cancellation is unavailable for this recording. Speech did not start. You can type instead.';
+const ISOLATION_UNAVAILABLE = 'System audio cancellation is unavailable for this recording. Speech did not start.';
 
 const wait = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
@@ -613,7 +613,7 @@ export class Speech {
     if (!ISOLATED_INPUT_OS.has(platform)) {
       this.failSession(session, speechError(
         'unsupported-input',
-        'This system cannot isolate the microphone for local recognition. You can type instead.',
+        'This system cannot isolate the microphone for local recognition.',
       ));
       return;
     }
@@ -661,7 +661,7 @@ export class Speech {
     }
     track.onended = () => {
       if (!this.current(session)) return;
-      this.failSession(session, speechError('audio-capture', 'The microphone stopped. Choose Listen to try again, or type instead.'));
+      this.failSession(session, speechError('audio-capture', 'The microphone stopped. Choose Listen to try again.'));
     };
     this.startAttempt(session);
   }
@@ -916,12 +916,12 @@ export class Speech {
         try { attempt.recognition.abort(); } catch {}
         this.failSession(session, speechError(
           'recognition',
-          'Speech recognition stopped before the microphone released. Choose Listen to try again, or type instead.',
+          'Speech recognition stopped before the microphone released. Choose Listen to try again.',
         ));
       }, ABORT_TIMEOUT_MS);
       return;
     }
-    this.failSession(session, speechError(code, `Speech recognition stopped: ${code}. Choose Listen to try again, or type instead.`));
+    this.failSession(session, speechError(code, `Speech recognition stopped: ${code}. Choose Listen to try again.`));
   }
 
   handleEnd(session, attempt) {

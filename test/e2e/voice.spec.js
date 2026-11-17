@@ -43,7 +43,7 @@ test('opening the panel installs nothing and starts no microphone', async () => 
 
     // Numbered preparation may install and prompt, but never opens a command.
     await panel.locator('#listen').focus();
-    await panel.keyboard.press('Control+Shift+2');
+    await panel.keyboard.press('Control+Shift+1');
     await expect.poll(async () => (await voiceState(panel)).installCalls.length, { timeout: 15_000 }).toBe(1);
     await expect.poll(async () => await announcements(panel), { timeout: 15_000 })
       .toContain('Paste your OpenCode Go API key');
@@ -241,7 +241,7 @@ test('a spoken choice is read back and consumes only the original question', asy
     const question = await panel.locator('#ask-question').textContent();
 
     await sendIntent(worker, intent('spoken-one'));
-    await expect.poll(async () => (await voiceState(panel)).starts).toBe(1);
+    await expect.poll(async () => (await voiceState(panel)).starts).toBe(2);
     await expect(panel.locator('#mode-line')).toContainText('Listening. Speak now.');
     await emitFinal(panel, 'one');
     await expect.poll(async () => await announcements(panel)).toContain('I heard: one');
@@ -349,7 +349,7 @@ test('a spoken answer does not move focus, and the next number answers the new c
     await emitFinal(panel, 'What is this page about?');
     await expect(panel.locator('#ask-sites')).toBeVisible();
     await expect(panel.locator('#ask-options button').first()).not.toBeFocused();
-    expect(await panel.evaluate(() => document.activeElement?.id)).toBe('message');
+    expect(await panel.evaluate(() => document.activeElement?.id)).toBe('listen');
     await panel.keyboard.press('Control+Shift+1');
     await expect(panel.locator('#ask')).toBeHidden();
     expect(occurrences(await announcements(panel), 'Selected option 1: Allow.')).toBe(1);
@@ -358,7 +358,7 @@ test('a spoken answer does not move focus, and the next number answers the new c
   }
 });
 
-test('a spoken answer from a focused option restores Message for the next question', async () => {
+test('a spoken answer from a focused option restores Listen for the next question', async () => {
   const { context, extensionId } = await launch();
   try {
     await resetMock();
@@ -374,15 +374,15 @@ test('a spoken answer from a focused option restores Message for the next questi
     await panel.locator('#ask-options button').first().focus();
     await emitFinal(panel, '1');
     await expect(panel.locator('#ask-question')).toContainText('AM or PM', { timeout: 30_000 });
-    await expect(panel.locator('#message')).toBeFocused();
+    await expect(panel.locator('#listen')).toBeFocused();
     await expect(panel.locator('#ask-options button').first()).not.toBeFocused();
-    expect((await voiceState(panel)).starts).toBe(1);
+    expect((await voiceState(panel)).starts).toBe(2);
   } finally {
     await context.close();
   }
 });
 
-test('one warm open request focuses once and preserves the draft caret', async () => {
+test('one warm open request focuses the choice once', async () => {
   const { context, extensionId, worker } = await launch();
   try {
     await resetMock();
@@ -390,8 +390,6 @@ test('one warm open request focuses once and preserves the draft caret', async (
     const panel = await openPanel(context, extensionId);
     await sendText(panel, 'What is this page about?');
     await expect(panel.locator('#ask-sites')).toBeVisible({ timeout: 30_000 });
-    await panel.locator('#message').fill('keep this draft');
-    await panel.evaluate(() => document.getElementById('message').setSelectionRange(2, 6));
 
     await panel.evaluate(() => {
       window.__aaFocus = { window: 0, choice: 0 };
@@ -415,7 +413,7 @@ test('one warm open request focuses once and preserves the draft caret', async (
       };
     });
 
-    await sendIntent(worker, { id: 'held-focus', mode: 'typing', source: 'command', tabId: 0 });
+    await sendIntent(worker, { id: 'held-focus', mode: 'open', source: 'command', tabId: 0 });
     await expect(panel.locator('#ask-options button').first()).toBeFocused();
     expect(await panel.evaluate(() => window.__aaFocus)).toEqual({ window: 1, choice: 1 });
 
@@ -425,15 +423,12 @@ test('one warm open request focuses once and preserves the draft caret', async (
     await panel.evaluate(() => window.__aaReleaseClaim?.());
     await expect(panel.locator('#ask-options button').first()).toBeFocused();
     expect(await panel.evaluate(() => window.__aaFocus)).toEqual({ window: 1, choice: 2 });
-    expect(await panel.locator('#message').inputValue()).toBe('keep this draft');
-    expect(await panel.locator('#message').evaluate((element) => [element.selectionStart, element.selectionEnd]))
-      .toEqual([2, 6]);
   } finally {
     await context.close();
   }
 });
 
-test('an explicit open shortcut focuses the current choice without touching the draft', async () => {
+test('an explicit open shortcut focuses the current choice, else Listen', async () => {
   const { context, extensionId, worker } = await launch();
   try {
     await resetMock();
@@ -441,15 +436,13 @@ test('an explicit open shortcut focuses the current choice without touching the 
     const panel = await openPanel(context, extensionId);
     await sendText(panel, 'What is this page about?');
     await expect(panel.locator('#ask-sites')).toBeVisible();
-    await panel.locator('#message').fill('keep this draft');
-    await sendIntent(worker, { id: 'focus-choice', mode: 'typing', source: 'command', tabId: 0 });
+    await sendIntent(worker, { id: 'focus-choice', mode: 'open', source: 'command', tabId: 0 });
     await expect(panel.locator('#ask-options button').first()).toBeFocused();
-    expect(await panel.locator('#message').inputValue()).toBe('keep this draft');
-    expect((await voiceState(panel)).starts).toBe(0);
+    expect((await voiceState(panel)).starts).toBe(1);
 
     const second = await openPanel(context, extensionId);
-    await sendIntent(worker, { id: 'focus-composer', mode: 'typing', source: 'command', tabId: 0 });
-    await expect(second.locator('#message')).toBeFocused();
+    await sendIntent(worker, { id: 'focus-composer', mode: 'open', source: 'command', tabId: 0 });
+    await expect(second.locator('#listen')).toBeFocused();
     expect((await voiceState(second)).starts).toBe(0);
   } finally {
     await context.close();
@@ -462,10 +455,10 @@ test('an automatic question leaves the user’s focus alone', async () => {
     await resetMock();
     await openFixture(context, '/article');
     const panel = await openPanel(context, extensionId);
-    await panel.locator('#message').focus();
+    await panel.locator('#listen').focus();
     await sendText(panel, 'What is this page about?');
     await expect(panel.locator('#ask-sites')).toBeVisible();
-    expect(await panel.evaluate(() => document.activeElement?.id)).toBe('message');
+    expect(await panel.evaluate(() => document.activeElement?.id)).toBe('listen');
   } finally {
     await context.close();
   }
@@ -484,7 +477,7 @@ test('a pending install completes preparation without listening', async () => {
     expect((await voiceState(panel)).starts).toBe(0);
     await panel.evaluate(() => { window.__aaVoice.available = 'available'; });
     await expect(panel.locator('#voice-setup')).toBeHidden({ timeout: 20_000 });
-    await expect(panel.locator('#listen')).toHaveText('2 Listen');
+    await expect(panel.locator('#listen')).toHaveText('1 Listen');
     expect((await voiceState(panel)).starts).toBe(0);
     await expect(panel.locator('#sr-alert')).toHaveText('');
   } finally {
