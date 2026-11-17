@@ -61,6 +61,16 @@ test('choice sets reject duplicate or numeric labels', () => {
     question: 'q',
     options: [{ label: 'Yes' }, { label: 'No', value: 'b' }],
   }), /must have text/u);
+  assert.throws(() => createChoiceSet({
+    id: 'x',
+    question: 'q',
+    options: [{ label: 'Yes', value: 'a' }, { label: 'Yes.', value: 'b' }],
+  }), /Duplicate option label/u);
+  assert.throws(() => createChoiceSet({
+    id: 'x',
+    question: 'q',
+    options: [{ label: 'Yes', value: 'go' }, { label: 'No', value: 'Go.' }],
+  }), /Duplicate option value/u);
 });
 
 test('choice sets reject non-string content instead of coercing it', () => {
@@ -99,6 +109,14 @@ test('answers accept numbers, number words, labels and values', () => {
   assert.equal(resolveChoice({ ...set, used: true }, '1').reason, 'closed');
   assert.equal(parseChoiceNumber('option 2'), 2);
   assert.equal(parseChoiceNumber('second'), null);
+  const continueSet = createChoiceSet({
+    id: 'c4',
+    question: 'Continue?',
+    options: [{ label: 'Continue?', value: 'next' }, { label: 'Stop', value: 'stop' }],
+  });
+  const continued = resolveChoice(continueSet, 'Continue?');
+  assert.equal(continued.ok, true);
+  assert.equal(continued.option.value, 'next');
 });
 
 test('expired and consumed choice sets reject answers even before a timer fires', () => {

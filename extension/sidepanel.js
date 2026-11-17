@@ -1788,6 +1788,7 @@ async function toolObserve(call, ok, fail, epoch, signal) {
     tabId: state.tab.tabId,
     expectedDocumentId: state.tab.documentId,
     allowedFrameOrigins: [...state.frameConsent],
+    cursor: call.args?.cursor,
   });
   if (turnStale(epoch, signal)) return fail('The user interrupted; the page was not read.');
   const shape = (value) => ({
@@ -1822,6 +1823,7 @@ async function toolObserve(call, ok, fail, epoch, signal) {
     expectedDocumentId: state.tab.documentId,
     allowedFrameOrigins: [...state.frameConsent],
     visual: true,
+    cursor: call.args?.cursor,
   });
   if (turnStale(epoch, signal)) return fail('The user interrupted; no screenshot was sent.');
   if (seen.error) return fail(seen.error);
@@ -1954,6 +1956,7 @@ async function consentForProposal(proposed, epoch, signal) {
     options: [{ label: 'Run', value: 'execute' }, { label: 'Cancel', value: 'cancel' }],
   });
   await send('ARM_CONSENT', { proposalId: proposed.proposalId, choiceSetId: set.id });
+  if (turnStale(epoch, signal)) return { cancelled: true, stale: true };
   let choice = await presentSet(set, { timeoutMs: 120_000 });
   if (turnStale(epoch, signal)) return { cancelled: true, stale: true };
   if (!choice) {
@@ -1977,6 +1980,7 @@ async function consentForProposal(proposed, epoch, signal) {
       options: [{ label: 'Run anyway', value: 'execute' }, { label: 'Cancel', value: 'cancel' }],
     });
     await send('ARM_CONSENT', { proposalId: proposed.proposalId, choiceSetId: set.id });
+    if (turnStale(epoch, signal)) return { cancelled: true, stale: true };
     choice = await presentSet(set, { timeoutMs: 120_000 });
     if (turnStale(epoch, signal)) return { cancelled: true, stale: true };
     if (state.actionContext) state.actionContext.phase = 'executing';
@@ -2030,6 +2034,7 @@ async function finishProposal(proposalId, report, epoch) {
     options: [{ label: 'Keep', value: 'keep' }, { label: 'Undo', value: 'undo' }],
   });
   await send('ARM_RESULT', { proposalId, choiceSetId: set.id });
+  if (epoch !== state.epoch) return resultText;
   const choice = await presentSet(set, { timeoutMs: 120_000 });
   if (!choice) {
     await send('CONFIRM_RESULT', { proposalId, choiceSetId: set.id, optionValue: 'keep' }).catch(() => {});
@@ -2069,6 +2074,7 @@ async function performUndo(epoch) {
       options: [{ label: 'Undo', value: 'execute' }, { label: 'Keep', value: 'cancel' }],
     });
     await send('ARM_CONSENT', { proposalId: result.proposalId, choiceSetId: set.id });
+    if (stale()) return replaced;
     const choice = await presentSet(set, { timeoutMs: 120_000 });
     if (stale()) return replaced;
     const response = await send('CONFIRM_PROPOSAL', {
@@ -2403,8 +2409,9 @@ async function refreshTab({ announce = false, reason = '', windowId = null } = {
   $('page-line').textContent = `Current page: ${pageName}${info.readable ? '' : ' (unreadable)'}`;
   if (changed) {
     cancelVoice();
-    if (previous?.tabId) await send('RESET_SESSION', { tabId: previous.tabId }).catch(() => {});
     resetConversation();
+    if (previous?.tabId) await send('RESET_SESSION', { tabId: previous.tabId }).catch(() => {});
+    if (seq !== state.refreshSeq) return false;
     if (announce) {
       await say(`${reason ? `${reason}. ` : ''}Current page: ${pageName}.`);
     }
@@ -2782,6 +2789,8 @@ async function undoFromButton() {
   if (state.busy) preemptTurn();
   else interruptOutput();
   const epoch = state.epoch;
+  await state.turnTask;
+  if (epoch !== state.epoch) return;
   state.busy = true;
   syncWorking();
   try {

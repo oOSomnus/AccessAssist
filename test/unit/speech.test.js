@@ -1105,6 +1105,48 @@ test('final segments join across a two-second pause and interim text never execu
   }
 });
 
+test('a live interim after a final keeps the pause from firing', async (t) => {
+  const control = fakeBrowser({ audio: 'running' });
+  t.mock.timers.enable({ apis: ['setTimeout'] });
+  const flush = async () => {
+    for (let index = 0; index < 20; index += 1) await Promise.resolve();
+  };
+  try {
+    const speech = new Speech();
+    speech.localAvailable = true;
+    const results = [];
+    const ends = [];
+    const pending = speech.startListening({
+      onResult: (text) => results.push(text),
+      onEnd: (info) => ends.push(info),
+    });
+    await flush();
+    await pending;
+
+    control.recognition.onresult(cumulativeEvent([
+      { transcript: 'Read the first' },
+      { transcript: 'paragraph', final: false },
+    ]));
+    t.mock.timers.tick(2_000);
+    await flush();
+    assert.deepEqual(results, []);
+    assert.equal(control.tracksStopped, 0);
+
+    control.recognition.onresult(cumulativeEvent([
+      { transcript: 'Read the first' },
+      { transcript: 'paragraph' },
+    ]));
+    t.mock.timers.tick(2_000);
+    await flush();
+    assert.deepEqual(results, ['Read the first paragraph']);
+    assert.equal(ends.length, 1);
+    assert.equal(ends[0].reason, 'final');
+  } finally {
+    t.mock.timers.reset();
+    clearBrowser();
+  }
+});
+
 test('identical words at different finalized indexes are kept', async (t) => {
   const control = fakeBrowser({ audio: 'running' });
   t.mock.timers.enable({ apis: ['setTimeout'] });

@@ -8,9 +8,11 @@ import {
   armResult,
   createSession,
   finishExecution,
+  observationDrift,
   pointsCrossMask,
   validateProposal,
 } from './policy.js';
+import { createExecutionQueue } from './execution.js';
 
 const PANEL_URL = chrome.runtime.getURL('sidepanel.html');
 const LAUNCHER_ID = 'accessassist-launcher-host';
@@ -36,7 +38,7 @@ const observations = new Map();
 const registry = new Map();
 const proposals = new Map();
 const undoRecords = new Map();
-const stoppedTabs = new Set();
+const executions = createExecutionQueue();
 const notices = [];
 const activeExecutions = new Map();
 
@@ -469,7 +471,7 @@ async function route(message) {
       return observePage(
         tab,
         Array.isArray(message.allowedFrameOrigins) ? message.allowedFrameOrigins : [],
-        { visual: message.visual === true, expectedDocumentId: message.expectedDocumentId },
+        { visual: message.visual === true, expectedDocumentId: message.expectedDocumentId, cursor: message.cursor },
       );
     }
     case 'READ_TARGET': return readTarget(requireTab(await targetTab(message.tabId)), message);
@@ -624,7 +626,7 @@ function modelTarget(entry, target) {
   };
 }
 
-async function observePage(tab, allowedOrigins, { visual = false, expectedDocumentId } = {}) {
+async function observePage(tab, allowedOrigins, { visual = false, expectedDocumentId, cursor } = {}) {
   const frames = (await framesFor(tab.id)).slice().sort((a, b) => a.frameId - b.frameId);
   const top = pinnedTop(frames, expectedDocumentId);
   const topOrigin = originOf(top.url);
@@ -663,6 +665,7 @@ async function observePage(tab, allowedOrigins, { visual = false, expectedDocume
       observation = await agentCall(tab.id, frame, {
         op: 'observe',
         visual: visual && frame.frameId === 0,
+        cursor: frame.frameId === 0 ? cursor : undefined,
       });
     } catch (error) {
       if (frame.frameId === 0) throw new Error(`Could not read the page: ${error?.message ?? 'script injection failed'}`);
@@ -917,7 +920,6 @@ function comparable(state) {
 }
 
 async function proposeAction(tab, message) {
-  stoppedTabs.delete(tab.id);
   const observation = observations.get(tab.id);
   if (!observation) return { ok: false, errors: ['Observe the page first'] };
   const session = createSession();
@@ -960,12 +962,16 @@ async function proposeAction(tab, message) {
     if (!entry || entry.tabId !== tab.id) return { ok: false, errors: ['Snapshot expired; observe the page again'] };
     const state = await expectedState(step, entry, { fullValue: step.type === 'set_value' });
     if (!state.state?.exists) return { ok: false, errors: ['Target no longer exists; observe the page again'] };
+    const drift = observationDrift(step, state.state, entry.targets.get(step.nodeId));
+    if (drift) return { ok: false, errors: [`The page changed since it was observed (${drift}); observe the page again`] };
     expected.set(`${step.snapshotId}:${step.nodeId}`, comparable(state.state));
     if (step.toNodeId !== undefined) {
       const end = await agentCall(tab.id, entry, {
         op: 'state', snapshotId: step.snapshotId, nodeId: step.toNodeId,
       });
       if (!end?.exists) return { ok: false, errors: ['Drag endpoint no longer exists; observe the page again'] };
+      const endDrift = observationDrift(step, end, entry.targets.get(step.toNodeId));
+      if (endDrift) return { ok: false, errors: [`The page changed since it was observed (${endDrift}); observe the page again`] };
       expected.set(`${step.snapshotId}:${step.toNodeId}`, comparable(end));
     }
   }
@@ -1031,16 +1037,24 @@ async function confirmProposal(tab, message) {
   if (outcome.action === 'risk') return { ok: true, action: 'risk' };
 
   const proposal = outcome.session.proposal;
-  await chrome.storage.session.set({
-    executing: { proposalId: proposal.id, tabId: tab.id, at: Date.now() },
-  }).catch(() => {});
   let report;
+  let stopped = false;
   try {
-    report = await executeProposal(tab, proposal);
+    const run = await executions.run(tab.id, async () => {
+      await chrome.storage.session.set({
+        executing: { proposalId: proposal.id, tabId: tab.id, at: Date.now() },
+      }).catch(() => {});
+      try {
+        return await executeProposal(tab, proposal);
+      } finally {
+        await chrome.storage.session.remove('executing').catch(() => {});
+      }
+    });
+    report = run.value;
+    stopped = run.stopped;
   } catch (error) {
     report = { completed: 0, failedStep: error?.message ?? 'Execution failed', verified: false, record: null };
   }
-  await chrome.storage.session.remove('executing').catch(() => {});
   const finished = finishExecution(outcome.session, {
     completedSteps: report.completed,
     failedStep: report.failedStep,
@@ -1049,7 +1063,7 @@ async function confirmProposal(tab, message) {
     undoKind: report.record?.undoKind ?? 'unavailable',
   });
   // A reset during execution owns the tab now; do not revive the old proposal.
-  if (stoppedTabs.has(tab.id)) proposals.delete(message.proposalId);
+  if (stopped) proposals.delete(message.proposalId);
   else proposals.set(message.proposalId, { ...stored, session: finished.session });
   if (finished.phase !== PHASE.result || proposal.isUndo) proposals.delete(message.proposalId);
   return {
@@ -1091,6 +1105,16 @@ function compareExpected(step, state, expected) {
 }
 
 async function executeProposal(tab, proposal) {
+  if (executions.stopped(tab.id)) {
+    return {
+      completed: 0,
+      failedStep: 'The page was reset before this action started; nothing was executed',
+      verified: false,
+      changed: false,
+      record: null,
+      details: [],
+    };
+  }
   const record = {
     transactionId: crypto.randomUUID(),
     tabId: tab.id,
@@ -1114,7 +1138,7 @@ async function executeProposal(tab, proposal) {
     cdp = await debuggerSession(tab.id);
     await setLauncherHidden(cdp, true);
     for (const [index, step] of proposal.steps.entries()) {
-      if (stoppedTabs.has(tab.id)) {
+      if (executions.stopped(tab.id)) {
         failedStep = 'The user left or reset the page; remaining steps were not executed';
         break;
       }
@@ -1203,6 +1227,7 @@ async function executeProposal(tab, proposal) {
   } finally {
     activeExecutions.delete(tab.id);
     if (cdp) await setLauncherHidden(cdp, false);
+    if (cdp) cdp.close();
     await detach(tab.id);
   }
   if (record.fields.length === 0 && record.clicks.length === 0) record.undoKind = 'unavailable';
@@ -1240,7 +1265,7 @@ async function executeStep(tab, step, entry, beforeState, cdp, record) {
       if (prepared.before.length > MAX_FIELD_VALUE) {
         return { ok: false, error: 'The field is too large to replace safely.' };
       }
-      if (stoppedTabs.has(tab.id)) {
+      if (executions.stopped(tab.id)) {
         return { ok: false, error: 'The user left or reset the page; remaining steps were not executed' };
       }
       if (prepared.kind === 'segmented') {
@@ -1278,6 +1303,10 @@ async function executeStep(tab, step, entry, beforeState, cdp, record) {
       if (beforeState.checkable && beforeState.tag === 'input') {
         result = await agentCall(tab.id, entry, { op: 'setChecked', snapshotId, nodeId, checked: step.checked });
       } else {
+        const current = beforeState.ariaChecked ?? beforeState.checked;
+        if (current !== null && current !== undefined && String(current) === String(step.checked)) {
+          return { ok: true, verified: true, changed: false, detail: 'The control already had the requested state' };
+        }
         const point = await targetPoint(tab.id, entry, snapshotId, nodeId, cdp);
         await clickPoint(cdp, point);
         result = await agentCall(tab.id, entry, { op: 'state', snapshotId, nodeId });
@@ -1290,6 +1319,13 @@ async function executeStep(tab, step, entry, beforeState, cdp, record) {
         before: beforeState.ariaChecked ?? beforeState.checked,
         after: after.ariaChecked ?? after.checked,
       });
+      // Target first, then the sibling the browser cleared, so undo unchecks
+      // this control and then re-checks the previous one.
+      if (result.previousRadio) {
+        record.fields.push({
+          kind: 'checked', snapshotId, nodeId: result.previousRadio, frameId: entryFrame, before: true, after: false,
+        });
+      }
       const actual = after.ariaChecked !== undefined && result.after === undefined ? after.ariaChecked : after.checked;
       return { ok: true, verified: String(actual) === String(step.checked), detail: `Checked state updated` };
     }
@@ -1320,8 +1356,8 @@ async function executeStep(tab, step, entry, beforeState, cdp, record) {
       };
     }
     case 'navigate': {
-      const previous = observations.get(tab.id)?.documentId ?? null;
-      const commit = waitForUrl(tab.id, previous, 8000);
+      const previous = entry.documentId ?? observations.get(tab.id)?.documentId ?? null;
+      const commit = waitForUrl(tab.id, previous, 8000, { frameId: entry.frameId ?? 0 });
       const result = await agentCall(tab.id, entry, {
         op: 'navigate', snapshotId, nodeId, href: step.href,
       }).catch((error) => ({ error: error?.message ?? 'The link could not be opened' }));
@@ -1550,7 +1586,7 @@ async function executeStep(tab, step, entry, beforeState, cdp, record) {
           modifiers: step.modifiers, tabId: tab.id,
         });
         await sleep(SETTLE_MS);
-        if (stoppedTabs.has(tab.id)) {
+        if (executions.stopped(tab.id)) {
           return { ok: true, changed: true, verified: false, detail: 'Cancelled during the drag; the mouse button was released.' };
         }
         return {
@@ -1625,7 +1661,10 @@ async function executeStep(tab, step, entry, beforeState, cdp, record) {
 }
 
 async function requestUndo(tab) {
-  stoppedTabs.delete(tab.id);
+  return (await executions.run(tab.id, () => undoLastAction(tab))).value;
+}
+
+async function undoLastAction(tab) {
   let record = undoRecords.get(tab.id);
   if (!record) {
     const stored = await chrome.storage.session.get(`undo:${tab.id}`).catch(() => ({}));
@@ -1652,8 +1691,10 @@ async function requestUndo(tab) {
       expected: expectedAgainstRecord,
     };
     const report = await executeProposal(tab, proposal);
-    undoRecords.delete(tab.id);
-    await chrome.storage.session.remove(`undo:${tab.id}`).catch(() => {});
+    if (report.completed > 0) {
+      undoRecords.delete(tab.id);
+      await chrome.storage.session.remove(`undo:${tab.id}`).catch(() => {});
+    }
     return { ok: report.completed === steps.length, report };
   }
   const steps = [];
@@ -1755,7 +1796,7 @@ async function detectConflict(record) {
 
 async function resetSession(tabId, { clearSnapshots = false } = {}) {
   if (!Number.isInteger(tabId)) return { ok: true };
-  stoppedTabs.add(tabId);
+  executions.stop(tabId);
   for (const [id, entry] of proposals) if (entry.tabId === tabId) proposals.delete(id);
   if (clearSnapshots) forgetTab(tabId);
   return { ok: true };
@@ -1849,7 +1890,7 @@ async function setLauncherPosition(position, sourceTabId) {
   return { ok: true, position: next };
 }
 
-function waitForUrl(tabId, previousDocumentId = null, timeoutMs = 8000) {
+function waitForUrl(tabId, previousDocumentId = null, timeoutMs = 8000, { frameId = 0 } = {}) {
   let settled = false;
   let settle;
   const done = new Promise((resolve) => { settle = resolve; });
@@ -1865,7 +1906,7 @@ function waitForUrl(tabId, previousDocumentId = null, timeoutMs = 8000) {
     settle(value);
   };
   const listener = (details) => {
-    if (details.tabId !== tabId || details.frameId !== 0) return;
+    if (details.tabId !== tabId || details.frameId !== frameId) return;
     // Same-document history updates and the old document's own commit do not
     // prove this navigation opened anything.
     if (previousDocumentId && details.documentId === previousDocumentId) return;
@@ -2005,6 +2046,7 @@ async function frameOffset(cdp, frameId) {
   let x = 0;
   let y = 0;
   let guard = 0;
+  const levels = [];
   while (parents.has(current) && guard < 32) {
     guard += 1;
     const parentId = parents.get(current);
@@ -2018,10 +2060,11 @@ async function frameOffset(cdp, frameId) {
     if (!quad || quad.length < 8) throw new Error('Could not prove the embedded frame position; observe again');
     x += Math.min(quad[0], quad[2], quad[4], quad[6]);
     y += Math.min(quad[1], quad[3], quad[5], quad[7]);
+    levels.push({ sessionId, frameId: parentId, owner: owner.backendNodeId, x, y });
     current = parentId;
   }
   if (guard >= 32) throw new Error('Could not prove the embedded frame position; observe again');
-  return { x, y };
+  return { x, y, levels };
 }
 
 async function framePoint(entry, x, y, cdp) {
@@ -2029,7 +2072,34 @@ async function framePoint(entry, x, y, cdp) {
   const mapped = (await documentFrameMap(cdp, [entry.docToken])).get(entry.docToken);
   if (!mapped) throw new Error('Could not prove the embedded frame position; observe again');
   const offset = await frameOffset(cdp, mapped.frameId);
-  return { x: offset.x + x, y: offset.y + y };
+  return {
+    x: offset.x + x,
+    y: offset.y + y,
+    levels: offset.levels.map((level) => ({ ...level, x: level.x + x, y: level.y + y })),
+  };
+}
+
+// The in-frame hit test cannot see parent-page overlays; prove each frame
+// owner is topmost at the point, from an isolated world page scripts cannot patch.
+async function assertFramesTopmost(cdp, levels) {
+  for (const level of levels) {
+    const world = await cdp.send('Page.createIsolatedWorld', {
+      frameId: level.frameId, worldName: 'accessassist-hit',
+    }, level.sessionId).catch(() => null);
+    const resolved = world?.executionContextId
+      ? await cdp.send('DOM.resolveNode', {
+        backendNodeId: level.owner, executionContextId: world.executionContextId,
+      }, level.sessionId).catch(() => null)
+      : null;
+    if (!resolved?.object?.objectId) throw new Error('Could not prove the embedded frame position; observe again');
+    const topmost = await cdp.send('Runtime.callFunctionOn', {
+      objectId: resolved.object.objectId,
+      functionDeclaration: 'function (x, y) { return this.getRootNode().elementFromPoint(x, y) === this; }',
+      arguments: [{ value: level.x }, { value: level.y }],
+      returnByValue: true,
+    }, level.sessionId).catch(() => null);
+    if (topmost?.result?.value !== true) throw new Error('The embedded area is covered; observe the page again');
+  }
 }
 
 async function targetPoint(tabId, entry, snapshotId, nodeId, cdp) {
@@ -2050,18 +2120,19 @@ async function targetPoint(tabId, entry, snapshotId, nodeId, cdp) {
   if (size && (point.x < 0 || point.y < 0 || point.x > size.clientWidth || point.y > size.clientHeight)) {
     throw new Error('Target is outside the viewport');
   }
-  return point;
+  await assertFramesTopmost(cdp, point.levels);
+  return { x: point.x, y: point.y };
 }
 
 async function waitSlices(tabId, totalMs) {
   const deadline = Date.now() + totalMs;
   let remaining = totalMs;
   while (remaining > 0) {
-    if (stoppedTabs.has(tabId)) return false;
+    if (executions.stopped(tabId)) return false;
     await sleep(Math.min(50, remaining));
     remaining = deadline - Date.now();
   }
-  return !stoppedTabs.has(tabId);
+  return !executions.stopped(tabId);
 }
 
 const MODIFIER_MASKS = Object.freeze({ Alt: 1, Control: 2, Meta: 4, Shift: 8 });
@@ -2233,7 +2304,7 @@ async function dragPoints(cdp, mapped, { modifiers = [], tabId = null } = {}) {
   let last = start;
   try {
     for (const point of rest) {
-      if (tabId !== null && stoppedTabs.has(tabId)) break;
+      if (tabId !== null && executions.stopped(tabId)) break;
       await cdp.send('Input.dispatchMouseEvent', {
         type: 'mouseMoved', x: point.x, y: point.y, button: 'left', buttons: 1, modifiers: mask,
       });
@@ -2546,12 +2617,9 @@ async function captureTarget(tab, message) {
       const captured = await viewportShot(cdp, viewport, { x: viewport.scrollX, y: viewport.scrollY });
       const x = Math.max(0, state.rect.x);
       const y = Math.max(0, state.rect.y);
-      const rect = {
-        x,
-        y,
-        width: Math.min(state.rect.width, viewport.width - x),
-        height: Math.min(state.rect.height, viewport.height - y),
-      };
+      const right = Math.min(state.rect.x + state.rect.width, viewport.width);
+      const bottom = Math.min(state.rect.y + state.rect.height, viewport.height);
+      const rect = { x, y, width: right - x, height: bottom - y };
       if (rect.width < 2 || rect.height < 2) throw new Error('Image area is too small to read');
       captured.bitmap.close();
       return { dataUrl: captured.dataUrl, rect, scale: captured.scale };

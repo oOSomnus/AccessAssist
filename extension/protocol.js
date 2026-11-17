@@ -144,6 +144,8 @@ export function normalizeAnswer(raw) {
     .replace(/[.!?\s]+$/u, '');
 }
 
+const answerKey = (value) => normalizeAnswer(value).toLowerCase();
+
 const NUMBER_WORDS = {
   one: 1, two: 2, three: 3, four: 4, five: 5, six: 6, seven: 7, eight: 8, nine: 9,
 };
@@ -175,11 +177,12 @@ export function createChoiceSet({ id, question, options, expiresAt = null }) {
     if (violation) throw new Error(`Option ${index + 1}: ${violation}`);
     if (!value) throw new Error(`Option ${index + 1} is missing a value`);
     if (parseChoiceNumber(label) !== null) throw new Error(`Option label must not be only a number: ${label}`);
-    const key = label.normalize('NFKC').toLowerCase();
+    const key = answerKey(label);
     if (seenLabels.has(key)) throw new Error(`Duplicate option label: ${label}`);
-    if (seenValues.has(value)) throw new Error(`Duplicate option value: ${value}`);
+    const valueKey = answerKey(value);
+    if (seenValues.has(valueKey)) throw new Error(`Duplicate option value: ${value}`);
     seenLabels.add(key);
-    seenValues.add(value);
+    seenValues.add(valueKey);
     return { number: index + 1, label, value };
   });
   return {
@@ -209,10 +212,10 @@ export function resolveChoice(choiceSet, rawInput) {
     const option = choiceSet.options.find((candidate) => candidate.number === number);
     return option ? { ok: true, option } : { ok: false, reason: 'invalid' };
   }
-  const lowered = input.toLowerCase();
-  const byLabel = choiceSet.options.filter((option) => option.label.normalize('NFKC').toLowerCase() === lowered);
+  const lowered = answerKey(input);
+  const byLabel = choiceSet.options.filter((option) => answerKey(option.label) === lowered);
   if (byLabel.length === 1) return { ok: true, option: byLabel[0] };
-  const byValue = choiceSet.options.filter((option) => option.value.toLowerCase() === lowered);
+  const byValue = choiceSet.options.filter((option) => answerKey(option.value) === lowered);
   if (byValue.length === 1) return { ok: true, option: byValue[0] };
   return { ok: false, reason: byLabel.length + byValue.length > 1 ? 'ambiguous' : 'invalid' };
 }

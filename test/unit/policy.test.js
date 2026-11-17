@@ -9,6 +9,7 @@ import {
   armResult,
   createSession,
   finishExecution,
+  observationDrift,
   timeNeedsClarification,
   validateProposal,
 } from '../../extension/policy.js';
@@ -52,6 +53,9 @@ test('short clock values need a meridiem but 24-hour values do not', () => {
   assert.equal(timeNeedsClarification('2 p.m.'), false);
   assert.equal(timeNeedsClarification('14:00 to 15:00'), false);
   assert.equal(timeNeedsClarification('15 minutes'), false);
+  assert.equal(timeNeedsClarification('Monday 2:00; Tuesday 3:00 PM'), true);
+  assert.equal(timeNeedsClarification('2:00 to 3:00 PM'), false);
+  assert.equal(timeNeedsClarification('Monday 2:00 PM, Tuesday 3:00 PM'), false);
 });
 
 test('missing fields keep the session in clarification', () => {
@@ -241,6 +245,26 @@ test('stale document targets are rejected', () => {
   const outcome = validateProposal(proposal(), ctx);
   assert.equal(outcome.ok, false);
   assert.match(outcome.errors.join(), /page changed/u);
+});
+
+test('an approved proposal is checked against the observed target', () => {
+  const observed = {
+    visible: true, disabled: false, name: 'Save', role: 'button', tag: 'button',
+    value: null, checked: null, ariaChecked: null,
+  };
+  const step = { type: 'click', snapshotId: 's1', nodeId: 3 };
+  assert.equal(observationDrift(step, { ...observed }, observed), null);
+  assert.equal(observationDrift(step, { ...observed, name: 'Delete' }, observed), 'name');
+  assert.equal(observationDrift(step, { ...observed, disabled: true }, observed), 'disabled');
+  // collectTargets overrides the role of extra targets, so role is not compared.
+  assert.equal(observationDrift(step, { ...observed, role: 'region' }, observed), null);
+  // A screenshot point is anchored to frozen pixels, not to the control's own text.
+  assert.equal(observationDrift({ ...step, point: { x: 1, y: 1 } }, { ...observed, name: 'Delete' }, observed), null);
+  assert.equal(observationDrift(step, null, observed), 'target');
+  const text = { ...observed, tag: 'div', value: 'a b' };
+  assert.equal(observationDrift(step, { ...text, contentEditable: true, value: 'a\n  b' }, text), null);
+  assert.equal(observationDrift(step, { ...text, value: 'x'.repeat(400) }, { ...text, value: 'x'.repeat(300) }), null);
+  assert.equal(observationDrift(step, { ...text, value: 'typed' }, { ...text, value: '' }), 'value');
 });
 
 test('irreversible actions need two separate confirmations', () => {

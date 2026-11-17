@@ -835,6 +835,7 @@ export class Speech {
     }
     let heard = false;
     let sawFinal = false;
+    let interimPending = false;
     for (let index = 0; index < results.length; index += 1) {
       if (index < attempt.ignoredFloor) continue;
       const result = results[index];
@@ -846,6 +847,7 @@ export class Speech {
         sawFinal = true;
         heard = true;
       } else {
+        interimPending = true;
         if (attempt.interims.get(index) === text) continue;
         attempt.interims.set(index, text);
         heard = true;
@@ -853,7 +855,7 @@ export class Speech {
     }
     if (!heard || session.finishing) return;
     session.hasSpeech = true;
-    if (sawFinal) {
+    if (sawFinal && !interimPending) {
       // A finalized phrase is the only executable text; interim hypotheses
       // only keep the command alive.
       session.speechActive = false;

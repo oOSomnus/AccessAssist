@@ -484,6 +484,7 @@
   }
 
   openButton.addEventListener('click', (event) => {
+    if (!event.isTrusted) return;
     if (suppressClick && event.detail > 0) {
       suppressClick = false;
       event.preventDefault();

@@ -345,7 +345,7 @@
     };
   }
 
-  function textOf(element) {
+  function textOf(element, full = false) {
     if (element.tagName === 'IMG') {
       return clean(element.getAttribute('alt')) || '[image has no alt text]';
     }
@@ -354,9 +354,9 @@
       return [...element.selectedOptions].map((option) => clean(option.textContent)).join(', ');
     }
     if ('value' in element && (element.tagName === 'INPUT' || element.tagName === 'TEXTAREA')) {
-      return valueOf(element) ?? '';
+      return valueOf(element, full) ?? '';
     }
-    return clean(element.innerText).slice(0, 3000);
+    return full ? clean(element.innerText) : clean(element.innerText).slice(0, 3000);
   }
 
   function sectionOf(element) {
@@ -708,7 +708,7 @@
     if (!element) return { error: 'Target no longer exists; observe the page again' };
     const type = (element.getAttribute('type') ?? '').toLowerCase();
     if (type === 'password') return { error: 'Password fields are not read' };
-    const text = textOf(element);
+    const text = textOf(element, true);
     const offset = Math.max(0, Number(cursor) || 0);
     const chunk = text.slice(offset, offset + 8000);
     return {
@@ -872,7 +872,7 @@
         const selection = element.ownerDocument.getSelection();
         selection?.removeAllRanges();
         selection?.addRange(range);
-        if (!selection || selection.isCollapsed) {
+        if (!selection || selection.rangeCount === 0 || (selection.isCollapsed && before !== '')) {
           return { error: 'The text target lost its selection; observe again.' };
         }
       } else {
@@ -925,14 +925,25 @@
     if (!element) return { error: 'Target no longer exists; observe the page again' };
     const before = stateOf(element);
     if (!before.checkable) return { error: 'Target is not a checkable control' };
+    let previousRadio = null;
     if (element.tagName === 'INPUT') {
+      // Checking one radio silently unchecks its group, so remember the sibling
+      // the browser will clear and let undo restore it.
+      const previous = checked && element.type === 'radio' && element.name
+        ? [...element.getRootNode().querySelectorAll('input[type="radio"]')].find((node) => node !== element
+          && node.checked && node.name === element.name && node.form === element.form) ?? null
+        : null;
       element.checked = checked;
       fire(element, ['input', 'change']);
+      if (previous && !previous.checked) {
+        previousRadio = idFor(previous);
+        snapshots.get(snapshotId)?.nodeIds.add(previousRadio);
+      }
     } else {
       element.setAttribute('aria-checked', checked ? 'true' : 'false');
       fire(element, ['input', 'change']);
     }
-    return { ok: true, docToken, before, after: stateOf(element) };
+    return { ok: true, docToken, before, after: stateOf(element), previousRadio };
   }
 
   function setSelected({ snapshotId, nodeId, values }) {
