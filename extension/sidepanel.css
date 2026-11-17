@@ -96,7 +96,7 @@ label { display: block; margin-top: var(--space-sm); font-weight: 600; }
 #voice-help[open] > summary { margin-bottom: var(--space-sm); }
 #advanced-api > input, #advanced-api > select { margin-top: var(--space-xs); }
 #save-settings { margin-top: var(--space-sm); }
-#replay-intro { align-self: flex-start; }
+#replay-intro, #export-log { align-self: flex-start; }
 .shortcut-help { padding-top: var(--space-md); border-top: 1px solid var(--color-rule); }
 .shortcut-help h3 { margin: 0; }
 #shortcut-status { display: grid; gap: var(--space-sm); margin: var(--space-sm) 0 0; }

@@ -416,6 +416,7 @@ test('regression: HTTP error bodies never reach error messages', async () => {
         assert.equal(error.code, code);
         assert.match(error.message, new RegExp(`HTTP ${status}`, 'u'));
         assert.equal(error.message.includes(secret), false);
+        assert.equal(error.details.status, status);
         return true;
       },
     );

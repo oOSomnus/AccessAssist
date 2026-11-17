@@ -3,10 +3,11 @@
 import { TOOLS } from './protocol.js';
 
 export class ApiError extends Error {
-  constructor(code, message) {
+  constructor(code, message, details) {
     super(message);
     this.name = 'ApiError';
     this.code = code;
+    if (details) this.details = details;
   }
 }
 
@@ -345,19 +346,21 @@ function parseAnthropic(config, json) {
 }
 
 export function mapHttpError(status, body) {
-  // The body is inspected only to classify image rejections; never reflect it
-  // into a user-visible message because providers may echo credentials.
+  // The body is inspected only to classify image rejections; it never goes into
+  // a user-visible message because providers may echo credentials. It travels
+  // only in details, which the panel scrubs before writing the debug log.
   const detail = String(body ?? '');
-  if (status === 401 || status === 403) return new ApiError('auth', `Model service rejected authentication (HTTP ${status})`);
-  if (status === 429) return new ApiError('rate_limit', 'Too many requests to the model service (HTTP 429); try again later');
+  const details = { status, body: detail.slice(0, 2000) };
+  if (status === 401 || status === 403) return new ApiError('auth', `Model service rejected authentication (HTTP ${status})`, details);
+  if (status === 429) return new ApiError('rate_limit', 'Too many requests to the model service (HTTP 429); try again later', details);
   if ((status === 400 || status === 422) && /image|vision|multimodal/iu.test(detail)) {
-    return new ApiError('image_rejected', `Model service rejected the screenshot (HTTP ${status})`);
+    return new ApiError('image_rejected', `Model service rejected the screenshot (HTTP ${status})`, details);
   }
-  if (status === 400 || status === 422) return new ApiError('bad_request', `Model service rejected the request (HTTP ${status})`);
-  return new ApiError('http', `Model service returned an error (HTTP ${status})`);
+  if (status === 400 || status === 422) return new ApiError('bad_request', `Model service rejected the request (HTTP ${status})`, details);
+  return new ApiError('http', `Model service returned an error (HTTP ${status})`, details);
 }
 
-const DEFAULT_TIMEOUT_MS = 60_000;
+export const REQUEST_TIMEOUT_MS = 180_000;
 
 export async function requestTurn({
   config,
@@ -368,7 +371,7 @@ export async function requestTurn({
   tools = TOOLS,
   signal,
   fetchImpl = globalThis.fetch,
-  timeoutMs = DEFAULT_TIMEOUT_MS,
+  timeoutMs = REQUEST_TIMEOUT_MS,
   maxTokens = 4096,
 }) {
   const normalized = normalizeConfig(config);
@@ -380,6 +383,7 @@ export async function requestTurn({
   const abort = () => controller.abort(signal.reason);
   if (signal?.aborted) abort();
   else signal?.addEventListener('abort', abort, { once: true });
+  const started = Date.now();
   try {
     const response = await fetchImpl(endpointFor(settings), {
       method: 'POST',
@@ -393,15 +397,25 @@ export async function requestTurn({
     try {
       json = JSON.parse(bodyText);
     } catch {
-      throw new ApiError('invalid_json', 'Model service returned invalid JSON');
+      throw new ApiError('invalid_json', 'Model service returned invalid JSON', { body: bodyText.slice(0, 2000) });
     }
-    return settings.protocol === 'anthropic' ? parseAnthropic(settings, json) : parseOpenAI(settings, json);
+    try {
+      return settings.protocol === 'anthropic' ? parseAnthropic(settings, json) : parseOpenAI(settings, json);
+    } catch (error) {
+      // Empty, truncated and billing failures carry the raw reply for the debug log.
+      error.details ??= { body: bodyText.slice(0, 2000) };
+      throw error;
+    }
   } catch (error) {
     if (error instanceof ApiError) throw error;
     if (error?.name === 'AbortError' || error?.name === 'TimeoutError') {
-      throw new ApiError('timeout', 'Model request timed out; try again');
+      throw new ApiError('timeout', 'Model request timed out; try again', {
+        elapsedMs: Date.now() - started,
+        timeoutMs,
+        cancelled: signal?.aborted === true,
+      });
     }
-    throw new ApiError('network', 'Could not reach the model service');
+    throw new ApiError('network', 'Could not reach the model service', { cause: String(error?.message ?? error) });
   } finally {
     clearTimeout(timer);
     signal?.removeEventListener('abort', abort);
