@@ -1,4 +1,5 @@
 import { normalizeConfig, requestTurn } from './ai.js';
+import { consentRound } from './consent-round.js';
 import { closeChoiceSet, createChoiceSet, formatChoices, parseChoiceNumber, resolveChoice } from './protocol.js';
 import { keyBinding, keyForBinding, configFingerprint, configOrigin, DEFAULT_API_CONFIG, grantUpload, needsUpload, uploadConsentFor } from './settings.js';
 import { Speech, spokenSites } from './speech.js';
@@ -1926,6 +1927,8 @@ async function toolDescribeImage(call, ok, fail, turn) {
   return ok('The user allowed AI reading; the image is attached to the next user message.');
 }
 
+const consentPorts = (stale) => ({ send, present: presentSet, newId: uid, stale });
+
 async function consentForProposal(proposed, turn) {
   const limit = proposed.risk === 'irreversible'
     ? 'This may submit or send content, and it may not be undoable.'
@@ -1933,47 +1936,29 @@ async function consentForProposal(proposed, turn) {
   await say(`About to run: ${proposed.summary}. ${limit}`);
   // A replaced turn must not arm or confirm an older proposal.
   if (turn.stale) return { cancelled: true, stale: true };
-  let set = createChoiceSet({
-    id: uid(),
+  const first = await consentRound(consentPorts(() => turn.stale), {
+    tabId: state.tab.tabId,
+    proposalId: proposed.proposalId,
     question: 'Run this?',
-    options: [{ label: 'Run', value: 'execute' }, { label: 'Cancel', value: 'cancel' }],
+    runLabel: 'Run',
+    keepLabel: 'Cancel',
   });
-  await send('ARM_CONSENT', { proposalId: proposed.proposalId, choiceSetId: set.id });
-  if (turn.stale) return { cancelled: true, stale: true };
-  let choice = await presentSet(set, { timeoutMs: 120_000 });
-  if (turn.stale) return { cancelled: true, stale: true };
-  if (!choice) {
-    await send('CONFIRM_PROPOSAL', {
-      tabId: state.tab.tabId, proposalId: proposed.proposalId, choiceSetId: set.id, optionValue: 'cancel',
-    }).catch(() => {});
-    return { cancelled: true };
-  }
-  if (state.actionContext) state.actionContext.phase = 'executing';
-  let response = await send('CONFIRM_PROPOSAL', {
-    tabId: state.tab.tabId, proposalId: proposed.proposalId, choiceSetId: set.id, optionValue: choice.value,
-  });
-  if (state.actionContext) state.actionContext.phase = response.report ? 'settling' : 'arming';
+  if (first.stale) return { cancelled: true, stale: true };
+  if (!first.choice) return { cancelled: true };
+  let response = first.response;
   if (response.action === 'risk') {
     if (turn.stale) return { cancelled: true, stale: true };
     await say('Please confirm again: this action may not be undoable.');
     if (turn.stale) return { cancelled: true, stale: true };
-    set = createChoiceSet({
-      id: uid(),
-      question: 'Run anyway?',
-      options: [{ label: 'Run anyway', value: 'execute' }, { label: 'Cancel', value: 'cancel' }],
-    });
-    await send('ARM_CONSENT', { proposalId: proposed.proposalId, choiceSetId: set.id });
-    if (turn.stale) return { cancelled: true, stale: true };
-    choice = await presentSet(set, { timeoutMs: 120_000 });
-    if (turn.stale) return { cancelled: true, stale: true };
-    if (state.actionContext) state.actionContext.phase = 'executing';
-    response = await send('CONFIRM_PROPOSAL', {
+    const second = await consentRound(consentPorts(() => turn.stale), {
       tabId: state.tab.tabId,
       proposalId: proposed.proposalId,
-      choiceSetId: set.id,
-      optionValue: choice?.value ?? 'cancel',
+      question: 'Run anyway?',
+      runLabel: 'Run anyway',
+      keepLabel: 'Cancel',
     });
-    if (state.actionContext) state.actionContext.phase = response.report ? 'settling' : 'arming';
+    if (second.stale) return { cancelled: true, stale: true };
+    response = second.response;
   }
   if (response.action === 'cancel' || !response.report) {
     if (!turn.stale) await say('Cancelled.');
@@ -2030,28 +2015,22 @@ async function performUndo(turn) {
   if (result.requiresConsent) {
     await say('Undo will modify the page again and may trigger another save.');
     if (stale()) return replaced;
-    const set = createChoiceSet({
-      id: uid(),
-      question: 'Undo this change?',
-      options: [{ label: 'Undo', value: 'execute' }, { label: 'Keep', value: 'cancel' }],
-    });
-    await send('ARM_CONSENT', { proposalId: result.proposalId, choiceSetId: set.id });
-    if (stale()) return replaced;
-    const choice = await presentSet(set, { timeoutMs: 120_000 });
-    if (stale()) return replaced;
-    const response = await send('CONFIRM_PROPOSAL', {
+    const round = await consentRound(consentPorts(stale), {
       tabId,
       proposalId: result.proposalId,
-      choiceSetId: set.id,
-      optionValue: choice?.value === 'execute' ? 'execute' : 'cancel',
+      question: 'Undo this change?',
+      runLabel: 'Undo',
+      keepLabel: 'Keep',
     });
+    if (round.stale) return replaced;
     if (stale()) return replaced;
-    if (!response.report) {
+    if (!round.response.report) {
       await say('Kept the current state.');
       return 'The user cancelled undo.';
     }
-    await say(response.report.completed ? `Undone, ${response.report.completed} steps completed.` : 'Undo did not complete.');
-    return response.report.completed ? 'The user undid the last change.' : 'Undo not completed.';
+    const completed = round.response.report.completed;
+    await say(completed ? `Undone, ${completed} steps completed.` : 'Undo did not complete.');
+    return completed ? 'The user undid the last change.' : 'Undo not completed.';
   }
   await say(result.ok ? 'Undone.' : 'Undo did not fully succeed.');
   return result.ok ? 'The user undid the last change.' : 'Undo not completed.';
@@ -2063,7 +2042,6 @@ function beginActionContext(proposalId) {
     sourceTabId: state.tab?.tabId ?? null,
     windowId: state.tab?.windowId ?? state.windowId,
     turn: turns.current,
-    phase: 'arming',
     deferredTabId: null,
   };
 }
