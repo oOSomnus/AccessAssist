@@ -771,6 +771,12 @@ test('appearance: setup and launcher remain usable across display modes', async 
 
     await page.setViewportSize({ width: 160, height: 640 });
     const narrowBar = page.locator('#accessassist-launcher-host .launcher-bar');
+    // The launcher reapplies its normalized position in the next animation
+    // frame after a viewport change; wait for that layout instead of racing it.
+    await expect.poll(async () => {
+      const box = await narrowBar.boundingBox();
+      return box ? box.x + box.width : Infinity;
+    }).toBeLessThanOrEqual(160);
     const narrow = await narrowBar.boundingBox();
     expect(narrow.x).toBeGreaterThanOrEqual(0);
     expect(narrow.x + narrow.width).toBeLessThanOrEqual(160);
