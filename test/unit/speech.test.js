@@ -5,6 +5,7 @@ import {
   Speech,
   localRecognitionSupported,
   spokenSites,
+  voiceSetupView,
 } from '../../extension/speech.js';
 
 const tick = (ms = 0) => new Promise((resolve) => setTimeout(resolve, ms));
@@ -1680,4 +1681,60 @@ test('handlers captured from an ended session cannot reach the next one', async 
   } finally {
     clearBrowser();
   }
+});
+
+test('voice setup view keeps every status sentence', () => {
+  const base = { local: 'available', mic: 'granted', ready: false, preparing: false, failed: false, listen: 'Press X to listen' };
+  const cases = [
+    [{ ...base, surface: 'panel' }, 'Speech is ready. Press X to listen.'],
+    [{ ...base, surface: 'panel', failed: true }, 'Voice is not ready. Choose Retry to try again.'],
+    [{ ...base, surface: 'panel', mic: 'prompt' }, 'Voice needs microphone permission. Choose Prepare voice to start.'],
+    [{ ...base, surface: 'panel', mic: 'denied' }, 'Microphone access is denied. Allow it in Chrome site settings and system settings, then choose Retry.'],
+    [{ ...base, surface: 'panel', local: 'unavailable' }, 'This Chrome cannot recognize speech on this device. Choose Retry after enabling local speech.'],
+    [{ ...base, surface: 'panel', local: 'error' }, 'Chrome could not check the English speech pack. Choose Retry.'],
+    [{ ...base, surface: 'panel', local: 'downloadable' }, 'The English speech pack is not ready. Choose Prepare voice to start.'],
+    [{ ...base, surface: 'panel', local: 'downloading' }, 'Chrome is downloading the English speech pack. Voice will be ready when it finishes.'],
+    [{ ...base, surface: 'panel', preparing: true, mic: 'prompt' }, 'Chrome is preparing the English speech pack and will ask for the microphone.'],
+    [{ ...base, surface: 'setup', ready: true }, 'Microphone access is granted. Speech is ready on this device.'],
+    [{ ...base, surface: 'setup' }, 'Waiting for the English speech pack.'],
+    [{ ...base, surface: 'setup', mic: 'prompt' }, 'Press Prepare voice to check the microphone and prepare speech.'],
+    [{ ...base, surface: 'setup', mic: 'prompt', failed: true }, 'Voice is not ready. Choose Retry to try again.'],
+    [{ ...base, surface: 'setup', mic: 'denied' }, 'Microphone access is denied. Allow it in Chrome site settings and system settings, then choose Retry.'],
+    [{ ...base, surface: 'setup', local: 'unavailable' }, 'This Chrome cannot recognize speech on this device.'],
+    [{ ...base, surface: 'setup', local: 'error' }, 'Chrome could not check the English speech pack. Choose Retry.'],
+    [{ ...base, surface: 'setup', local: 'downloadable' }, 'Chrome needs the English speech pack. Choose Prepare voice to start.'],
+    [{ ...base, surface: 'setup', local: 'downloading' }, 'Chrome is downloading the English speech pack. Voice will be ready when it finishes.'],
+    [{ ...base, surface: 'setup', preparing: true }, 'Chrome is preparing the English speech pack and will ask for the microphone. Allow it when Chrome asks.'],
+  ];
+  for (const [input, expected] of cases) {
+    assert.equal(voiceSetupView(input).status, expected, JSON.stringify(input));
+  }
+});
+
+test('a downloading pack says so and hides Prepare voice', () => {
+  const base = { local: 'available', mic: 'granted', ready: false, preparing: false, failed: false, listen: 'Press X to listen' };
+  const downloading = 'Chrome is downloading the English speech pack. Voice will be ready when it finishes.';
+  for (const surface of ['panel', 'setup']) {
+    const busy = voiceSetupView({ ...base, surface, local: 'downloading' });
+    assert.equal(busy.status, downloading, surface);
+    assert.equal(busy.startHidden, true, surface);
+    const ready = voiceSetupView({ ...base, surface, local: 'downloadable' });
+    assert.match(ready.status, /Choose Prepare voice/u, surface);
+    assert.equal(ready.startHidden, false, surface);
+    assert.equal(ready.startLabel, '1 Prepare voice', surface);
+  }
+});
+
+test('voice setup view hides the right controls', () => {
+  const base = { local: 'available', mic: 'granted', ready: false, preparing: false, failed: false, listen: 'Press X to listen' };
+  assert.deepEqual(voiceSetupView({ ...base, surface: 'panel', ready: true }), { sectionHidden: true });
+  assert.equal(voiceSetupView({ ...base, surface: 'setup', local: 'downloading' }).startHidden, true);
+  assert.equal(voiceSetupView({ ...base, surface: 'setup', local: 'downloading' }).returnHidden, true);
+  const retry = voiceSetupView({ ...base, surface: 'panel', local: 'downloading', failed: true });
+  assert.equal(retry.startHidden, false);
+  assert.equal(retry.startLabel, '1 Retry');
+  const busy = voiceSetupView({ ...base, surface: 'panel', preparing: true });
+  assert.equal(busy.startHidden, true);
+  assert.equal(busy.startLabel, '1 Prepare voice');
+  assert.equal(voiceSetupView({ ...base, surface: 'setup', ready: true }).returnHidden, false);
 });

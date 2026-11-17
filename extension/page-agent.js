@@ -150,6 +150,7 @@
   function valueOf(element, full = false) {
     const type = (element.getAttribute('type') ?? '').toLowerCase();
     if (type === 'password') return null;
+    // 300 = VALUE_CHAR_LIMIT in target-state.js; this injected script cannot import it.
     if (element.isContentEditable) {
       const text = element.innerText ?? '';
       return full ? text : clean(text).slice(0, 300);
