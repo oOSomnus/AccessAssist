@@ -1111,10 +1111,12 @@ async function executeProposal(tab, proposal) {
   let failedStep = null;
   let verified = true;
   let changed = false;
+  let stepNumber = 0;
   try {
     cdp = await debuggerSession(tab.id);
     await setLauncherHidden(cdp, true);
     for (const [index, step] of proposal.steps.entries()) {
+      stepNumber = index + 1;
       if (executions.stopped(tab.id)) {
         failedStep = 'The user left or reset the page; remaining steps were not executed';
         break;
@@ -1201,6 +1203,9 @@ async function executeProposal(tab, proposal) {
       }
       await sleep(SETTLE_MS);
     }
+  } catch (error) {
+    const message = error?.message ?? 'Execution failed';
+    failedStep = stepNumber ? `Step ${stepNumber}: ${message}` : message;
   } finally {
     activeExecutions.delete(tab.id);
     if (cdp) await setLauncherHidden(cdp, false);

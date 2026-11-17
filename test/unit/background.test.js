@@ -26,6 +26,9 @@ const behavior = {
   holdLauncherGet: false,
   releaseLocalGet: null,
   tab: null,
+  frames: [],
+  agent: null,
+  attachError: null,
 };
 
 const listener = () => ({ addListener() {} });
@@ -60,6 +63,8 @@ globalThis.chrome = {
     onUpdated: listener(),
   },
   webNavigation: {
+    getAllFrames: async () => behavior.frames,
+    getFrame: async () => behavior.frames[0] ?? null,
     onHistoryStateUpdated: listener(),
     onCommitted: listener(),
     onCreatedNavigationTarget: listener(),
@@ -140,10 +145,15 @@ globalThis.chrome = {
     },
   },
   debugger: {
+    attach: async () => {
+      if (behavior.attachError) throw behavior.attachError;
+    },
     detach: async () => {},
+    sendCommand: async () => ({}),
+    onEvent: { addListener() {}, removeListener() {} },
   },
   scripting: {
-    executeScript: async () => {},
+    executeScript: async (details) => (behavior.agent ? behavior.agent(details) : undefined),
   },
 };
 
@@ -171,6 +181,9 @@ function reset() {
   behavior.holdLauncherGet = false;
   behavior.releaseLocalGet = null;
   behavior.tab = null;
+  behavior.frames = [];
+  behavior.agent = null;
+  behavior.attachError = null;
 }
 
 async function settle() {
@@ -503,4 +516,89 @@ test('a local undo is marked as an execution', async () => {
   assert.equal(markers.length, 1);
   assert.equal(markers[0]['executing:7'].tabId, 7);
   assert.equal('executing:7' in behavior.sessionState, false);
+});
+
+// A page whose agent answers observe/state/setAlt, then fails every injection
+// like a document that navigated under the worker.
+function fakePage(tabId) {
+  behavior.tab = { id: tabId, windowId: 3, title: 'Page', url: 'https://example.test/page' };
+  behavior.frames = [{ frameId: 0, documentId: 'doc-1', url: 'https://example.test/page' }];
+  const alts = new Map();
+  let gone = false;
+  const img = (nodeId) => ({
+    nodeId, tag: 'img', role: 'img', name: `Image ${nodeId}`, visible: true, disabled: false,
+    checkable: false, selectable: false, editable: false, focusable: false,
+    checked: null, ariaChecked: null, value: null,
+    alt: alts.get(nodeId) ?? { present: false, value: '' },
+  });
+  behavior.agent = async ({ args }) => {
+    if (gone) throw new Error('Frame removed');
+    if (!args) return [{ documentId: 'doc-1', result: true }];
+    const payload = args[0];
+    let result;
+    if (payload.op === 'observe') {
+      result = {
+        snapshotId: 'abcdef01-snap', docToken: 'tok', title: 'Page',
+        viewport: null, sections: [], targets: [img(1), img(2)], nextCursor: null,
+      };
+    } else if (payload.op === 'state') {
+      result = { exists: true, docToken: 'tok', ...img(payload.nodeId) };
+    } else if (payload.op === 'setAlt') {
+      const after = { present: true, value: payload.alt };
+      alts.set(payload.nodeId, after);
+      gone = true;
+      result = { before: { present: false, value: '' }, after };
+    } else {
+      throw new Error(`Unexpected agent op ${payload.op}`);
+    }
+    return [{ documentId: 'doc-1', result }];
+  };
+}
+
+async function observeAndPropose(tabId) {
+  const observed = await panelMessage({ type: 'OBSERVE_PAGE', tabId, expectedDocumentId: 'doc-1' });
+  assert.equal(observed.error, undefined, JSON.stringify(observed));
+  const proposed = await panelMessage({
+    type: 'PROPOSE_ACTION',
+    tabId,
+    payload: {
+      summary: 'Describe two images',
+      steps: [
+        { type: 'set_alt', id: 'abcdef01-1', alt: 'First' },
+        { type: 'set_alt', id: 'abcdef01-2', alt: 'Second' },
+      ],
+    },
+  });
+  assert.equal(proposed.ok, true, JSON.stringify(proposed));
+  assert.equal(proposed.autoRun, true);
+  return proposed.proposalId;
+}
+
+test('a step that throws mid-proposal keeps the completed step and its undo record', async () => {
+  reset();
+  fakePage(11);
+  const proposalId = await observeAndPropose(11);
+  const response = await panelMessage({ type: 'RUN_PROPOSAL', proposalId, tabId: 11 });
+
+  assert.equal(response.report.completed, 1);
+  assert.equal(response.report.failedStep, 'Step 2: The page changed; observe it again');
+  assert.equal(response.report.undoKind, 'local');
+  assert.equal(response.phase, 'awaiting_result_confirmation');
+  const record = behavior.sessionState['undo:11'];
+  assert.equal(record.fields.length, 1);
+  assert.equal(record.fields[0].after.value, 'First');
+});
+
+test('a failure before any step reports nothing done and stores no undo record', async () => {
+  reset();
+  fakePage(12);
+  behavior.attachError = new Error('Another debugger is attached');
+  const proposalId = await observeAndPropose(12);
+  const response = await panelMessage({ type: 'RUN_PROPOSAL', proposalId, tabId: 12 });
+
+  assert.equal(response.report.completed, 0);
+  assert.equal(response.report.failedStep, 'Could not connect to the page debugger: Another debugger is attached');
+  assert.equal(response.report.undoKind, 'unavailable');
+  assert.equal(response.phase, 'guide');
+  assert.equal('undo:12' in behavior.sessionState, false);
 });
