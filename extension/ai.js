@@ -259,11 +259,15 @@ export function plainText(value) {
     .map((cell) => cell.trim())
     .filter(Boolean)
     .join(' '));
-  text = text.replace(/`([^`\n]+)`/gu, '$1');
+  const kept = [];
+  const keep = (value) => `\u0000${kept.push(value) - 1}\u0000`;
+  text = text.replace(/`([^`\n]+)`/gu, (_, code) => keep(code));
+  text = text.replace(/https?:\/\/[^\s<>()\[\]]+/gu, keep);
   text = text.replace(/\*\*([^*\n]+)\*\*/gu, '$1');
   text = text.replace(/__([^_\n]+)__/gu, '$1');
   text = text.replace(/(^|[^\w*])\*([^*\n]+)\*(?!\w)/gu, '$1$2');
   text = text.replace(/(^|[^\w_])_([^_\n]+)_(?!\w)/gu, '$1$2');
+  text = text.replace(/\u0000(\d+)\u0000/gu, (_, index) => kept[Number(index)]);
   text = text.replace(/!\[([^\]\n]*)\]\(([^)\s]+)(?:[ \t]+"[^"]*")?\)/gu, '$1');
   text = text.replace(/\[([^\]\n]+)\]\(([^)\s]+)(?:[ \t]+"[^"]*")?\)/gu, (_, label, href) => (
     href && label !== href ? `${label} (${href})` : label

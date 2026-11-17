@@ -282,6 +282,9 @@ test('markdown is removed from visible text without damaging ordinary values', (
   assert.equal(plainText('Version #2 costs $5 * 3.'), 'Version #2 costs $5 * 3.');
   assert.equal(plainText('```js\nconst a = 1;\n```'), 'const a = 1;');
   assert.equal(plainText('1. First choice\n2. Second choice'), 'First choice\nSecond choice');
+  assert.equal(plainText('Use `__init__`.'), 'Use __init__.');
+  assert.equal(plainText('See https://example.test/_private_/guide now'), 'See https://example.test/_private_/guide now');
+  assert.equal(plainText('[https://example.test/a_b_c](https://example.test/a_b_c)'), 'https://example.test/a_b_c');
 });
 
 test('both protocols clean visible text while keeping raw and tool data', async () => {

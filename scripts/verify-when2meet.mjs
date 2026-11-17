@@ -92,7 +92,7 @@ async function runProtocol({ name, config, key }) {
       const url = request.url();
       const submission = /(?:save|create)[^/]*event/i.test(url);
       if (submission || !/^(GET|HEAD)$/i.test(request.method())) {
-        if (submission) submissions.push(url);
+        submissions.push(`${request.method()} ${url}`);
         await route.abort();
         return;
       }

@@ -6,9 +6,12 @@ Tests and packaging need Node and npm; the end-to-end tests use Playwright's bun
 
 ```bash
 npm install
+npx playwright install chromium
 npm run test:unit
 npm run test:e2e
 ```
+
+On Linux hosts that lack browser system libraries, use `npx playwright install --with-deps chromium`.
 
 `npm run test:e2e` starts local fixture pages and a scripted API, then loads the real extension in Chromium. It uses scripted speech, microphone, and audio boundaries, so it cannot prove native side-panel placement, audible cues, or real microphone behavior.
 

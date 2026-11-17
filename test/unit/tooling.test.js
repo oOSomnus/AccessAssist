@@ -84,9 +84,10 @@ function runPackager(project) {
 }
 
 function envWithoutKey(extra = {}) {
-  const env = { ...process.env, ...extra };
+  const env = { ...process.env };
   delete env.OPENCODE_ACCESS_KEY;
-  return env;
+  delete env.ONLY_PROTOCOL;
+  return { ...env, ...extra };
 }
 
 test('regression: fixtures bind ephemeral ports, resolve the API origin, and close', async () => {
@@ -400,10 +401,19 @@ test('regression: packaging rebuilds a clean archive and preserves the last good
 
 test('regression: ONLY_PROTOCOL selects one known protocol and keeps both when absent', () => {
   const entries = [{ name: 'openai' }, { name: 'anthropic' }];
-  assert.deepEqual(selectProtocols(entries, undefined), entries);
-  assert.deepEqual(selectProtocols(entries, ''), entries);
-  assert.deepEqual(selectProtocols(entries, 'anthropic'), [{ name: 'anthropic' }]);
-  assert.equal(selectProtocols(entries, 'bogus'), null);
+  const saved = process.env.ONLY_PROTOCOL;
+  try {
+    delete process.env.ONLY_PROTOCOL;
+    assert.deepEqual(selectProtocols(entries, undefined), entries);
+    assert.deepEqual(selectProtocols(entries, ''), entries);
+    assert.deepEqual(selectProtocols(entries, 'anthropic'), [{ name: 'anthropic' }]);
+    assert.equal(selectProtocols(entries, 'bogus'), null);
+    process.env.ONLY_PROTOCOL = 'anthropic';
+    assert.deepEqual(selectProtocols(entries), [{ name: 'anthropic' }]);
+  } finally {
+    if (saved === undefined) delete process.env.ONLY_PROTOCOL;
+    else process.env.ONLY_PROTOCOL = saved;
+  }
   assert.equal(protocolSelectionError(), 'ONLY_PROTOCOL must be one of: openai, anthropic');
   assert.equal(isMain(new URL('../../scripts/live-check.mjs', import.meta.url).href, ''), false);
 });
@@ -431,6 +441,8 @@ test('regression: live check modules import without running', async () => {
   const smoke = await import('../../scripts/smoke-ai.mjs');
   const verify = await import('../../scripts/verify-when2meet.mjs');
   assert.equal(typeof smoke.insideTarget, 'function');
+  assert.equal(smoke.insideTarget({ x: 113, y: 20 }, { x: 120, y: 10, width: 90, height: 30 }), false);
+  assert.equal(smoke.insideTarget({ x: 165, y: 25 }, { x: 120, y: 10, width: 90, height: 30 }), true);
   assert.equal(typeof verify.oracleOk, 'function');
   assert.equal(typeof verify.terminalSuccess, 'function');
 });

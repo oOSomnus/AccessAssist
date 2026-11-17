@@ -153,10 +153,10 @@ const GROUNDING_TOOLS = [{
   },
 }];
 
-export function insideTarget(point, rect, margin = 8) {
+export function insideTarget(point, rect) {
   return Number.isFinite(point?.x) && Number.isFinite(point?.y)
-    && point.x >= rect.x - margin && point.x <= rect.x + rect.width + margin
-    && point.y >= rect.y - margin && point.y <= rect.y + rect.height + margin;
+    && point.x >= rect.x && point.x <= rect.x + rect.width
+    && point.y >= rect.y && point.y <= rect.y + rect.height;
 }
 
 function redact(result) {
