@@ -839,8 +839,15 @@ test('appearance: the panel follows the newest message and open question', async
         await expect(panel.locator('#transcript')).toHaveAttribute('aria-busy', 'false', { timeout: 30_000 });
       }
       const inView = (selector) => panel.evaluate((sel) => {
-        const rect = document.querySelector(sel).getBoundingClientRect();
-        return rect.top >= -1 && rect.bottom <= innerHeight + 1;
+        const element = document.querySelector(sel);
+        const rect = element.getBoundingClientRect();
+        const within = (top, bottom) => rect.top >= top - 1 && rect.bottom <= bottom + 1;
+        if (!within(0, innerHeight)) return false;
+        // The tall layout scrolls inside .panel-content; the short one scrolls the document.
+        const content = document.querySelector('.panel-content');
+        if (!content.contains(element) || getComputedStyle(content).overflowY === 'visible') return true;
+        const clip = content.getBoundingClientRect();
+        return within(clip.top, clip.bottom);
       }, selector);
       expect(await inView('#transcript > li:last-child')).toBe(true);
       await sendText(panel, 'Select Monday two to three.');

@@ -2249,6 +2249,10 @@ async function followOpenedPages(report, epoch, signal) {
 }
 
 async function toolProposeAction(call, ok, fail, epoch, signal) {
+  // The re-observation and the spoken result each need one more model call; never say "Confirming." without them.
+  if (MAX_MODEL_CALLS_PER_TURN - state.callsThisTurn < 2) {
+    return fail('Not run: this turn has too few model calls left to confirm the result. Ask the user to give the instruction again.');
+  }
   const proposed = await send('PROPOSE_ACTION', {
     tabId: state.tab.tabId,
     payload: call.args,

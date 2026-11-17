@@ -462,6 +462,33 @@ test('form edit is verified and undo stops on a later user change', async () => 
   }
 });
 
+test('an action starts only when the turn can still confirm it', async () => {
+  const { context, extensionId } = await launch();
+  try {
+    for (const { at, runs } of [{ at: 14, runs: true }, { at: 15, runs: false }]) {
+      await resetMock();
+      const page = await openFixture(context, '/article');
+      const panel = await openPanel(context, extensionId);
+      await sendText(panel, `Late name change at ${at}: Alex Morgan.`);
+      await answerWhen(panel, 'page text', 0);
+      if (runs) await answerWhen(panel, 'Run this?', 0);
+      await expect(panel.locator('#transcript'))
+        .toContainText(runs ? 'Done: the name is Alex Morgan.' : 'too few model calls left', { timeout: 30_000 });
+      await expect(panel.locator('#transcript')).toHaveAttribute('aria-busy', 'false', { timeout: 30_000 });
+      const spoken = await announcements(panel);
+      expect(spoken).not.toContain('model calls. Give a new instruction.');
+      expect(spoken.includes('About to run')).toBe(runs);
+      expect(spoken.includes('Confirming.')).toBe(runs);
+      if (runs) await expect(page.locator('#name')).toHaveValue('Alex Morgan');
+      else await expect(page.locator('#name')).not.toHaveValue('Alex Morgan');
+      await panel.close();
+      await page.close();
+    }
+  } finally {
+    await context.close();
+  }
+});
+
 test('submit needs two confirmations and reports that undo is unavailable', async () => {
   const { context, extensionId } = await launch();
   try {
