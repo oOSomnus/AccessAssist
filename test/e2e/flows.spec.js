@@ -117,6 +117,50 @@ test('read flow speaks the real paragraph and does not submit the form', async (
   }
 });
 
+test('debug log export records the session without the API key', async () => {
+  const { context, extensionId } = await launch();
+  try {
+    await resetMock();
+    await openFixture(context, '/article');
+    const panel = await openPanel(context, extensionId, { apiKey: 'sk-debug-secret-42' });
+    await expect(panel.locator('#page-line')).toContainText('Event schedule');
+
+    await sendText(panel, 'What is this page about? Read the second paragraph.');
+    await answerWhen(panel, 'page text', 0);
+    await expect(panel.locator('#transcript')).toContainText('Second paragraph: meet at the community center on Friday at 3 p.m. Bring water.', { timeout: 30_000 });
+
+    await panel.locator('#settings-toggle').click();
+    const [download] = await Promise.all([
+      panel.waitForEvent('download'),
+      panel.locator('#export-log').click(),
+    ]);
+    expect(download.suggestedFilename()).toMatch(/^accessassist-debug-.+\.json$/u);
+    const text = fs.readFileSync(await download.path(), 'utf8');
+    expect(text).not.toContain('sk-debug-secret-42');
+
+    const report = JSON.parse(text);
+    expect(report.format).toBe('accessassist-debug-log/1');
+    expect(report.requestTimeoutMs).toBe(180_000);
+    expect(report.events.map((event) => event.kind)).toEqual(expect.arrayContaining([
+      'turn.start',
+      'model.request',
+      'model.response',
+      'tool.call',
+      'tool.result',
+      'worker.request',
+      'worker.response',
+      'speech.status',
+      'choice.show',
+      'choice.finish',
+      'voice.result',
+    ]));
+    expect(report.events.find((event) => event.kind === 'turn.start').data.text)
+      .toBe('What is this page about? Read the second paragraph.');
+  } finally {
+    await context.close();
+  }
+});
+
 test('a real option click returns focus to Listen, not the document', async () => {
   const { context, extensionId } = await launch();
   try {

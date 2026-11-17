@@ -131,11 +131,13 @@ export class Speech {
     this.workingToken = 0;
     this.workingNodes = null;
     this.workingFailures = 0;
+    this.onWrite = null;
   }
 
-  attach({ statusEl, alertEl }) {
+  attach({ statusEl, alertEl, onWrite = null }) {
     this.statusEl = statusEl;
     this.alertEl = alertEl;
+    this.onWrite = onWrite;
   }
 
   async resumeAudio() {
@@ -321,6 +323,7 @@ export class Speech {
     const target = alert ? this.alertEl : this.statusEl;
     if (!target || target.isConnected === false) return false;
     const value = String(text);
+    this.onWrite?.(value, alert);
     if (!alert && target.getAttribute?.('role') === 'log' && target.ownerDocument) {
       // A log accumulates messages: replacing its text would overwrite what a
       // screen reader has not read yet. Append one populated node per message.

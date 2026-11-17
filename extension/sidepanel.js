@@ -1,5 +1,6 @@
-import { normalizeConfig, requestTurn } from './ai.js';
+import { normalizeConfig, requestTurn, REQUEST_TIMEOUT_MS } from './ai.js';
 import { consentRound } from './consent-round.js';
+import { createDebugLog } from './debug-log.js';
 import { closeChoiceSet, createChoiceSet, formatChoices, parseChoiceNumber, resolveChoice } from './protocol.js';
 import { keyBinding, keyForBinding, configFingerprint, configOrigin, DEFAULT_API_CONFIG, grantUpload, needsUpload, uploadConsentFor } from './settings.js';
 import { Speech, spokenSites, voiceSetupView } from './speech.js';
@@ -130,8 +131,24 @@ const state = {
   refreshSeq: 0,
 };
 
+// Session-scoped: cleared when the panel closes or reloads, kept across
+// conversation resets so a reset does not erase what led to it.
+const debugLog = createDebugLog({ secrets: () => [state.apiKey] });
+window.addEventListener('error', (event) => debugLog.add('panel.error', {
+  message: event.message,
+  source: event.filename,
+  line: event.lineno,
+  column: event.colno,
+  stack: event.error?.stack,
+}));
+window.addEventListener('unhandledrejection', (event) => debugLog.add('panel.rejection', { reason: event.reason }));
+
 const speech = new Speech({ lang: 'en-US' });
-speech.attach({ statusEl: $('sr-status'), alertEl: $('sr-alert') });
+speech.attach({
+  statusEl: $('sr-status'),
+  alertEl: $('sr-alert'),
+  onWrite: (text, alert) => debugLog.add(alert ? 'speech.alert' : 'speech.status', { text }),
+});
 
 const turns = createTurns();
 
@@ -253,7 +270,18 @@ function reveal(element) {
 }
 
 async function send(type, payload = {}) {
-  const response = await chrome.runtime.sendMessage({ type, ...payload });
+  // GET_COMMANDS fires on every focus; logging it would bury everything else.
+  const log = type !== 'GET_COMMANDS';
+  if (log) debugLog.add('worker.request', { type, payload });
+  const started = performance.now();
+  let response;
+  try {
+    response = await chrome.runtime.sendMessage({ type, ...payload });
+  } catch (error) {
+    if (log) debugLog.add('worker.failed', { type, elapsedMs: Math.round(performance.now() - started), error: error?.message });
+    throw error;
+  }
+  if (log) debugLog.add('worker.response', { type, elapsedMs: Math.round(performance.now() - started), response });
   if (response?.error) throw new Error(response.error);
   return response ?? {};
 }
@@ -369,27 +397,32 @@ async function listenOnce(requestId, seq) {
       }
       await speech.startListening({
         onReady: () => {
+          debugLog.add('voice.ready', { owned: owned() });
           if (!owned()) return;
           $('mode-line').textContent = 'Listening. Speak now.';
           syncWorking();
         },
         onResult: (text, info) => {
+          debugLog.add('voice.result', { owned: owned(), text, info });
           if (!owned()) return;
           consumeListen();
           void onVoiceResult(text, info, choiceSetId);
         },
         onError: (error) => {
+          debugLog.add('voice.error', { owned: owned(), error });
           if (!owned()) return;
           consumeListen();
           void onVoiceError(error);
         },
         onEnd: (info) => {
+          debugLog.add('voice.end', { owned: owned(), info });
           if (!owned()) return;
           consumeListen();
           void onVoiceEnd(info);
         },
       });
     } catch (error) {
+      debugLog.add('voice.failed', { owned: owned(), code: error?.code, message: error?.message });
       if (!owned()) return;
       consumeListen();
       // A prepared pack stays usable after a device or cue failure; only a
@@ -1088,6 +1121,7 @@ function finishChoice(choiceSetId, option, reason = 'answered') {
   state.choice = null;
   clearTimeout(current.timer);
   current.set = closeChoiceSet(current.set, reason);
+  debugLog.add('choice.finish', { id: current.set.id, reason, option });
   hideChoice();
   let feedback = null;
   if (option) {
@@ -1176,6 +1210,7 @@ function presentSet(set, { timeoutMs = 0, recordChoice = true, sourceSites = [] 
   return new Promise((resolve) => {
     const current = { set, resolve, timer: null, recordChoice, sourceSites: [...sourceSites] };
     state.choice = current;
+    debugLog.add('choice.show', { set, sourceSites: current.sourceSites, timeoutMs });
     state.choiceTrigger = choiceTriggerFor(document.activeElement);
     state.audioPaused = false;
     // A screen-reader announcement is not finished when the DOM write returns;
@@ -1351,8 +1386,19 @@ async function requestModel(turn, { retried = false } = {}) {
   if (!(await apiReady())) return null;
   if (!turn.isCurrent()) return null;
   syncWorking();
+  const started = performance.now();
+  const elapsedMs = () => Math.round(performance.now() - started);
+  debugLog.add('model.request', {
+    call: state.callsThisTurn + 1,
+    retried,
+    protocol: state.config.protocol,
+    baseUrl: state.config.baseUrl,
+    model: state.config.model,
+    effort: state.config.effort,
+    messages: state.history.length,
+  });
   try {
-    return await requestTurn({
+    const response = await requestTurn({
       config: state.config,
       apiKey: state.apiKey,
       sessionId: state.apiSessionId,
@@ -1360,7 +1406,23 @@ async function requestModel(turn, { retried = false } = {}) {
       messages: state.history,
       signal: turn.signal,
     });
+    debugLog.add('model.response', {
+      elapsedMs: elapsedMs(),
+      text: response.text,
+      toolCalls: response.toolCalls,
+      stopReason: response.stopReason,
+      usage: response.usage,
+      raw: response.raw,
+    });
+    return response;
   } catch (error) {
+    debugLog.add('model.error', {
+      elapsedMs: elapsedMs(),
+      stale: turn.stale,
+      code: error?.code,
+      message: error?.message,
+      details: error?.details,
+    });
     // A user abort surfaces from ai.js as a timeout; it must not be announced.
     if (turn.stale) return null;
     if (error?.code === 'image_rejected' && !retried) {
@@ -1451,7 +1513,17 @@ async function advance(turn) {
     for (const call of response.toolCalls) {
       if (turn.signal.aborted) break;
       runningCall = nextCall;
+      debugLog.add('tool.call', { id: call.id, name: call.name, args: call.args });
+      const toolStarted = performance.now();
       const result = await handleToolCall(call, turn);
+      debugLog.add('tool.result', {
+        id: call.id,
+        name: call.name,
+        elapsedMs: Math.round(performance.now() - toolStarted),
+        isError: result.isError,
+        content: result.content,
+        aborted: turn.signal.aborted,
+      });
       if (turn.signal.aborted) break;
       results.push(result);
       nextCall += 1;
@@ -1473,6 +1545,7 @@ async function advance(turn) {
 
 // Invalidates the running turn without erasing effects already executed.
 function preemptTurn() {
+  debugLog.add('turn.preempt');
   state.pendingInput = null;
   turns.next();
   state.actionContext = null;
@@ -1494,6 +1567,7 @@ async function runTurn(text) {
   state.confirming = false;
   state.history.push({ role: 'user', content: text });
   addTranscript('user', text);
+  debugLog.add('turn.start', { text, tab: state.tab });
   syncWorking();
   try {
     if (!(await apiReady())) return;
@@ -1507,8 +1581,14 @@ async function runTurn(text) {
     }
     await advance(turn);
   } catch (error) {
+    debugLog.add('turn.error', { error });
     if (turn.isCurrent()) await announceFailure(error);
   } finally {
+    debugLog.add('turn.end', {
+      calls: state.callsThisTurn,
+      current: turn.isCurrent(),
+      aborted: turn.signal.aborted,
+    });
     if (state.runningTurn === turn) {
       state.busy = false;
       syncWorking();
@@ -2291,6 +2371,7 @@ async function refreshTab({ announce = false, reason = '', windowId = null } = {
 }
 
 function resetConversation() {
+  debugLog.add('conversation.reset');
   interruptOutput();
   state.deferChoiceFocus = false;
   turns.next();
@@ -2446,6 +2527,11 @@ async function saveSettings(event) {
     state.apiKey = keyValue;
     state.keyStale = false;
   }
+  debugLog.add('settings.saved', {
+    config: next,
+    originChanged,
+    keyReplaced: Boolean(!originChanged && keyValue),
+  });
   await send('RESET_SESSION', { tabId: state.tab?.tabId }).catch(() => {});
   resetConversation();
   fillSettings();
@@ -2458,6 +2544,48 @@ async function saveSettings(event) {
   }
   await say(keyValue ? `Settings saved. ${listenSentence()}.` : 'Settings saved.');
   if (!state.apiKey) openSettingsForKey();
+}
+
+// One JSON file per export, built from the in-memory log plus a state snapshot.
+// The panel cannot confirm the file was written, so the announcement says the
+// download started rather than that it finished.
+async function exportDebugLog() {
+  const exportedAt = new Date().toISOString();
+  const report = debugLog.report({
+    exportedAt,
+    extensionVersion: chrome.runtime.getManifest().version,
+    userAgent: navigator.userAgent,
+    apiSessionId: state.apiSessionId,
+    config: state.config,
+    apiKeySet: Boolean(state.apiKey),
+    requestTimeoutMs: REQUEST_TIMEOUT_MS,
+    state: {
+      tab: state.tab,
+      mode: state.mode,
+      ready: state.ready,
+      busy: state.busy,
+      voiceReady: state.voiceReady,
+      voiceRetry: state.voiceRetry,
+      micState: state.micState,
+      localSpeech: speech.localStatus,
+      callsThisTurn: state.callsThisTurn,
+      visionLimited: state.visionLimited,
+      uploadConsent: state.uploadConsent,
+      frameConsent: state.frameConsent,
+      frameSkipped: state.frameSkipped,
+      choice: state.choice?.set ?? null,
+    },
+    systemPrompt: SYSTEM_PROMPT,
+    history: state.history,
+    pendingMessages: state.pendingMessages,
+  });
+  const url = URL.createObjectURL(new Blob([JSON.stringify(report, null, 2)], { type: 'application/json' }));
+  const link = document.createElement('a');
+  link.href = url;
+  link.download = `accessassist-debug-${exportedAt.replace(/[:.]/gu, '-')}.json`;
+  link.click();
+  setTimeout(() => URL.revokeObjectURL(url), 60_000);
+  await say(`Debug log download started with ${report.events.length} events. It includes page text and your spoken commands; the API key is removed.`);
 }
 
 const SHORTCUT_COMMAND_IDS = ['open-assistant', 'listen-once', 'close-assistant', 'replay-introduction'];
@@ -2535,6 +2663,7 @@ function bindEvents() {
     interruptOutput();
     void runIntro({ page: false });
   });
+  $('export-log').addEventListener('click', () => void exportDebugLog());
   $('settings-form').addEventListener('submit', (event) => void saveSettings(event));
   $('protocol').addEventListener('change', toggleAnthropicFields);
   document.addEventListener('keydown', handleNumberShortcut);
