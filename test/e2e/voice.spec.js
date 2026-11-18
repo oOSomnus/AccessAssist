@@ -359,7 +359,8 @@ test('a spoken answer does not move focus, and the next number answers the new c
     expect(await panel.evaluate(() => document.activeElement?.id)).toBe('listen');
     await panel.keyboard.press('Control+Shift+1');
     await expect(panel.locator('#ask')).toBeHidden();
-    expect(occurrences(await announcements(panel), 'Selected option 1: Allow.')).toBe(1);
+    // The selection is read after its cue, so it lands after the question hides.
+    await expect.poll(async () => occurrences(await announcements(panel), 'Selected option 1: Allow.')).toBe(1);
   } finally {
     await context.close();
   }
