@@ -354,6 +354,8 @@ async function say(text, { urgent = false, tag = null } = {}) {
   }
   return {
     delivered: current && outcome.delivered === true,
+    // Reached the region, even if a newer output took over meanwhile.
+    written: outcome.delivered === true,
     interrupted: !current || outcome.interrupted === true,
     reason: outcome.reason ?? null,
   };
@@ -475,8 +477,13 @@ async function onVoiceResult(text, info, choiceSetId) {
   if (!unchanged) return;
   if (!readback.delivered) {
     if (!readback.interrupted) {
+      // Withdrawn means a more urgent message replaced the readback before it
+      // was written; otherwise there was no region to write it to.
+      const why = readback.reason === 'withdrawn'
+        ? 'another message replaced its readback'
+        : 'its readback could not be delivered. Check that your screen reader is working';
       speech.writeStatus(
-        `Your spoken input was not used because its readback could not finish. Check that your screen reader is working. ${listenAction()} to try again.`,
+        `Your spoken input was not used because ${why}. ${listenAction()} to try again.`,
         true,
       );
     }
@@ -1329,10 +1336,15 @@ async function announcePage() {
 }
 
 let introGeneration = 0;
+const INTRO_TAG = 'intro';
 async function runIntro({ page = true } = {}) {
   const token = ++introGeneration;
-  const outcome = await say(introText());
+  // Tagged so a new entry clearing the queue lets the introduction through
+  // instead of dropping it; the first run is marked seen when it is claimed.
+  const outcome = await say(introText(), { tag: INTRO_TAG });
   if (!outcome.delivered) {
+    // It reached the region; a newer output only took over afterwards.
+    if (outcome.written) return false;
     if (token === introGeneration) {
       speech.writeStatus('The introduction was interrupted. Use Replay introduction to hear it again.');
     }
@@ -1703,6 +1715,8 @@ async function pauseAssistant() {
   state.audioPaused = true;
   interruptOutput();
   cancelVoice();
+  // An explicit pause: nothing still waiting to be read is wanted any more.
+  speech.cancelQueue();
   syncWorking();
   await speech.play('cancel');
   speech.writeStatus(`Paused. ${listenSentence()}.`);
@@ -2356,10 +2370,19 @@ async function runGuide() {
       reader = choice.value;
       // Stored so this is asked once, not once per image.
       state.screenReader = normalizeScreenReader(reader);
-      await chrome.storage.local.set({ screenReader: state.screenReader }).catch(() => {});
+      const saved = await chrome.storage.local.set({ screenReader: state.screenReader })
+        .then(() => true, () => false);
       // Only this field: fillSettings would also clear a key the user is
       // part-way through typing.
       $('screen-reader').value = state.screenReader;
+      // The choice stays saved, but a cancel during the write owns the panel.
+      if (!alive()) return;
+      if (!saved) {
+        const notice = 'Your screen reader choice could not be saved. This panel will use it, but a new panel will ask again. You can set it in Settings.';
+        addTranscript('assistant', notice);
+        await say(notice);
+        if (!alive()) return;
+      }
     }
   }
   const guide = guideFor(reader);
@@ -2458,7 +2481,15 @@ async function handleEntryIntent(intent) {
   state.deferChoiceFocus = false;
   interruptOutput();
   // A new entry owns the panel; messages queued for the old one are stale.
-  speech.cancelQueue();
+  // Two are not: the question of a choice that stays open, which the entry
+  // focuses but does not read again, and a first-run introduction that has
+  // already been marked seen. A replay entry reads the introduction itself.
+  speech.cancelQueue({
+    keep: [
+      state.choice ? choiceTag(state.choice.set.id) : null,
+      intent.mode === 'intro' ? null : INTRO_TAG,
+    ],
+  });
   cancelVoice();
   // A warm open notification already transferred keyboard focus before the
   // serialized claim; asking the window again would repeat its announcement.
@@ -2554,8 +2585,14 @@ async function saveSettings(event) {
   const previousFingerprint = configFingerprint(state.config);
   const next = normalized.config;
   const originChanged = previousOrigin !== configOrigin(next);
+  const keyValue = $('api-key').value.trim();
+  // The Screen reader preference reaches no model, so changing only that keeps
+  // the conversation, its pending messages, and upload consent.
+  const apiChanged = Boolean(keyValue)
+    || previousFingerprint !== configFingerprint(next)
+    || (state.config.effort ?? 'default') !== (next.effort ?? 'default');
   // Page text consented for the old receiver must not reach a newly configured one.
-  turns.current.cancel();
+  if (apiChanged) turns.current.cancel();
   const screenReader = normalizeScreenReader($('screen-reader').value);
   state.screenReader = screenReader;
   await chrome.storage.local.set({ apiConfig: next, screenReader });
@@ -2567,7 +2604,6 @@ async function saveSettings(event) {
     state.uploadConsent = null;
   }
   state.config = next;
-  const keyValue = $('api-key').value.trim();
   if (!originChanged && keyValue) {
     await chrome.storage.session.set({ apiKey: keyBinding(keyValue, next) });
     state.apiKey = keyValue;
@@ -2578,8 +2614,10 @@ async function saveSettings(event) {
     originChanged,
     keyReplaced: Boolean(!originChanged && keyValue),
   });
-  await send('RESET_SESSION', { tabId: state.tab?.tabId }).catch(() => {});
-  resetConversation();
+  if (apiChanged) {
+    await send('RESET_SESSION', { tabId: state.tab?.tabId }).catch(() => {});
+    resetConversation();
+  }
   fillSettings();
   $('settings-status').textContent = 'Saved.';
   updateModeLine();
@@ -2952,15 +2990,19 @@ async function initializePanel() {
   // microphone, or starts listening.
   if (status.local !== 'available') ensureLocalWatch();
   const claim = await send('CLAIM_INTENT', { windowId: state.windowId, cold: true }).catch(() => ({}));
-  if (claim.notices?.length) await say(claim.notices.join(' '));
+  // Startup messages are queued, not awaited: an announcement now settles only
+  // when it is written, and holding readiness behind each hold would drop the
+  // user's first clicks. The queue keeps their order, and the introduction is
+  // tagged so a cold-start entry below lets it through instead of dropping it.
+  if (claim.notices?.length) void say(claim.notices.join(' '));
   let intent = isForThisWindow(claim.intent) ? claim.intent : null;
 
   const intro = await send('CLAIM_INTRO').catch(() => ({ seen: true }));
-  if (!intro.seen) await runIntro();
-  else if (!intent) await say(replaySentence());
+  if (!intro.seen) void runIntro();
+  else if (!intent) void say(replaySentence());
 
   if (state.keyStale) {
-    await say('The saved API key was bound to an older address format and was cleared. Paste it again in Settings.', { urgent: true });
+    void say('The saved API key was bound to an older address format and was cleared. Paste it again in Settings.', { urgent: true });
     openSettingsForKey();
   }
   state.ready = true;

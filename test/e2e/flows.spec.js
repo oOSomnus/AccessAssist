@@ -581,6 +581,17 @@ test('authentication failure is spoken and focuses the key form', async () => {
 
 test('image choice cancels without upload and AI choice sends a cropped screenshot', async () => {
   const { context, extensionId } = await launch();
+  // Windows, through both inputs detection reads, so the reader is asked and
+  // the offered readers are known.
+  await context.addInitScript(() => {
+    if (!location.protocol.startsWith('chrome-extension:')) return;
+    Object.defineProperty(Navigator.prototype, 'platform', { configurable: true, get: () => 'Win32' });
+    Object.defineProperty(Navigator.prototype, 'userAgentData', {
+      configurable: true,
+      get: () => ({ platform: 'Windows', mobile: false, brands: [] }),
+    });
+  });
+  const guideEntries = (panel) => panel.locator('.message-body', { hasText: 'Here are the NVDA keys' }).count();
   try {
     await resetMock();
     const page = await openFixture(context, '/images');
@@ -599,23 +610,29 @@ test('image choice cancels without upload and AI choice sends a cropped screensh
     await sendText(panel, 'What is this image?');
     await answerWhen(panel, 'Allow these sources', 1);
     await answerWhen(panel, 'How should I describe this image?', 1);
-    // Detection can only tell Windows from macOS, so the reader itself is
-    // asked. On this platform every reader we have keys for is offered.
-    await answerWhen(panel, 'Which screen reader', 0);
-    await expect(panel.locator('#transcript')).toContainText('VO plus Shift plus L');
+    // Detection can only tell Windows from macOS, so on Windows the reader
+    // itself is asked, offering the three Windows readers.
+    await expect(panel.locator('#ask-question')).toContainText('Which screen reader');
+    expect(await panel.locator('#ask-options button').allTextContents())
+      .toEqual(['1 Narrator', '2 NVDA', '3 JAWS', '4 Back']);
+    await panel.locator('#ask-options button', { hasText: 'NVDA' }).click();
+    await expect(panel.locator('#transcript')).toContainText('NVDA plus R');
+    expect(await guideEntries(panel)).toBe(1);
     expect(await announcements(panel)).not.toContain('Continue?');
     await expect(panel.locator('#transcript')).toContainText('screen-reader guide');
     requests = await mockRequests();
     expect(requests.some((request) => JSON.stringify(request.body).includes('image_url'))).toBe(false);
-    expect(await panel.locator('#screen-reader').inputValue()).toBe('voiceover');
+    expect(await panel.locator('#screen-reader').inputValue()).toBe('nvda');
 
     await page.bringToFront();
     await sendText(panel, 'What is this image?');
     await answerWhen(panel, 'Allow these sources', 1);
     // The stored answer means the reader is asked once, not once per image:
-    // the guide follows the describe choice directly.
+    // the guide follows the describe choice directly. Wait for that second
+    // guide, so a picker opened late would still be caught below.
+    const guidesBefore = await guideEntries(panel);
     await answerWhen(panel, 'How should I describe this image?', 1);
-    await expect(panel.locator('#transcript')).toContainText('VO plus Shift plus L');
+    await expect.poll(() => guideEntries(panel), { timeout: 30_000 }).toBe(guidesBefore + 1);
     await expect(panel.locator('#ask')).toBeHidden();
     expect(await announcements(panel)).not.toContain('Continue?');
     await expect(panel.locator('#transcript')).toContainText('screen-reader guide');
@@ -915,13 +932,18 @@ test('HTTPS www receiver and source are spoken as domains without changing origi
     await answerWhen(panel, 'How should I describe this image?', 0);
     await expect(panel.locator('#ask-question')).toContainText('The receiver is opencode.ai');
     await expect(panel.locator('#ask-sites')).toBeHidden();
+    const receiverEntries = async () => (await announcementEntries(panel))
+      .filter((entry) => entry.includes('The receiver is opencode.ai')).length;
+    // The question's own first reading must land before the baseline, or it
+    // alone would satisfy the check below even if Repeat did nothing.
+    await expect.poll(receiverEntries).toBe(1);
     const beforeRepeat = (await announcementEntries(panel)).length;
     await panel.locator('#repeat').click();
-    // Messages are queued, so the repeat can arrive after the question's own
-    // first reading; wait for the receiver to be spoken rather than taking
-    // whichever entry lands first.
-    await expect.poll(async () => (await announcementEntries(panel)).slice(beforeRepeat).join(' '))
-      .toContain('The receiver is opencode.ai');
+    await expect.poll(receiverEntries).toBe(2);
+    // Let the repeated reading's hold run out. The queue writes its next
+    // message in the same step that clears the region, so an empty region
+    // means nothing queued behind the repeat is still unwritten.
+    await expect(panel.locator('#sr-status')).toHaveText('');
     const repeated = (await announcementEntries(panel)).slice(beforeRepeat).join(' ');
     expect(repeated).not.toContain('https://www');
     // The previous question was answered before this one appeared; its reading

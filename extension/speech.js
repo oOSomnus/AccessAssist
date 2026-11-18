@@ -109,9 +109,10 @@ export function voiceSetupView({ surface, local, mic, ready, preparing, failed, 
           : mic === 'denied' ? 'Microphone access is denied. Allow it in Chrome site settings and system settings, then choose Retry.'
             : preparing ? 'Chrome is preparing the English speech pack and will ask for the microphone. Allow it when Chrome asks.'
               : local === 'downloading' ? 'Chrome is downloading the English speech pack. Voice will be ready when it finishes.'
-                : local === 'downloadable' ? 'Chrome needs the English speech pack. Choose Prepare voice to start.'
-                  : mic === 'granted' ? 'Waiting for the English speech pack.'
-                    : retry ? 'Voice is not ready. Choose Retry to try again.'
+                // A failed attempt shows Retry, so the text must name Retry too.
+                : retry ? 'Voice is not ready. Choose Retry to try again.'
+                  : local === 'downloadable' ? 'Chrome needs the English speech pack. Choose Prepare voice to start.'
+                    : mic === 'granted' ? 'Waiting for the English speech pack.'
                       : 'Press Prepare voice to check the microphone and prepare speech.';
     return { sectionHidden: false, returnHidden: !ready, startHidden: ready || preparing || local === 'downloading', startLabel, status };
   }
@@ -121,8 +122,8 @@ export function voiceSetupView({ surface, local, mic, ready, preparing, failed, 
       : mic === 'denied' ? 'Microphone access is denied. Allow it in Chrome site settings and system settings, then choose Retry.'
         : preparing ? 'Chrome is preparing the English speech pack and will ask for the microphone.'
           : local === 'downloading' ? 'Chrome is downloading the English speech pack. Voice will be ready when it finishes.'
-            : local === 'downloadable' ? 'The English speech pack is not ready. Choose Set up voice to start.'
-              : retry ? 'Voice is not ready. Choose Retry to try again.'
+            : retry ? 'Voice is not ready. Choose Retry to try again.'
+              : local === 'downloadable' ? 'The English speech pack is not ready. Choose Set up voice to start.'
                 : mic === 'granted' ? `Speech is ready. ${listen}.`
                   : 'Voice needs microphone permission. Choose Set up voice to start.';
   return { sectionHidden: false, returnHidden: true, startHidden: (preparing || local === 'downloading') && !retry, startLabel, status };
@@ -134,6 +135,7 @@ export class Speech {
     this.liveEl = null;
     this.queue = [];
     this.queueTimer = null;
+    this.shown = null;
     this.quietUntil = 0;
     this.audio = null;
     this.listening = false;
@@ -287,6 +289,15 @@ export class Speech {
     this.workingNodes = null;
   }
 
+  // Cuts the tone group that is sounding now but keeps the working request,
+  // so the next group still plays once the region is quiet again.
+  silenceWorking() {
+    for (const oscillator of this.workingNodes ?? []) {
+      try { oscillator.stop(); } catch {}
+    }
+    this.workingNodes = null;
+  }
+
   scheduleWorking(delay) {
     if (!this.workingActive || this.workingTimer) return;
     const token = this.workingToken;
@@ -313,6 +324,11 @@ export class Speech {
     }
     const running = await this.resumeAudio();
     if (!this.workingActive || token !== this.workingToken) return;
+    // A message may have entered the region while audio was resuming.
+    if (this.quietUntil - Date.now() > 0) {
+      this.scheduleWorking(WORKING_GAP_MS);
+      return;
+    }
     if (!running || !this.audio) {
       this.workingFailures += 1;
       if (this.workingFailures >= WORKING_FAILURES) {
@@ -350,26 +366,48 @@ export class Speech {
   }
 
   // One region, one queue. Both readers then speak the same messages in the
-  // same order: an urgent message drops what is still pending rather than
-  // racing a second region whose priority each reader resolves differently.
-  // Returns whether the message was accepted, which is delivery to the page
-  // and never proof that a reader spoke it.
+  // same order: an urgent message goes ahead of what is still pending rather
+  // than racing a second region whose priority each reader resolves
+  // differently. Returns whether the message was accepted, which is delivery
+  // to the page and never proof that a reader spoke it.
   // A tag names what a message is about, so the message can be withdrawn while
   // it is still waiting once that thing is gone; see dropPending.
   writeStatus(text, urgent = false, tag = null) {
+    return this.enqueue(text, { urgent, tag }) !== null;
+  }
+
+  // Queues one message and returns a promise that settles once: delivered
+  // when the message is written to the region, not delivered when it is
+  // withdrawn first. Returns null when there is no region to write to.
+  enqueue(text, { urgent = false, tag = null } = {}) {
     const target = this.liveEl;
-    if (!target || target.isConnected === false) return false;
+    if (!target || target.isConnected === false) return null;
     const value = String(text);
     this.onWrite?.(value, urgent);
+    let settle;
+    const written = new Promise((resolve) => { settle = resolve; });
+    const entry = { value, urgent, tag, settle };
     if (urgent) {
-      // Anything still pending and not urgent describes a state this message
-      // supersedes. What survives is all urgent, so appending keeps urgent
-      // messages in the order they were raised.
-      this.queue = this.queue.filter((entry) => entry.urgent);
+      // An untagged pending message describes a state this one supersedes.
+      // A tagged one is about something its owner still holds open, such as
+      // an unanswered question, so it waits behind the urgent message instead
+      // and is withdrawn only when that thing closes.
+      const kept = [];
+      for (const pending of this.queue) {
+        if (pending.urgent || pending.tag != null) kept.push(pending);
+        else pending.settle(false);
+      }
+      // Behind earlier urgent messages, ahead of everything else, so urgent
+      // messages keep the order they were raised in.
+      const at = kept.findIndex((pending) => !pending.urgent);
+      if (at === -1) kept.push(entry);
+      else kept.splice(at, 0, entry);
+      this.queue = kept;
+    } else {
+      this.queue.push(entry);
     }
-    this.queue.push({ value, urgent, tag });
     this.pumpQueue();
-    return true;
+    return written;
   }
 
   // Withdraws messages with this tag that have not been written yet. A
@@ -378,26 +416,40 @@ export class Speech {
   // alone: it may be mid-sentence, and cutting it off is the reader's job.
   dropPending(tag) {
     if (tag == null) return;
-    this.queue = this.queue.filter((entry) => entry.tag !== tag);
+    this.queue = this.queue.filter((entry) => {
+      if (entry.tag !== tag) return true;
+      entry.settle(false);
+      return false;
+    });
   }
 
-  // Writes one message, then holds the region long enough for a reader to get
-  // through it. This queue is what keeps a later message from overwriting an
-  // unread one, so the region itself can stay atomic and ephemeral.
+  // Writes one message, then holds the region for an estimate of how long a
+  // reader needs for it. The hold is capped at six seconds and nothing reports
+  // when reading actually finishes, so a later message, urgent or not, waits
+  // only for the current estimated hold. This queue is what keeps a later
+  // message from overwriting one that was just written, so the region itself
+  // can stay atomic and ephemeral.
   pumpQueue() {
     if (this.queueTimer) return;
     const entry = this.queue.shift();
     if (!entry) return;
     const target = this.liveEl;
     if (!target || target.isConnected === false) {
+      entry.settle(false);
+      for (const pending of this.queue) pending.settle(false);
       this.queue.length = 0;
       return;
     }
+    // A tone over a screen reader buries the message.
+    this.silenceWorking();
     this.showMessage(target, entry.value);
+    this.shown = entry;
+    entry.settle(true);
     const hold = speechHoldMs(entry.value);
     this.quietUntil = Date.now() + hold;
     this.queueTimer = setTimeout(() => {
       this.queueTimer = null;
+      this.shown = null;
       // Clearing stops the hidden region from becoming a browsable copy of the
       // transcript; aria-relevant="additions" keeps the removal silent.
       this.clearLive();
@@ -426,13 +478,23 @@ export class Speech {
   }
 
   // Drops every message not yet written. Only a user action reaches this, so it
-  // also releases the quiet window and lets the working tone resume.
-  cancelQueue() {
-    this.queue.length = 0;
+  // also releases the quiet window and lets the working tone resume. Messages
+  // whose tag is in keep survive: their subject is still open. A kept message
+  // already in the region also keeps its hold, so it is not cut short.
+  cancelQueue({ keep = [] } = {}) {
+    const kept = new Set(keep.filter((tag) => tag != null));
+    this.queue = this.queue.filter((entry) => {
+      if (kept.has(entry.tag)) return true;
+      entry.settle(false);
+      return false;
+    });
+    if (this.shown && kept.has(this.shown.tag)) return;
     if (this.queueTimer) clearTimeout(this.queueTimer);
     this.queueTimer = null;
+    this.shown = null;
     this.quietUntil = 0;
     this.clearLive();
+    this.pumpQueue();
   }
 
   clearStatus() {
@@ -440,15 +502,20 @@ export class Speech {
   }
 
   // Stopping recording here keeps a readback from being captured as a new
-  // command.
+  // command. Settles once the message is written to the region (delivered) or
+  // withdrawn before that (not delivered). Written is not spoken: nothing
+  // reports when a reader finishes.
   async announce(text, { urgent = false, tag = null } = {}) {
     const value = String(text ?? '').trim();
     if (!value) return { delivered: true, interrupted: false, reason: null };
     this.stopListening();
+    const written = this.enqueue(value, { urgent, tag });
+    if (!written) return { delivered: false, interrupted: false, reason: 'no-region' };
+    const delivered = await written;
     return {
-      delivered: this.writeStatus(value, urgent, tag),
+      delivered,
       interrupted: false,
-      reason: null,
+      reason: delivered ? null : 'withdrawn',
     };
   }
 

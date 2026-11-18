@@ -1,5 +1,5 @@
 import { expect, test } from '@playwright/test';
-import { announcementEntries, announcements, answer, launch, openFixture, openPanel, resetMock, sendText, voiceState } from './helpers.js';
+import { announcementEntries, announcements, answer, answerWhen, launch, openFixture, openPanel, resetMock, sendText, voiceState } from './helpers.js';
 
 async function attachScreenshot(page, testInfo, name) {
   await testInfo.attach(name, {
@@ -881,8 +881,14 @@ test('appearance: one announcement region, reachable controls, and distinct cont
     await expect(panel.locator('#sr-status')).toHaveAttribute('role', 'status');
     await expect(panel.locator('#sr-status')).toHaveAttribute('aria-atomic', 'true');
     await expect(panel.locator('#sr-status')).toHaveAttribute('aria-live', 'polite');
-    expect(await panel.locator('[role="alert"]').count()).toBe(0);
-    expect(await panel.locator('[role="log"]').count()).toBe(0);
+    // Every live region, explicit aria-live or a role that is live without it
+    // (output is an implicit status). #sr-status is the only announcement
+    // channel; the other two are the visible status lines of the settings form
+    // and voice setup, and no new region may join them unnoticed.
+    const liveRegions = await panel.evaluate(() => [...document.querySelectorAll(
+      '[aria-live]:not([aria-live="off"]), [role="status"], [role="alert"], [role="log"], [role="marquee"], [role="timer"], output',
+    )].map((node) => node.id || node.tagName));
+    expect(liveRegions.sort()).toEqual(['settings-status', 'sr-status', 'voice-status']);
 
     // The primary controls must be reachable by landmark and heading, not only
     // by tabbing from the top of the panel.
@@ -890,16 +896,17 @@ test('appearance: one announcement region, reachable controls, and distinct cont
     await expect(panel.locator('#composer')).toHaveAccessibleName('Actions');
     await expect(panel.locator('#actions-heading')).toHaveText('Actions');
 
-    // Named once each: the section heading already names the conversation, and
-    // a labelled group around the options would repeat the question on focus.
+    // The section heading already names the conversation. The options are a
+    // group named by the question, so focus that lands straight on an option
+    // still hears what it answers after the live region has cleared.
     expect(await panel.locator('#transcript').getAttribute('aria-label')).toBeNull();
-    expect(await panel.locator('#ask-options').getAttribute('role')).toBeNull();
-    expect(await panel.locator('#ask-options').getAttribute('aria-labelledby')).toBeNull();
+    await expect(panel.locator('#ask-options')).toHaveAttribute('role', 'group');
+    await expect(panel.locator('#ask-options')).toHaveAttribute('aria-labelledby', 'ask-question');
 
     // Two buttons that do different things must not answer to the same name.
     await expect(panel.locator('#voice-setup')).toBeVisible();
-    await expect(panel.locator('#start-using')).toHaveText('1 Set up voice');
-    await expect(panel.locator('#listen')).toHaveText('1 Prepare voice');
+    await expect(panel.locator('#start-using')).toHaveAccessibleName('1 Set up voice');
+    await expect(panel.locator('#listen')).toHaveAccessibleName('1 Prepare voice');
 
     await panel.locator('#settings-toggle').click();
     await expect(panel.locator('#screen-reader')).toBeVisible();
@@ -916,9 +923,21 @@ test('appearance: the live region holds one message at a time instead of accumul
     await openFixture(context, '/article');
     const panel = await openPanel(context, extensionId);
     await sendText(panel, 'What is this page about?');
-    // Readback, working, and the answer are three separate announcements.
-    await expect.poll(async () => (await announcementEntries(panel)).length, { timeout: 30_000 })
-      .toBeGreaterThan(2);
+    // Readback, working, and the source question are separate announcements,
+    // written in that order.
+    const inOrder = (entries) => {
+      const readback = entries.indexOf('I heard: What is this page about?');
+      const working = entries.indexOf('working', readback + 1);
+      const question = entries.findIndex((entry, index) => index > working && entry.includes('Allow these sources'));
+      return readback >= 0 && working > readback && question > working;
+    };
+    await expect.poll(async () => inOrder(await announcementEntries(panel)), { timeout: 30_000 })
+      .toBe(true);
+    // The mock's answer follows the question once the sources are allowed.
+    const asked = (await announcementEntries(panel)).length;
+    await answerWhen(panel, 'Allow these sources', 0);
+    await expect.poll(async () => (await announcementEntries(panel)).slice(asked)
+      .some((entry) => entry.includes('Event schedule')), { timeout: 30_000 }).toBe(true);
 
     // Everything said stays in #transcript. A region that kept its history
     // would be a second, stale copy for a reader to wander into, so it holds

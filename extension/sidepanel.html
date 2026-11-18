@@ -33,9 +33,10 @@
         <h2 id="ask-heading">Your choice</h2>
         <p id="ask-question"></p>
         <ol id="ask-sites" aria-label="Source sites" hidden></ol>
-        <!-- No group role: the section and its heading already group and name
-             these, and a second label would repeat the question on focus. -->
-        <div id="ask-options"></div>
+        <!-- Named by the question, so focus that lands straight on an option
+             still hears what it answers once the live region has cleared.
+             Each button keeps its visible text as its own name. -->
+        <div id="ask-options" role="group" aria-labelledby="ask-question"></div>
         <p id="choice-shortcut-hint" class="hint">Press Control plus Shift plus a number to choose. Press Escape to cancel.</p>
       </section>
 

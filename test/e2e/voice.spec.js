@@ -99,8 +99,9 @@ test('a missing announcement target blocks capture before the microphone', async
     await sendIntent(worker, intent('prompt-missing'));
     // There is exactly one announcement channel, so with it gone the refusal
     // cannot be spoken either. What must hold is the behaviour: a prompt that
-    // cannot be delivered never opens the microphone.
-    await panel.waitForTimeout(1_000);
+    // cannot be delivered never opens the microphone. The failure tone is the
+    // refusal path finishing; only then is the absence of capture meaningful.
+    await expect.poll(async () => (await voiceState(panel)).tones, { timeout: 10_000 }).toContain(220);
     const state = await voiceState(panel);
     expect(state.starts).toBe(0);
     expect(state.gumCalls).toBe(0);
