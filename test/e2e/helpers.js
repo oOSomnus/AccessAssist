@@ -9,32 +9,26 @@ export const MOCK_BASE = 'http://127.0.0.1:4174';
 
 function recordAnnouncements() {
   window.__aaAnnouncements = [];
-  const seen = new Set();
+  // The panel holds each message only long enough for a reader to speak it,
+  // then clears the region. Real holds would push a queued sequence past these
+  // tests' poll budgets, so shorten them; ordering is what the tests check.
+  window.__aaSpeechHoldMs = 50;
   const install = () => {
-    let attached = 0;
-    for (const id of ['sr-status', 'sr-alert']) {
-      if (seen.has(id)) {
-        attached += 1;
-        continue;
+    const element = document.getElementById('sr-status');
+    if (!element) return false;
+    const record = (node) => {
+      const text = node?.textContent;
+      if (text) window.__aaAnnouncements.push(text);
+    };
+    // One added node is one message. Removals are the panel clearing the
+    // region after its hold, which is not an announcement.
+    new MutationObserver((records) => {
+      for (const mutation of records) {
+        for (const node of mutation.addedNodes) record(node);
       }
-      const element = document.getElementById(id);
-      if (!element) continue;
-      seen.add(id);
-      const record = (node) => {
-        const text = node?.textContent;
-        if (text) window.__aaAnnouncements.push(text);
-      };
-      // Each append is one message; ignore removals and never re-read the
-      // accumulated log, which would replay every earlier message.
-      new MutationObserver((records) => {
-        for (const mutation of records) {
-          for (const node of mutation.addedNodes) record(node);
-        }
-      }).observe(element, { childList: true });
-      record(element);
-      attached += 1;
-    }
-    return attached === 2;
+    }).observe(element, { childList: true });
+    record(element);
+    return true;
   };
   if (install()) return;
   const timer = setInterval(() => { if (install()) clearInterval(timer); }, 10);

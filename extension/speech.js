@@ -24,6 +24,25 @@ const WORKING_GAIN = 0.035;
 const WORKING_DELAY_MS = 400;
 const WORKING_GAP_MS = 1200;
 const WORKING_FAILURES = 3;
+// A live region reports delivery to the page, never that a screen reader
+// finished speaking. These bounds estimate how long one message occupies the
+// reader at roughly 180 words per minute, so the queue leaves a gap between
+// messages and the working tone stays out of the way. The cap is deliberately
+// short: a long answer must not stall the queue behind it.
+const SPEECH_MS_PER_WORD = 330;
+const SPEECH_SETUP_MS = 400;
+const SPEECH_HOLD_MIN_MS = 1_200;
+const SPEECH_HOLD_MAX_MS = 6_000;
+
+const clamp = (value, low, high) => Math.min(high, Math.max(low, value));
+
+// Tests shorten the hold so a queued sequence fits inside their poll budget.
+function speechHoldMs(text) {
+  const override = globalThis.__aaSpeechHoldMs;
+  if (Number.isFinite(override)) return Math.max(0, override);
+  const words = String(text).trim().split(/\s+/u).filter(Boolean).length;
+  return clamp(words * SPEECH_MS_PER_WORD + SPEECH_SETUP_MS, SPEECH_HOLD_MIN_MS, SPEECH_HOLD_MAX_MS);
+}
 // Chrome only honors the track overload on these platforms; elsewhere the
 // extra argument can be dropped and the default microphone used instead.
 const ISOLATED_INPUT_OS = new Set(['win', 'mac', 'linux']);
@@ -78,7 +97,9 @@ export function localRecognitionSupported(Recognition) {
 // The voice-setup section for one surface: which controls show and the one status sentence.
 export function voiceSetupView({ surface, local, mic, ready, preparing, failed, listen }) {
   const retry = !ready && (failed || mic === 'denied' || local === 'unavailable' || local === 'error');
-  const startLabel = retry ? '1 Retry' : '1 Prepare voice';
+  // In the panel the composer's Listen button already reads "1 Prepare voice"
+  // while voice is unready, so this one must not answer to the same name.
+  const startLabel = retry ? '1 Retry' : surface === 'setup' ? '1 Prepare voice' : '1 Set up voice';
   if (surface === 'setup') {
     // Keep the preparation entry visible whenever it is not already running,
     // so a first-time user can start the pack download without a shortcut.
@@ -100,18 +121,20 @@ export function voiceSetupView({ surface, local, mic, ready, preparing, failed, 
       : mic === 'denied' ? 'Microphone access is denied. Allow it in Chrome site settings and system settings, then choose Retry.'
         : preparing ? 'Chrome is preparing the English speech pack and will ask for the microphone.'
           : local === 'downloading' ? 'Chrome is downloading the English speech pack. Voice will be ready when it finishes.'
-            : local === 'downloadable' ? 'The English speech pack is not ready. Choose Prepare voice to start.'
+            : local === 'downloadable' ? 'The English speech pack is not ready. Choose Set up voice to start.'
               : retry ? 'Voice is not ready. Choose Retry to try again.'
                 : mic === 'granted' ? `Speech is ready. ${listen}.`
-                  : 'Voice needs microphone permission. Choose Prepare voice to start.';
+                  : 'Voice needs microphone permission. Choose Set up voice to start.';
   return { sectionHidden: false, returnHidden: true, startHidden: (preparing || local === 'downloading') && !retry, startLabel, status };
 }
 
 export class Speech {
   constructor({ lang = 'en-US' } = {}) {
     this.lang = lang;
-    this.statusEl = null;
-    this.alertEl = null;
+    this.liveEl = null;
+    this.queue = [];
+    this.queueTimer = null;
+    this.quietUntil = 0;
     this.audio = null;
     this.listening = false;
     this.sessionSeq = 0;
@@ -134,9 +157,8 @@ export class Speech {
     this.onWrite = null;
   }
 
-  attach({ statusEl, alertEl, onWrite = null }) {
-    this.statusEl = statusEl;
-    this.alertEl = alertEl;
+  attach({ liveEl, onWrite = null }) {
+    this.liveEl = liveEl;
     this.onWrite = onWrite;
   }
 
@@ -268,10 +290,18 @@ export class Speech {
   scheduleWorking(delay) {
     if (!this.workingActive || this.workingTimer) return;
     const token = this.workingToken;
+    // A tone over a screen reader buries the message. While a message still
+    // holds the region, wait out the rest of its hold instead of playing.
+    const quiet = this.quietUntil - Date.now();
+    const wait = quiet > 0 ? Math.max(delay, quiet) : delay;
     this.workingTimer = setTimeout(() => {
       this.workingTimer = null;
+      if (this.quietUntil - Date.now() > 0) {
+        this.scheduleWorking(WORKING_GAP_MS);
+        return;
+      }
       void this.playWorkingGroup(token);
-    }, delay);
+    }, wait);
   }
 
   async playWorkingGroup(token) {
@@ -319,39 +349,104 @@ export class Speech {
     }
   }
 
-  writeStatus(text, alert = false) {
-    const target = alert ? this.alertEl : this.statusEl;
+  // One region, one queue. Both readers then speak the same messages in the
+  // same order: an urgent message drops what is still pending rather than
+  // racing a second region whose priority each reader resolves differently.
+  // Returns whether the message was accepted, which is delivery to the page
+  // and never proof that a reader spoke it.
+  // A tag names what a message is about, so the message can be withdrawn while
+  // it is still waiting once that thing is gone; see dropPending.
+  writeStatus(text, urgent = false, tag = null) {
+    const target = this.liveEl;
     if (!target || target.isConnected === false) return false;
     const value = String(text);
-    this.onWrite?.(value, alert);
-    if (!alert && target.getAttribute?.('role') === 'log' && target.ownerDocument) {
-      // A log accumulates messages: replacing its text would overwrite what a
-      // screen reader has not read yet. Append one populated node per message.
-      const message = target.ownerDocument.createElement('div');
-      message.textContent = value;
-      target.append(message);
-      return true;
+    this.onWrite?.(value, urgent);
+    if (urgent) {
+      // Anything still pending and not urgent describes a state this message
+      // supersedes. What survives is all urgent, so appending keeps urgent
+      // messages in the order they were raised.
+      this.queue = this.queue.filter((entry) => entry.urgent);
     }
-    // The alert channel and single-value status targets show only the latest;
-    // clearing first lets an identical message produce a fresh announcement.
-    if (alert) target.textContent = '';
-    target.textContent = value;
+    this.queue.push({ value, urgent, tag });
+    this.pumpQueue();
     return true;
   }
 
-  clearStatus() {
-    if (this.statusEl) this.statusEl.textContent = '';
+  // Withdraws messages with this tag that have not been written yet. A
+  // question answered or replaced while its reading still waits in the queue
+  // must not be read out afterwards. The message already in the region is left
+  // alone: it may be mid-sentence, and cutting it off is the reader's job.
+  dropPending(tag) {
+    if (tag == null) return;
+    this.queue = this.queue.filter((entry) => entry.tag !== tag);
   }
 
-  // A live-region write is delivery to the page, not proof that a screen
-  // reader finished speaking. Stopping recording here keeps a readback from
-  // being captured as a new command.
-  async announce(text, { alert = false } = {}) {
+  // Writes one message, then holds the region long enough for a reader to get
+  // through it. This queue is what keeps a later message from overwriting an
+  // unread one, so the region itself can stay atomic and ephemeral.
+  pumpQueue() {
+    if (this.queueTimer) return;
+    const entry = this.queue.shift();
+    if (!entry) return;
+    const target = this.liveEl;
+    if (!target || target.isConnected === false) {
+      this.queue.length = 0;
+      return;
+    }
+    this.showMessage(target, entry.value);
+    const hold = speechHoldMs(entry.value);
+    this.quietUntil = Date.now() + hold;
+    this.queueTimer = setTimeout(() => {
+      this.queueTimer = null;
+      // Clearing stops the hidden region from becoming a browsable copy of the
+      // transcript; aria-relevant="additions" keeps the removal silent.
+      this.clearLive();
+      this.pumpQueue();
+    }, hold);
+  }
+
+  // One mutation per message: an empty-then-fill write makes some readers
+  // announce the same message twice.
+  showMessage(target, value) {
+    const owner = target.ownerDocument;
+    if (owner?.createElement && target.replaceChildren) {
+      const message = owner.createElement('div');
+      message.textContent = value;
+      target.replaceChildren(message);
+      return;
+    }
+    target.textContent = value;
+  }
+
+  clearLive() {
+    const target = this.liveEl;
+    if (!target) return;
+    if (target.replaceChildren) target.replaceChildren();
+    else target.textContent = '';
+  }
+
+  // Drops every message not yet written. Only a user action reaches this, so it
+  // also releases the quiet window and lets the working tone resume.
+  cancelQueue() {
+    this.queue.length = 0;
+    if (this.queueTimer) clearTimeout(this.queueTimer);
+    this.queueTimer = null;
+    this.quietUntil = 0;
+    this.clearLive();
+  }
+
+  clearStatus() {
+    this.cancelQueue();
+  }
+
+  // Stopping recording here keeps a readback from being captured as a new
+  // command.
+  async announce(text, { urgent = false, tag = null } = {}) {
     const value = String(text ?? '').trim();
     if (!value) return { delivered: true, interrupted: false, reason: null };
     this.stopListening();
     return {
-      delivered: this.writeStatus(value, alert),
+      delivered: this.writeStatus(value, urgent, tag),
       interrupted: false,
       reason: null,
     };

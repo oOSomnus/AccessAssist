@@ -599,19 +599,24 @@ test('image choice cancels without upload and AI choice sends a cropped screensh
     await sendText(panel, 'What is this image?');
     await answerWhen(panel, 'Allow these sources', 1);
     await answerWhen(panel, 'How should I describe this image?', 1);
-    await answerWhen(panel, 'Which system', 0);
+    // Detection can only tell Windows from macOS, so the reader itself is
+    // asked. On this platform every reader we have keys for is offered.
+    await answerWhen(panel, 'Which screen reader', 0);
     await expect(panel.locator('#transcript')).toContainText('VO plus Shift plus L');
     expect(await announcements(panel)).not.toContain('Continue?');
     await expect(panel.locator('#transcript')).toContainText('screen-reader guide');
     requests = await mockRequests();
     expect(requests.some((request) => JSON.stringify(request.body).includes('image_url'))).toBe(false);
+    expect(await panel.locator('#screen-reader').inputValue()).toBe('voiceover');
 
     await page.bringToFront();
     await sendText(panel, 'What is this image?');
     await answerWhen(panel, 'Allow these sources', 1);
+    // The stored answer means the reader is asked once, not once per image:
+    // the guide follows the describe choice directly.
     await answerWhen(panel, 'How should I describe this image?', 1);
-    await answerWhen(panel, 'Which system', 0);
     await expect(panel.locator('#transcript')).toContainText('VO plus Shift plus L');
+    await expect(panel.locator('#ask')).toBeHidden();
     expect(await announcements(panel)).not.toContain('Continue?');
     await expect(panel.locator('#transcript')).toContainText('screen-reader guide');
     requests = await mockRequests();
@@ -912,11 +917,19 @@ test('HTTPS www receiver and source are spoken as domains without changing origi
     await expect(panel.locator('#ask-sites')).toBeHidden();
     const beforeRepeat = (await announcementEntries(panel)).length;
     await panel.locator('#repeat').click();
-    await expect.poll(async () => (await announcementEntries(panel)).length).toBeGreaterThan(beforeRepeat);
+    // Messages are queued, so the repeat can arrive after the question's own
+    // first reading; wait for the receiver to be spoken rather than taking
+    // whichever entry lands first.
+    await expect.poll(async () => (await announcementEntries(panel)).slice(beforeRepeat).join(' '))
+      .toContain('The receiver is opencode.ai');
     const repeated = (await announcementEntries(panel)).slice(beforeRepeat).join(' ');
-    expect(repeated).toContain('opencode.ai');
     expect(repeated).not.toContain('https://www');
-    await expect(panel.locator('#sr-alert')).toHaveText('');
+    // The previous question was answered before this one appeared; its reading
+    // must not surface afterwards.
+    expect(repeated).not.toContain('How should I describe this image?');
+    // Cleared after its hold, so the hidden region never becomes a second,
+    // stale copy of the transcript in the accessibility tree.
+    await expect(panel.locator('#sr-status')).toHaveText('');
 
     // Screenshot capture needs the page tab active; clicking the panel through
     // Playwright does not bring the panel tab to the front.
@@ -1569,7 +1582,6 @@ test('a background close notification performs cleanup without closing natively'
     );
     await expect.poll(async () => await announcements(panel))
       .toContain('Could not close the assistant. native close failed');
-    await expect(panel.locator('#sr-alert')).toHaveText('Could not close the assistant. native close failed');
     expect(await panel.evaluate(() => window.__closeCalls.length)).toBe(0);
   } finally {
     await context.close();
