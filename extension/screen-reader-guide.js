@@ -31,7 +31,8 @@ export const GUIDES = Object.freeze({
     steps: [
       'The NVDA key is Insert by default; it may also be set to Caps Lock.',
       'Move the browse-mode cursor to the target image. Press G for the next image or Shift plus G for the previous one.',
-      'Press NVDA plus R to recognize the current object with Windows OCR. That reads text found in the image; it does not describe a scene.',
+      'Press NVDA plus R to recognize the current object with Windows OCR. That finds text in the image; it does not describe a scene.',
+      'The result opens as a document that may not be read aloud on its own. Use the arrow keys to read it, and press Escape to close it.',
       'NVDA has no built-in scene description. A description add-on from the NVDA add-on store can add one, and it may send the image to an online service.',
       'The extension cannot install or configure an add-on for you. Ask me to describe the image instead if you would rather not set one up.',
     ],

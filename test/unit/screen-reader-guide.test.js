@@ -38,7 +38,9 @@ test('detection separates macOS from Windows and admits when it cannot tell', ()
   assert.equal(detectPlatform({ platform: 'Win32' }), 'narrator');
   assert.equal(detectPlatform({ userAgentData: { platform: 'Windows' } }), 'narrator');
   assert.equal(detectPlatform({ platform: 'Linux x86_64' }), null);
-  assert.equal(detectPlatform(undefined), null);
+  // Explicit fixtures: undefined would fall back to the host's own navigator.
+  assert.equal(detectPlatform({}), null);
+  assert.equal(detectPlatform(null), null);
 });
 
 test('a stored preference beats detection, and auto falls back to it', () => {
