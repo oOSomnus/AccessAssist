@@ -2626,7 +2626,13 @@ async function saveSettings(event) {
     openSettingsForKey();
     return;
   }
-  await say(keyValue ? `Settings saved. ${listenSentence()}.` : 'Settings saved.');
+  if (apiChanged) {
+    await say(keyValue ? `Settings saved. ${listenSentence()}.` : 'Settings saved.');
+  } else {
+    // A reader-only save leaves the turn running; say() would take output
+    // ownership and mark that turn's queued message as interrupted.
+    speech.writeStatus('Settings saved.');
+  }
   if (!state.apiKey) openSettingsForKey();
 }
 

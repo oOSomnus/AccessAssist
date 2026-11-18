@@ -1090,6 +1090,36 @@ test('reasoning effort saves without clearing the key and reaches each protocol'
   }
 });
 
+test('a reader-only save is announced and leaves the running turn alone', async () => {
+  const { context, extensionId } = await launch();
+  try {
+    await resetMock();
+    await openFixture(context, '/article');
+    const panel = await openPanel(context, extensionId);
+    await expect(panel.locator('#page-line')).toContainText('Event schedule');
+
+    await sendText(panel, 'What is this page about?');
+    await expect(panel.locator('#ask-question')).toContainText('page text');
+    const requestsBefore = (await mockRequests()).length;
+
+    await panel.locator('#settings-toggle').click();
+    await panel.locator('#screen-reader').selectOption('nvda');
+    await panel.locator('#save-settings').click();
+    await expect(panel.locator('#settings-status')).toContainText('Saved');
+    await expect.poll(() => announcementEntries(panel)).toContain('Settings saved.');
+    expect(await panel.evaluate(async () => (await chrome.storage.local.get('screenReader')).screenReader))
+      .toBe('nvda');
+
+    // Nothing reached the model, so the open question and its turn continue.
+    expect((await mockRequests()).length).toBe(requestsBefore);
+    await answerWhen(panel, 'page text', 0);
+    await expect(panel.locator('#transcript')).toContainText('Event schedule', { timeout: 30_000 });
+    await expect(panel.locator('#transcript')).toContainText('What is this page about?');
+  } finally {
+    await context.close();
+  }
+});
+
 test('the Assistant launcher drags, persists, and never opens the panel', async () => {
   const { context, extensionId, worker } = await launch();
   try {
