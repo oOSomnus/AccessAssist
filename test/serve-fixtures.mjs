@@ -866,11 +866,26 @@ function lastCall(context, name) {
   return [...context.calls].reverse().find((call) => call.name === name) ?? null;
 }
 
+// A successful propose_action carries the page after the action, so it is a
+// newer observation than any earlier observe_page result.
+function pageOf(result) {
+  try {
+    return JSON.parse(result.content).page ?? null;
+  } catch {
+    return null;
+  }
+}
+
 function observationOf(context) {
   for (const call of [...context.calls].reverse()) {
-    if (call.name !== 'observe_page') continue;
     const result = context.results.get(call.id);
     if (!result) continue;
+    if (call.name === 'propose_action') {
+      const page = pageOf(result);
+      if (page) return page;
+      continue;
+    }
+    if (call.name !== 'observe_page') continue;
     try {
       return JSON.parse(result.content);
     } catch {
@@ -929,20 +944,11 @@ function gridScenario(context) {
     return { text: `I could not find all four slots: ${(observation.targets ?? []).map((target) => target.name).join('|')}` };
   }
   const steps = targets.map((target) => (target.tag === 'input'
-    ? { type: 'set_checked', snapshotId: target.snapshotId, nodeId: target.nodeId, checked: true }
-    : { type: 'click', snapshotId: target.snapshotId, nodeId: target.nodeId }));
-  const userText = context.userTexts.join(' ');
-  const timeSource = /\bPM\b/.test(userText)
-    ? { source: 'user', quote: 'PM' }
-    : { source: 'choice', quote: 'PM' };
+    ? { type: 'set_checked', id: target.id, checked: true }
+    : { type: 'click', id: target.id }));
   return toolReply(context, 'propose_action', {
     summary: 'Select Monday from 2 PM to 3 PM',
     steps,
-    requirements: [
-      { name: 'Date', value: '2026-11-16', source: 'page', quote: '2026-11-16' },
-      { name: 'Time', value: '2 PM to 3 PM', ...timeSource },
-    ],
-    missingFields: [],
   });
 }
 
@@ -960,9 +966,7 @@ function nameScenario(context) {
   if (!target) return { text: 'I could not find the name field.' };
   return toolReply(context, 'propose_action', {
     summary: 'Change the name to Alex Morgan',
-    steps: [{ type: 'set_value', snapshotId: target.snapshotId, nodeId: target.nodeId, value: 'Alex Morgan' }],
-    requirements: [{ name: 'Name', value: 'Alex Morgan', source: 'user', quote: 'Alex Morgan' }],
-    missingFields: [],
+    steps: [{ type: 'set_value', id: target.id, value: 'Alex Morgan' }],
   });
 }
 
@@ -976,7 +980,7 @@ function lateNameScenario(context, proposeAt) {
   }
   const result = context.results.get(proposal.id);
   // OpenAI tool results never carry isError, so read the refusal message instead.
-  if (result && /^Not run:/u.test(result.content)) return { text: `Refused: ${result.content}` };
+  if (result && /^(?:Error: )?Not run:/u.test(result.content)) return { text: `Refused: ${result.content}` };
   if (needsReobservation(context)) return toolReply(context, 'observe_page', {});
   return { text: 'Done: the name is Alex Morgan.' };
 }
@@ -1017,9 +1021,7 @@ function choicesScenario(context) {
   if (!target) return { text: `I could not find ${name}.` };
   return toolReply(context, 'propose_action', {
     summary: `Check ${name}`,
-    steps: [{ type: 'set_checked', snapshotId: target.snapshotId, nodeId: target.nodeId, checked: true }],
-    requirements: [],
-    missingFields: [],
+    steps: [{ type: 'set_checked', id: target.id, checked: true }],
   });
 }
 
@@ -1031,7 +1033,7 @@ function imageScenario(context) {
     const target = (observation.targets ?? []).find((candidate) => candidate.tag === 'img'
       && candidate.alt && candidate.alt.present === false);
     if (!target) return { text: 'I could not find an image to read.' };
-    return toolReply(context, 'describe_image', { snapshotId: target.snapshotId, nodeId: target.nodeId });
+    return toolReply(context, 'describe_image', { id: target.id });
   }
   const result = context.results.get(describe.id)?.content ?? '';
   if (context.image) return { text: 'The image shows a red circle to the left of a blue square, with the word EXIT below.' };
@@ -1053,9 +1055,7 @@ function submitScenario(context) {
   if (!target) return { text: 'I could not find the submit button.' };
   return toolReply(context, 'propose_action', {
     summary: 'Click Save to submit the form',
-    steps: [{ type: 'click', snapshotId: target.snapshotId, nodeId: target.nodeId }],
-    requirements: [],
-    missingFields: [],
+    steps: [{ type: 'click', id: target.id }],
   });
 }
 
@@ -1076,9 +1076,7 @@ function frameScenario(context) {
   if (!target) return { text: `I could not find ${name}.` };
   return toolReply(context, 'propose_action', {
     summary: `Click ${name}`,
-    steps: [{ type: 'click', snapshotId: target.snapshotId, nodeId: target.nodeId }],
-    requirements: [],
-    missingFields: [],
+    steps: [{ type: 'click', id: target.id }],
   });
 }
 
@@ -1099,19 +1097,16 @@ function altScenario(context) {
   if (!chosen) return { text: 'I could not find an image without a description.' };
   const describe = lastCall(context, 'describe_image');
   if (!describe) {
-    return toolReply(context, 'describe_image', { snapshotId: chosen.snapshotId, nodeId: chosen.nodeId });
+    return toolReply(context, 'describe_image', { id: chosen.id });
   }
   if (!context.image) return { text: 'I could not see the image, so I did not add a description.' };
   return toolReply(context, 'propose_action', {
     summary: 'Add an AI-generated description to the image',
     steps: [{
       type: 'set_alt',
-      snapshotId: chosen.snapshotId,
-      nodeId: chosen.nodeId,
+      id: chosen.id,
       alt: 'A red circle to the left of a blue square, with EXIT below.',
     }],
-    requirements: [],
-    missingFields: [],
   });
 }
 
@@ -1137,7 +1132,7 @@ function needsReobservation(context) {
   if (proposal < 0) return false;
   const result = context.results.get(context.calls[proposal].id);
   if (!result || result.isError) return false;
-  return callIndex(context, 'observe_page') < proposal;
+  return !pageOf(result) && callIndex(context, 'observe_page') < proposal;
 }
 
 function pointerScenario(context) {
@@ -1174,9 +1169,7 @@ function pointerScenario(context) {
     summary: 'Select Monday and Wednesday at 2 PM',
     steps: [monday, wednesday]
       .filter((target) => !selected(target))
-      .map((target) => ({ type: 'click', snapshotId: target.snapshotId, nodeId: target.nodeId })),
-    requirements: [],
-    missingFields: [],
+      .map((target) => ({ type: 'click', id: target.id })),
   });
 }
 
@@ -1209,9 +1202,7 @@ function legacyDaysScenario(context) {
   if (!modeOn) {
     return toolReply(context, 'propose_action', {
       summary: 'Switch the survey to Days of the Week',
-      steps: [{ type: 'select_option', snapshotId: mode.snapshotId, nodeId: mode.nodeId, values: ['DaysOfTheWeek'] }],
-      requirements: [],
-      missingFields: [],
+      steps: [{ type: 'select_option', id: mode.id, values: ['DaysOfTheWeek'] }],
     });
   }
   if (!monday || !wednesday) return { text: 'I could not find both weekday columns after the mode change.' };
@@ -1220,9 +1211,7 @@ function legacyDaysScenario(context) {
     summary: 'Select Monday and Wednesday',
     steps: [monday, wednesday]
       .filter((target) => !chosen(target))
-      .map((target) => ({ type: 'click', snapshotId: target.snapshotId, nodeId: target.nodeId })),
-    requirements: [],
-    missingFields: [],
+      .map((target) => ({ type: 'click', id: target.id })),
   });
 }
 
@@ -1239,9 +1228,7 @@ function keyScenario(context) {
   if (!toggle) return { text: 'I could not find the toggle.' };
   return toolReply(context, 'propose_action', {
     summary: 'Press Enter on the toggle',
-    steps: [{ type: 'press_key', snapshotId: toggle.snapshotId, nodeId: toggle.nodeId, key: 'Enter' }],
-    requirements: [],
-    missingFields: [],
+    steps: [{ type: 'press_key', id: toggle.id, key: 'Enter' }],
   });
 }
 
@@ -1257,19 +1244,16 @@ function visualScenario(context) {
     return { text: done ? 'Clicked the visible control.' : 'The visible click did not complete.' };
   }
   const canvas = (observation.targets ?? []).find((target) => target.tag === 'canvas');
-  if (!canvas || !observation.visual?.nodeId) {
+  if (!canvas || !observation.visual?.id) {
     return { text: `I could not see the canvas. ${JSON.stringify(observation.visual ?? null)}` };
   }
   return toolReply(context, 'propose_action', {
     summary: 'Click the canvas control',
     steps: [{
       type: 'click',
-      snapshotId: observation.visual.snapshotId,
-      nodeId: observation.visual.nodeId,
+      id: observation.visual.id,
       point: { x: canvas.rect.x + 20, y: canvas.rect.y + 20 },
     }],
-    requirements: [],
-    missingFields: [],
   });
 }
 
@@ -1283,20 +1267,17 @@ function visualDragScenario(context) {
     return { text: done ? 'Dragged across the canvas.' : 'The visual drag did not complete.' };
   }
   const canvas = (observation.targets ?? []).find((target) => target.tag === 'canvas');
-  if (!canvas || !observation.visual?.nodeId) return { text: 'I could not see the canvas for a drag.' };
+  if (!canvas || !observation.visual?.id) return { text: 'I could not see the canvas for a drag.' };
   return toolReply(context, 'propose_action', {
     summary: 'Drag across the canvas control',
     steps: [{
       type: 'drag',
-      snapshotId: observation.visual.snapshotId,
-      nodeId: observation.visual.nodeId,
+      id: observation.visual.id,
       points: [
         { x: canvas.rect.x + 20, y: canvas.rect.y + 20 },
         { x: canvas.rect.x + 200, y: canvas.rect.y + 20 },
       ],
     }],
-    requirements: [],
-    missingFields: [],
   });
 }
 
@@ -1337,9 +1318,7 @@ function setValueProposal(context, observation, name, value, extra = {}) {
   if (!target) return { text: `I could not find ${name}.` };
   return toolReply(context, 'propose_action', {
     summary: `Fill ${name}`,
-    steps: [{ type: 'set_value', snapshotId: target.snapshotId, nodeId: target.nodeId, value, ...extra }],
-    requirements: [],
-    missingFields: [],
+    steps: [{ type: 'set_value', id: target.id, value, ...extra }],
   });
 }
 
@@ -1347,9 +1326,7 @@ function clickProposal(context, target, summary, extra = {}) {
   if (!target) return { text: `I could not find ${summary}.` };
   return toolReply(context, 'propose_action', {
     summary,
-    steps: [{ type: 'click', snapshotId: target.snapshotId, nodeId: target.nodeId, ...extra }],
-    requirements: [],
-    missingFields: [],
+    steps: [{ type: 'click', id: target.id, ...extra }],
   });
 }
 
@@ -1357,9 +1334,7 @@ function pressKeyProposal(context, target, key, modifiers = []) {
   if (!target) return { text: 'I could not find the keyboard target.' };
   return toolReply(context, 'propose_action', {
     summary: `Press ${key}`,
-    steps: [{ type: 'press_key', snapshotId: target.snapshotId, nodeId: target.nodeId, key, modifiers }],
-    requirements: [],
-    missingFields: [],
+    steps: [{ type: 'press_key', id: target.id, key, modifiers }],
   });
 }
 
@@ -1370,10 +1345,8 @@ function dragProposal(context, observation, fromName, toName) {
   return toolReply(context, 'propose_action', {
     summary: `Drag ${fromName} onto ${toName}`,
     steps: [{
-      type: 'drag', snapshotId: from.snapshotId, nodeId: from.nodeId, toNodeId: to.nodeId,
+      type: 'drag', id: from.id, toId: to.id,
     }],
-    requirements: [],
-    missingFields: [],
   });
 }
 
@@ -1415,9 +1388,7 @@ function inputsScenario(context) {
       if (!contact) return { text: 'I could not find the contact field.' };
       return toolReply(context, 'propose_action', {
         summary: 'Leave the contact field',
-        steps: [{ type: 'blur', snapshotId: contact.snapshotId, nodeId: contact.nodeId }],
-        requirements: [],
-        missingFields: [],
+        steps: [{ type: 'blur', id: contact.id }],
       });
     }
     return { text: itemText(observation, 'Selected contact:') || 'The contact was not selected.' };
@@ -1444,9 +1415,7 @@ function inputsScenario(context) {
       if (!rich) return { text: 'I could not find the rich note.' };
       return toolReply(context, 'propose_action', {
         summary: 'Replace the rich note',
-        steps: [{ type: 'set_value', snapshotId: rich.snapshotId, nodeId: rich.nodeId, value: 'Updated rich note 😀' }],
-        requirements: [],
-        missingFields: [],
+        steps: [{ type: 'set_value', id: rich.id, value: 'Updated rich note 😀' }],
       });
     }
     return { text: itemText(observation, 'Updated rich note') ? 'The rich note shows the new text.' : 'The rich note did not update.' };
@@ -1458,13 +1427,11 @@ function inputsScenario(context) {
       return toolReply(context, 'propose_action', {
         summary: 'Type on the keypad with the keyboard',
         steps: [
-          { type: 'press_key', snapshotId: keypad.snapshotId, nodeId: keypad.nodeId, key: 'a' },
-          { type: 'press_key', snapshotId: keypad.snapshotId, nodeId: keypad.nodeId, key: 'b', modifiers: ['Shift'] },
-          { type: 'press_key', snapshotId: keypad.snapshotId, nodeId: keypad.nodeId, key: 'Backspace' },
-          { type: 'press_key', snapshotId: keypad.snapshotId, nodeId: keypad.nodeId, key: 'Enter', modifiers: ['Control'] },
+          { type: 'press_key', id: keypad.id, key: 'a' },
+          { type: 'press_key', id: keypad.id, key: 'b', modifiers: ['Shift'] },
+          { type: 'press_key', id: keypad.id, key: 'Backspace' },
+          { type: 'press_key', id: keypad.id, key: 'Enter', modifiers: ['Control'] },
         ],
-        requirements: [],
-        missingFields: [],
       });
     }
     return { text: itemText(observation, 'Keyboard model:') || 'The keyboard model did not change.' };
@@ -1534,9 +1501,7 @@ function interactionPointerScenario(context) {
       if (!anchor) return { text: 'I could not find the options control.' };
       return toolReply(context, 'propose_action', {
         summary: 'Show the options submenu',
-        steps: [{ type: 'hover', snapshotId: anchor.snapshotId, nodeId: anchor.nodeId, durationMs: 500 }],
-        requirements: [],
-        missingFields: [],
+        steps: [{ type: 'hover', id: anchor.id, durationMs: 500 }],
       });
     }
     if (!proposals[1]) return clickProposal(context, targetNamed(observation, 'Archive item'), 'Archive the item');
@@ -1544,7 +1509,7 @@ function interactionPointerScenario(context) {
   }
   if (/hold confirm/iu.test(text)) {
     if (!proposals.length) {
-      return clickProposal(context, targetNamed(observation, 'Hold to confirm'), 'Hold the control to confirm', { holdMs: 700 });
+      return clickProposal(context, targetNamed(observation, 'Hold to confirm'), 'Hold the control to confirm', { holdMs: 1100 });
     }
     return { text: itemText(observation, 'Held commits:') || 'The hold did not commit.' };
   }
@@ -1608,21 +1573,18 @@ function scrollScenario(context) {
     if (needsReobservation(context)) return toolReply(context, 'observe_page', {});
     if (!lastScroll) {
       if (!region) return { text: 'I could not find the messages list.' };
-      return toolReply(context, 'scroll_page', { direction: 'down', snapshotId: region.snapshotId, nodeId: region.nodeId });
+      return toolReply(context, 'scroll_page', { direction: 'down', id: region.id });
     }
     if (!proposals.length) {
       const visual = observation?.visual;
-      if (!visual?.nodeId) return { text: 'I have no screenshot to reuse.' };
+      if (!visual?.id) return { text: 'I have no screenshot to reuse.' };
       return toolReply(context, 'propose_action', {
         summary: 'Click the old screenshot point',
         steps: [{
           type: 'click',
-          snapshotId: visual.snapshotId,
-          nodeId: visual.nodeId,
+          id: visual.id,
           point: { x: 60, y: 60 },
         }],
-        requirements: [],
-        missingFields: [],
       });
     }
     return { text: proposalFailure(context) ?? 'The stale point click was executed.' };
@@ -1632,7 +1594,7 @@ function scrollScenario(context) {
   if (/scroll list down/iu.test(text)) {
     if (!scrolls.length) {
       if (!region) return { text: 'I could not find the messages list.' };
-      return toolReply(context, 'scroll_page', { direction: 'down', snapshotId: region.snapshotId, nodeId: region.nodeId });
+      return toolReply(context, 'scroll_page', { direction: 'down', id: region.id });
     }
     if (!observedAfterScroll) return toolReply(context, 'observe_page', {});
     if (!proposals.length) return clickProposal(context, targetNamed(observation, 'Deep item'), 'Click the deep item');
@@ -1641,7 +1603,7 @@ function scrollScenario(context) {
   if (/scroll boundary/iu.test(text)) {
     if (!region) return { text: 'I could not find the messages list.' };
     if (!lastResult || /"moved":true/u.test(lastResult.content ?? '')) {
-      return toolReply(context, 'scroll_page', { direction: 'down', snapshotId: region.snapshotId, nodeId: region.nodeId });
+      return toolReply(context, 'scroll_page', { direction: 'down', id: region.id });
     }
     return { text: `The list cannot scroll further after ${scrolls.length} steps.` };
   }
@@ -1649,7 +1611,7 @@ function scrollScenario(context) {
     const strip = targetNamed(observation, 'Photo strip');
     if (!strip) return { text: 'I could not find the photo strip.' };
     if (!lastScroll) {
-      return toolReply(context, 'scroll_page', { direction: 'right', snapshotId: strip.snapshotId, nodeId: strip.nodeId });
+      return toolReply(context, 'scroll_page', { direction: 'right', id: strip.id });
     }
     return { text: 'Scrolled the photo strip sideways.' };
   }

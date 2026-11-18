@@ -6,9 +6,10 @@ import {
   pointsCrossMask,
   acceptConsent,
   armConsent,
+  autoConsent,
+  autoRuns,
   createSession,
   finishExecution,
-  timeNeedsClarification,
   validateProposal,
 } from '../../extension/policy.js';
 
@@ -29,9 +30,6 @@ function context(overrides = {}) {
   ]);
   return {
     tabId: 7, windowId: 3, documentId: 'doc', url: 'https://example.test/',
-    userText: 'Change the name to Alex Morgan at 2 PM',
-    pageText: 'Name Choice A Monday',
-    confirmedChoices: new Set(['pm', 'PM']),
     targets,
     now: 1000,
     ...overrides,
@@ -42,56 +40,6 @@ const proposal = (overrides = {}) => ({
   summary: 'Change the name',
   steps: [{ type: 'set_value', snapshotId: 's1', nodeId: 1, value: 'Alex Morgan' }],
   ...overrides,
-});
-
-test('short clock values need a meridiem but 24-hour values do not', () => {
-  assert.equal(timeNeedsClarification('2:00 to 3:00'), true);
-  assert.equal(timeNeedsClarification('2:00'), true);
-  assert.equal(timeNeedsClarification('2 PM'), false);
-  assert.equal(timeNeedsClarification('2 p.m.'), false);
-  assert.equal(timeNeedsClarification('14:00 to 15:00'), false);
-  assert.equal(timeNeedsClarification('15 minutes'), false);
-  assert.equal(timeNeedsClarification('Monday 2:00; Tuesday 3:00 PM'), true);
-  assert.equal(timeNeedsClarification('2:00 to 3:00 PM'), false);
-  assert.equal(timeNeedsClarification('Monday 2:00 PM, Tuesday 3:00 PM'), false);
-});
-
-test('missing fields keep the session in clarification', () => {
-  const outcome = validateProposal(proposal({ missingFields: ['AM or PM'] }), context());
-  assert.equal(outcome.ok, true);
-  assert.equal(outcome.phase, PHASE.clarification);
-});
-
-test('requirements must quote real inputs or confirmed choices', () => {
-  const ok = validateProposal(proposal({
-    requirements: [
-      { name: 'name', value: 'Alex Morgan', source: 'user', quote: 'Alex Morgan' },
-      { name: 'time', value: '2 PM', source: 'user', quote: '2 PM' },
-      { name: 'day', value: 'pm', source: 'choice', quote: 'pm' },
-    ],
-  }), context());
-  assert.equal(ok.ok, true, JSON.stringify(ok.errors));
-  const badUser = validateProposal(proposal({
-    requirements: [{ name: 'name', value: 'Jordan Lee', source: 'user', quote: 'Jordan Lee' }],
-  }), context());
-  assert.equal(badUser.ok, false);
-  assert.match(badUser.errors.join(), /quotes the user/u);
-  const badPage = validateProposal(proposal({
-    requirements: [{ name: 'choice', value: 'B', source: 'page', quote: 'Choice B' }],
-  }), context());
-  assert.equal(badPage.ok, false);
-  const badChoice = validateProposal(proposal({
-    requirements: [{ name: 'time', value: '2 AM', source: 'choice', quote: 'AM' }],
-  }), context());
-  assert.equal(badChoice.ok, false);
-});
-
-test('ambiguous times are rejected before consent', () => {
-  const outcome = validateProposal(proposal({
-    requirements: [{ name: 'time', value: '2:00 to 3:00', source: 'user', quote: '2:00 to 3:00' }],
-  }), context({ userText: 'Select at 2:00 to 3:00' }));
-  assert.equal(outcome.ok, false);
-  assert.equal(outcome.needsClarification, true);
 });
 
 test('steps validate against observed targets and risk', () => {
@@ -114,9 +62,17 @@ test('steps validate against observed targets and risk', () => {
 
   const grid = validateProposal(proposal({
     steps: [{ type: 'click', snapshotId: 's1', nodeId: 7 }],
-  }), context({ targets: new Map([['s1:7', target({ role: 'gridcell' })]]) }));
+  }), context({ targets: new Map([['s1:7', target({ role: 'gridcell', ariaChecked: 'false' })]]) }));
   assert.equal(grid.proposal.risk, 'compensating');
   assert.equal(grid.proposal.undoKind, 'compensating');
+
+  // A click that only moves aria-selected has no inverse, so it needs consent.
+  const tab = validateProposal(proposal({
+    steps: [{ type: 'click', snapshotId: 's1', nodeId: 7 }],
+  }), context({ targets: new Map([['s1:7', target({ role: 'tab', ariaSelected: 'false', ariaChecked: null })]]) }));
+  assert.equal(tab.proposal.risk, 'irreversible');
+  assert.equal(tab.proposal.undoKind, 'unavailable');
+  assert.equal(autoRuns(tab.proposal), false);
 
   const disabled = validateProposal(proposal({
     steps: [{ type: 'set_value', snapshotId: 's1', nodeId: 5, value: 'x' }],
@@ -246,6 +202,29 @@ test('stale document targets are rejected', () => {
   const outcome = validateProposal(proposal(), ctx);
   assert.equal(outcome.ok, false);
   assert.match(outcome.errors.join(), /page changed/u);
+});
+
+test('undoable and hover-only proposals run without asking', () => {
+  const edit = validateProposal(proposal(), context()).proposal;
+  const hover = validateProposal(proposal({
+    steps: [{ type: 'hover', snapshotId: 's1', nodeId: 3 }],
+  }), context()).proposal;
+  const submit = validateProposal(proposal({
+    steps: [{ type: 'click', snapshotId: 's1', nodeId: 3 }],
+  }), context()).proposal;
+  assert.equal(edit.risk, 'compensating');
+  assert.equal(hover.risk, 'irreversible');
+  assert.equal(autoRuns(edit), true);
+  assert.equal(autoRuns(hover), true);
+  assert.equal(autoRuns(submit), false);
+
+  const started = autoConsent({ ...createSession(), phase: PHASE.consent, proposal: edit });
+  assert.equal(started.session.phase, PHASE.executing);
+  assert.equal(started.session.consent, null);
+  const asked = autoConsent({ ...createSession(), phase: PHASE.consent, proposal: submit });
+  assert.equal(asked.error, 'This action needs the user to confirm it');
+  const wrongPhase = autoConsent({ ...createSession(), phase: PHASE.guide, proposal: edit });
+  assert.equal(wrongPhase.error, 'There is no pending confirmation');
 });
 
 test('irreversible actions need two separate confirmations', () => {

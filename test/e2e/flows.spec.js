@@ -267,7 +267,6 @@ test('ambiguous time asks for AM or PM, then edits with confirmation and undo', 
     await expect(panel.locator('#ask-question')).toContainText('AM or PM');
 
     await answerWhen(panel, 'AM or PM', 1);
-    await answerWhen(panel, 'Run this?', 0);
 
     const slot = (day, time) => page.locator(`input[aria-label="${day} ${time}"]`);
     for (const time of ['14:00', '14:15', '14:30', '14:45']) {
@@ -284,6 +283,22 @@ test('ambiguous time asks for AM or PM, then edits with confirmation and undo', 
     expect(spoken).not.toContain('could not confirm');
     expect(spoken).not.toContain('Keep these changes?');
     await expect(panel.locator('#transcript')).not.toContainText('Let me check');
+
+    // The action ran without a question and the model saw the page it produced:
+    // one observation, one short target id, and the checked slot.
+    const requests = await mockRequests();
+    const messages = requests.at(-1).body.messages;
+    const proposeResult = JSON.parse(messages.filter((message) => message.role === 'tool').at(-1).content);
+    const slotTarget = proposeResult.page.targets.find((target) => target.name === 'Monday 14:00');
+    expect(slotTarget.checked).toBe(true);
+    expect(slotTarget.id).toMatch(/^[0-9a-f]{8}-\d+$/u);
+    expect(slotTarget).not.toHaveProperty('snapshotId');
+    const observations = messages
+      .flatMap((message) => message.tool_calls ?? [])
+      .filter((call) => call.function.name === 'observe_page');
+    expect(observations).toHaveLength(1);
+    expect(spoken).toContain('Doing: Select Monday from 2 PM to 3 PM.');
+    expect(spoken).not.toContain('Run this?');
   } finally {
     await context.close();
   }
@@ -323,9 +338,10 @@ test('bare digits stay native while the master combination chooses', async () =>
     await expect(panel.locator('#ask')).toBeVisible();
     await expect(panel.locator('#ask-question')).toHaveText(question);
 
-    // Shift turns the key label into a symbol; the physical digit still works.
+    // Shift turns the key label into a symbol; the physical digit still works
+    // and the undoable selection runs without a confirmation question.
     await panel.keyboard.press('Control+Shift+2');
-    await expect(panel.locator('#ask-question')).toContainText('Run this?');
+    await expect(page.locator('input[aria-label="Monday 14:00"]')).toBeChecked();
   } finally {
     await context.close();
   }
@@ -335,20 +351,20 @@ test('a stale choice button does not answer the new question', async () => {
   const { context, extensionId } = await launch();
   try {
     await resetMock();
-    const page = await openFixture(context, '/grid-native');
+    const page = await openFixture(context, '/frame-overlay');
     const panel = await openPanel(context, extensionId);
-    await sendText(panel, 'Select Monday two to three.');
+    await sendText(panel, 'Click the same-origin button.');
     await answerWhen(panel, 'page text', 0);
-    await expect(panel.locator('#ask-question')).toContainText('AM or PM');
+    await expect(panel.locator('#ask-question')).toContainText('Run this?');
     await panel.evaluate(() => {
       window.__staleChoice = document.querySelector('#ask-options button');
     });
-    await answer(panel, 1);
-    await expect(panel.locator('#ask-question')).toContainText('Run this?');
+    await answer(panel, 0);
+    await expect(panel.locator('#ask-question')).toContainText('Run anyway?');
     await panel.evaluate(() => window.__staleChoice.click());
     await panel.waitForTimeout(200);
-    await expect(panel.locator('#ask-question')).toContainText('Run this?');
-    expect(await page.locator('input[aria-label="Monday 14:00"]').isChecked()).toBe(false);
+    await expect(panel.locator('#ask-question')).toContainText('Run anyway?');
+    await expect(page.locator('#frame-clicks')).toHaveText('0');
   } finally {
     await context.close();
   }
@@ -363,7 +379,6 @@ test('undo restores the original native checkbox set', async () => {
     await sendText(panel, 'Select Monday two to three.');
     await answerWhen(panel, 'page text', 0);
     await answerWhen(panel, 'AM or PM', 1);
-    await answerWhen(panel, 'Run this?', 0);
     await undoLastChange(panel);
     await answerWhen(panel, 'Undo this change?', 0);
 
@@ -388,7 +403,6 @@ test('custom grid needs real mouse input and undo asks again', async () => {
     await sendText(panel, 'Select Monday two to three.');
     await answerWhen(panel, 'page text', 0);
     await answerWhen(panel, 'AM or PM', 1);
-    await answerWhen(panel, 'Run this?', 0);
     await undoLastChange(panel);
 
     const states = () => page.evaluate(() => [...document.querySelectorAll('[role="gridcell"]')]
@@ -412,7 +426,6 @@ test('undo restores the previously chosen radio', async () => {
     const panel = await openPanel(context, extensionId);
     await sendText(panel, 'Choice fixture radio.');
     await answerWhen(panel, 'page text', 0);
-    await answerWhen(panel, 'Run this?', 0);
     await undoLastChange(panel);
     await answerWhen(panel, 'Undo this change?', 0);
 
@@ -435,7 +448,6 @@ test('an already-checked custom checkbox is not toggled', async () => {
     await expect(panel.locator('#page-line')).toContainText('Plan choices');
     await sendText(panel, 'Choice fixture checkbox.');
     await answerWhen(panel, 'page text', 0);
-    await answerWhen(panel, 'Run this?', 0);
     await expect(panel.locator('#transcript')).toContainText('Done with the choice.', { timeout: 30_000 });
     await expect(page.locator('#toggles')).toHaveText('0');
     await expect(page.locator('#updates')).toHaveAttribute('aria-checked', 'true');
@@ -494,7 +506,6 @@ test('form edit is verified and undo stops on a later user change', async () => 
     const panel = await openPanel(context, extensionId);
     await sendText(panel, 'Change the name to Alex Morgan.');
     await answerWhen(panel, 'page text', 0);
-    await answerWhen(panel, 'Run this?', 0);
     await expect(page.locator('#name')).toHaveValue('Alex Morgan');
 
     await page.locator('#name').fill('Jordan Lee');
@@ -515,13 +526,12 @@ test('an action starts only when the turn can still confirm it', async () => {
       const panel = await openPanel(context, extensionId);
       await sendText(panel, `Late name change at ${at}: Alex Morgan.`);
       await answerWhen(panel, 'page text', 0);
-      if (runs) await answerWhen(panel, 'Run this?', 0);
       await expect(panel.locator('#transcript'))
         .toContainText(runs ? 'Done: the name is Alex Morgan.' : 'too few model calls left', { timeout: 30_000 });
       await expect(panel.locator('#transcript')).toHaveAttribute('aria-busy', 'false', { timeout: 30_000 });
       const spoken = await announcements(panel);
       expect(spoken).not.toContain('model calls. Give a new instruction.');
-      expect(spoken.includes('About to run')).toBe(runs);
+      expect(spoken.includes('Doing:')).toBe(runs);
       expect(spoken.includes('Confirming.')).toBe(runs);
       if (runs) await expect(page.locator('#name')).toHaveValue('Alex Morgan');
       else await expect(page.locator('#name')).not.toHaveValue('Alex Morgan');
@@ -697,7 +707,6 @@ test('AI image description restores the original missing alt attribute', async (
     await expect.poll(async () => (await mockRequests()).some((request) => JSON.stringify(request.body).includes('image_url'))).toBe(true);
     const withImage = (await mockRequests()).find((request) => JSON.stringify(request.body).includes('image_url'));
     expect(withImage).toBeTruthy();
-    await answerWhen(panel, 'Run this?', 0);
     await expect(page.locator('#simple')).toHaveAttribute('alt', 'A red circle to the left of a blue square, with EXIT below.');
 
     await panel.evaluate(() => document.getElementById('undo').click());
@@ -1444,7 +1453,6 @@ test('numbered undo restores the original native checkbox set', async () => {
     await sendText(panel, 'Select Monday two to three.');
     await answerWhen(panel, 'page text', 0);
     await answerWhen(panel, 'AM or PM', 1);
-    await answerWhen(panel, 'Run this?', 0);
     await expect(page.locator('input[aria-label="Monday 14:00"]')).toBeChecked();
 
     await panel.locator('#undo').focus();
@@ -1623,7 +1631,6 @@ test('Anthropic format also edits and undoes a grid', async () => {
     await sendText(panel, 'Select Monday two to three.');
     await answerWhen(panel, 'page text', 0);
     await answerWhen(panel, 'AM or PM', 1);
-    await answerWhen(panel, 'Run this?', 0);
     await undoLastChange(panel);
     await answerWhen(panel, 'Undo this change?', 0);
     await expect.poll(async () => (await announcements(panel)).includes('Undone')).toBe(true);
@@ -1699,7 +1706,6 @@ test('weekday cells in a layout table are selected and verified', async () => {
 
     await sendText(panel, 'Switch Survey using to Days of the Week. Select Monday and Wednesday only. Leave the event name, times, and all other fields unchanged. Do not create or submit an event.');
     await answerWhen(panel, 'page text', 0);
-    await answerWhen(panel, 'Run this?', 0);
 
     await answerWhen(panel, 'Run this?', 0);
     await page.bringToFront();

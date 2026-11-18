@@ -4,6 +4,8 @@ import {
   PHASE,
   acceptConsent,
   armConsent,
+  autoConsent,
+  autoRuns,
   createSession,
   finishExecution,
   pointMasked,
@@ -504,6 +506,7 @@ async function route(message) {
     case 'PROPOSE_ACTION': return proposeAction(requireTab(await targetTab(message.tabId)), message);
     case 'ARM_CONSENT': return armProposalConsent(message);
     case 'CONFIRM_PROPOSAL': return confirmProposal(requireTab(await targetTab(message.tabId)), message);
+    case 'RUN_PROPOSAL': return runProposal(requireTab(await targetTab(message.tabId)), message);
     case 'UNDO_REQUEST': return requestUndo(requireTab(await targetTab(message.tabId)));
     case 'CAPTURE_TARGET': return captureTarget(requireTab(await targetTab(message.tabId)), message);
     case 'ACTIVATE_TAB': return activateTab(message);
@@ -606,15 +609,17 @@ async function pageOrigins(tab, expectedDocumentId) {
   };
 }
 
+// Flags the model reads as absent when false; visible, inViewport and checked
+// stay explicit because a missing "checked" would be ambiguous.
+const OMIT_WHEN_FALSE = new Set([
+  'focusable', 'focused', 'disabled', 'readOnly', 'contentEditable', 'editable',
+  'checkable', 'selectable', 'submits',
+]);
+
 function modelTarget(entry, target) {
-  return {
-    snapshotId: entry.snapshotId,
-    frameId: entry.frameId,
-    nodeId: target.nodeId,
+  const full = {
+    id: targetId(entry.snapshotId, target.nodeId),
     kind: target.kind ?? 'native-control',
-    capabilities: target.capabilities ?? null,
-    focusable: target.focusable === true,
-    focused: target.focused === true,
     role: target.role,
     name: target.name,
     tag: target.tag,
@@ -622,6 +627,8 @@ function modelTarget(entry, target) {
     disabled: target.disabled,
     visible: target.visible,
     inViewport: target.inViewport,
+    focusable: target.focusable === true,
+    focused: target.focused === true,
     editable: target.editable,
     readOnly: target.readOnly === true,
     contentEditable: target.contentEditable === true,
@@ -638,11 +645,13 @@ function modelTarget(entry, target) {
     ariaPressed: target.ariaPressed,
     styleState: target.styleState ?? null,
     near: target.near ?? null,
-    docToken: target.docToken ?? null,
     selected: target.selected,
     options: target.options,
     rect: roundedRect(target.rect),
   };
+  return Object.fromEntries(Object.entries(full).filter(([key, value]) => (
+    value !== null && value !== undefined && !(value === false && OMIT_WHEN_FALSE.has(key))
+  )));
 }
 
 async function observePage(tab, allowedOrigins, { visual = false, expectedDocumentId, cursor } = {}) {
@@ -655,7 +664,6 @@ async function observePage(tab, allowedOrigins, { visual = false, expectedDocume
   const targets = [];
   const blockedFrames = [];
   const blockedIds = [];
-  const texts = [];
   let merged = null;
   let mergedVisual = null;
   let visualNodeId = null;
@@ -713,19 +721,13 @@ async function observePage(tab, allowedOrigins, { visual = false, expectedDocume
     for (const section of observation.sections ?? []) {
       sections.push({
         name: label && section.name === 'Body' ? label : section.name,
-        items: section.items.map((item) => ({ ...item, frameId: frame.frameId })),
+        items: section.items.map(({ role, name, text }) => ({ role, name, text })),
       });
     }
     for (const target of observation.targets ?? []) {
       const meta = { ...target, tabId: tab.id, frameId: frame.frameId, snapshotId: observation.snapshotId };
       entry.targets.set(target.nodeId, meta);
       targets.push(modelTarget(entry, target));
-      texts.push(target.name ?? '');
-      if (target.near?.above?.text) texts.push(target.near.above.text);
-      if (target.near?.left?.text) texts.push(target.near.left.text);
-    }
-    for (const section of observation.sections ?? []) {
-      for (const item of section.items) texts.push(`${item.name} ${item.text}`);
     }
     if (frame.frameId === 0 && observation.visual) {
       mergedVisual = observation.visual;
@@ -737,7 +739,6 @@ async function observePage(tab, allowedOrigins, { visual = false, expectedDocume
   const record = {
     docToken: merged?.docToken ?? null,
     documentId: top.documentId,
-    pageText: texts.join('\n').slice(0, 60000),
     title: tab.title ?? merged?.title ?? '',
     url: tab.url,
     viewport: merged?.viewport ?? null,
@@ -748,7 +749,6 @@ async function observePage(tab, allowedOrigins, { visual = false, expectedDocume
   observations.set(tab.id, record);
 
   const result = {
-    snapshotId: merged?.snapshotId ?? null,
     title: merged?.title ?? tab.title ?? '',
     url: modelUrl(tab.url),
     viewport: merged?.viewport ?? null,
@@ -793,8 +793,8 @@ async function observePage(tab, allowedOrigins, { visual = false, expectedDocume
     visualTarget.kind = 'visual-region';
     visualTarget.visual = metadata;
   }
-  const { fingerprint, pixels, ...visible } = metadata;
-  return { ...result, visual: { ...visible, dataUrl: capture.dataUrl } };
+  const { fingerprint, pixels, nodeId, snapshotId, frameId, ...visible } = metadata;
+  return { ...result, visual: { ...visible, id: targetId(merged.snapshotId, visualNodeId), dataUrl: capture.dataUrl } };
 }
 
 function invalidateVisual(tabId) {
@@ -809,29 +809,40 @@ function invalidateVisual(tabId) {
   }
 }
 
-function registryTarget(snapshotId, nodeId) {
-  const entry = registry.get(snapshotId);
-  if (!entry) return null;
-  const target = entry.targets.get(nodeId);
-  return target ? { entry, target } : null;
+const TARGET_ID = /^([0-9a-f]{8})-(\d+)$/u;
+const targetId = (snapshotId, nodeId) => `${snapshotId.slice(0, 8)}-${nodeId}`;
+
+// Model ids are short: 8 hex characters of the random snapshot id plus the
+// node id. The snapshot prefix makes them unique without extra state, and they
+// survive a worker restart because the snapshot id itself does.
+function registryTarget(tabId, id) {
+  const match = typeof id === 'string' ? TARGET_ID.exec(id) : null;
+  if (!match) return null;
+  const nodeId = Number(match[2]);
+  for (const entry of registry.values()) {
+    if (entry.tabId !== tabId || !entry.snapshotId.startsWith(match[1])) continue;
+    const target = entry.targets.get(nodeId);
+    if (target) return { entry, target, snapshotId: entry.snapshotId, nodeId };
+  }
+  return null;
 }
 
 async function readTarget(tab, message) {
-  const found = registryTarget(message.snapshotId, message.nodeId);
-  if (!found || found.entry.tabId !== tab.id) return { error: 'Observe the page again first' };
+  const found = registryTarget(tab.id, message.id);
+  if (!found) return { error: 'Observe the page again first' };
   const result = await agentCall(tab.id, found.entry, {
-    op: 'read', snapshotId: message.snapshotId, nodeId: message.nodeId, cursor: message.cursor,
+    op: 'read', snapshotId: found.snapshotId, nodeId: found.nodeId, cursor: message.cursor,
   });
   if (result?.error) return { error: result.error };
   return { name: result.name, role: result.role, text: result.text, nextCursor: result.nextCursor };
 }
 
 async function focusTarget(tab, message) {
-  const found = registryTarget(message.snapshotId, message.nodeId);
-  if (!found || found.entry.tabId !== tab.id) return { error: 'Observe the page again first' };
+  const found = registryTarget(tab.id, message.id);
+  if (!found) return { error: 'Observe the page again first' };
   try {
     const result = await agentCall(tab.id, found.entry, {
-      op: 'focus', snapshotId: message.snapshotId, nodeId: message.nodeId,
+      op: 'focus', snapshotId: found.snapshotId, nodeId: found.nodeId,
     });
     if (result?.error) return { error: result.error };
     return { ok: true };
@@ -845,10 +856,7 @@ async function scrollPage(tab, message) {
   if (!['up', 'down', 'left', 'right'].includes(message.direction)) {
     return { error: 'Unsupported scroll direction' };
   }
-  const hasSnapshot = message.snapshotId !== undefined;
-  const hasNode = message.nodeId !== undefined;
-  if (hasSnapshot !== hasNode) return { error: 'Scrolling a region needs both a snapshot and a target' };
-  if (!hasSnapshot) {
+  if (message.id === undefined) {
     const record = observations.get(tab.id);
     if (!record?.documentId) return { error: STALE_PAGE };
     const result = await agentCall(tab.id, { frameId: 0, documentId: record.documentId }, {
@@ -865,17 +873,17 @@ async function scrollPage(tab, message) {
       scrollTop: result.scrollTop ?? null,
     };
   }
-  const found = registryTarget(message.snapshotId, message.nodeId);
-  if (!found || found.entry.tabId !== tab.id) return { error: 'Observe the page again first' };
+  const found = registryTarget(tab.id, message.id);
+  if (!found) return { error: 'Observe the page again first' };
   const state = await agentCall(tab.id, found.entry, {
-    op: 'state', snapshotId: message.snapshotId, nodeId: message.nodeId,
+    op: 'state', snapshotId: found.snapshotId, nodeId: found.nodeId,
   });
   if (state?.error) return { error: state.error };
   if (!state?.exists) return { error: 'Target no longer exists; observe the page again' };
   if (!state.visible || !state.inViewport) return { error: 'Scroll to the target first, then observe it again' };
   if (state.docToken !== found.entry.docToken) return { error: 'The page changed; observe it again' };
   const result = await agentCall(tab.id, found.entry, {
-    op: 'scroll', direction: message.direction, snapshotId: message.snapshotId, nodeId: message.nodeId,
+    op: 'scroll', direction: message.direction, snapshotId: found.snapshotId, nodeId: found.nodeId,
   });
   invalidateVisual(tab.id);
   if (result?.error) return { error: result.error };
@@ -916,6 +924,32 @@ async function expectedState(step, entry, { fullValue = false } = {}) {
   return { state };
 }
 
+// The model names targets with one short id; policy, execution and undo keep
+// the internal snapshot/node pair they were written against.
+function internalSteps(tabId, steps) {
+  if (!Array.isArray(steps)) return { steps };
+  const out = [];
+  for (const [index, raw] of steps.entries()) {
+    if (!raw || typeof raw !== 'object') {
+      out.push(raw);
+      continue;
+    }
+    const { id, toId, ...rest } = raw;
+    const found = registryTarget(tabId, id);
+    if (!found) return { error: `Step ${index + 1}: Unknown or expired target id ${id}; observe the page again` };
+    const step = { ...rest, snapshotId: found.snapshotId, nodeId: found.nodeId };
+    if (toId !== undefined) {
+      const end = registryTarget(tabId, toId);
+      if (!end || end.snapshotId !== found.snapshotId) {
+        return { error: `Step ${index + 1}: Drag targets ${id} and ${toId} must come from the same observation; observe the page again` };
+      }
+      step.toNodeId = end.nodeId;
+    }
+    out.push(step);
+  }
+  return { steps: out };
+}
+
 async function proposeAction(tab, message) {
   const observation = observations.get(tab.id);
   if (!observation) return { ok: false, errors: ['Observe the page first'] };
@@ -930,29 +964,13 @@ async function proposeAction(tab, message) {
     documentId: observation.docToken,
     documentIds,
     url: modelUrl(tab.url),
-    userText: String(message.userText ?? ''),
-    pageText: observation.pageText,
-    confirmedChoices: new Set(Array.isArray(message.confirmedChoices) ? message.confirmedChoices : []),
     targets: currentTargets(tab.id),
     now: Date.now(),
   };
-  const outcome = validateProposal(message.payload, context);
-  if (!outcome.ok) {
-    return {
-      ok: false,
-      errors: outcome.errors,
-      needsClarification: Boolean(outcome.needsClarification),
-      message: outcome.needsClarification ? 'Required information is incomplete; use ask_user to clarify first' : 'Invalid proposal',
-    };
-  }
-  if (outcome.needsClarification) {
-    return {
-      ok: false,
-      needsClarification: true,
-      errors: outcome.proposal.missingFields.length ? outcome.proposal.missingFields : outcome.errors,
-      message: 'Required information is incomplete; use ask_user to clarify first',
-    };
-  }
+  const translated = internalSteps(tab.id, message.payload?.steps);
+  if (translated.error) return { ok: false, errors: [translated.error], message: 'Invalid proposal' };
+  const outcome = validateProposal({ ...message.payload, steps: translated.steps }, context);
+  if (!outcome.ok) return { ok: false, errors: outcome.errors, message: 'Invalid proposal' };
   const expected = new Map();
   for (const step of outcome.proposal.steps) {
     const entry = registry.get(step.snapshotId);
@@ -986,6 +1004,7 @@ async function proposeAction(tab, message) {
     risk: proposal.risk,
     undoKind: proposal.undoKind,
     stepCount: proposal.steps.length,
+    autoRun: autoRuns(proposal),
   };
 }
 
@@ -1012,15 +1031,18 @@ async function confirmProposal(tab, message) {
     return { ok: true, action: 'cancel' };
   }
   if (outcome.action === 'risk') return { ok: true, action: 'risk' };
+  return executeAccepted(tab, message.proposalId, outcome.session);
+}
 
-  const proposal = outcome.session.proposal;
+async function executeAccepted(tab, proposalId, session) {
+  const proposal = session.proposal;
   let report;
   try {
     report = (await executions.run(tab.id, () => executeProposal(tab, proposal))).value;
   } catch (error) {
     report = { completed: 0, failedStep: error?.message ?? 'Execution failed', verified: false, record: null };
   }
-  const finished = finishExecution(outcome.session, {
+  const finished = finishExecution(session, {
     completedSteps: report.completed,
     failedStep: report.failedStep,
     verified: report.verified,
@@ -1028,7 +1050,7 @@ async function confirmProposal(tab, message) {
     undoKind: report.record?.undoKind ?? 'unavailable',
   });
   // Execution ends the proposal; undo works from the tab's undo record.
-  proposals.delete(message.proposalId);
+  proposals.delete(proposalId);
   return {
     ok: true,
     action: 'execute',
@@ -1045,6 +1067,18 @@ async function confirmProposal(tab, message) {
     },
     phase: finished.phase,
   };
+}
+
+// The panel reports what it is doing and asks; the worker alone decides whether
+// a proposal is safe to run without a question.
+async function runProposal(tab, message) {
+  const stored = proposals.get(message.proposalId);
+  if (!stored) return { error: 'Proposal expired; propose it again' };
+  if (stored.tabId !== tab.id) return { error: 'The page changed; propose the action again' };
+  const outcome = autoConsent(stored.session);
+  if (outcome.error) return { error: outcome.error };
+  proposals.set(message.proposalId, { ...stored, session: outcome.session });
+  return executeAccepted(tab, message.proposalId, outcome.session);
 }
 
 async function executeProposal(tab, proposal) {
@@ -1077,10 +1111,12 @@ async function executeProposal(tab, proposal) {
   let failedStep = null;
   let verified = true;
   let changed = false;
+  let stepNumber = 0;
   try {
     cdp = await debuggerSession(tab.id);
     await setLauncherHidden(cdp, true);
     for (const [index, step] of proposal.steps.entries()) {
+      stepNumber = index + 1;
       if (executions.stopped(tab.id)) {
         failedStep = 'The user left or reset the page; remaining steps were not executed';
         break;
@@ -1167,6 +1203,9 @@ async function executeProposal(tab, proposal) {
       }
       await sleep(SETTLE_MS);
     }
+  } catch (error) {
+    const message = error?.message ?? 'Execution failed';
+    failedStep = stepNumber ? `Step ${stepNumber}: ${message}` : message;
   } finally {
     activeExecutions.delete(tab.id);
     if (cdp) await setLauncherHidden(cdp, false);
@@ -1628,8 +1667,6 @@ async function undoLastAction(tab) {
     url: modelUrl(tab.url),
     summary: `Undo: ${record.summary}`,
     steps,
-    requirements: [],
-    missingFields: [],
     risk: 'compensating',
     undoKind: 'compensating',
     createdAt: Date.now(),
@@ -2487,8 +2524,8 @@ async function cropPng(dataUrl, source, scale) {
 }
 
 async function captureTarget(tab, message) {
-  const found = registryTarget(message.snapshotId, message.nodeId);
-  if (!found || found.entry.tabId !== tab.id) return { error: 'Observe the image again first' };
+  const found = registryTarget(tab.id, message.id);
+  if (!found) return { error: 'Observe the image again first' };
   if (!['img', 'canvas', 'svg'].includes(found.target.tag)) return { error: 'Target is not an image' };
   if (found.entry.frameId !== 0) return { error: REFUSE_CAPTURE };
   const fresh = await chrome.tabs.get(tab.id).catch(() => null);
@@ -2497,7 +2534,7 @@ async function captureTarget(tab, message) {
     prepare: async (cdp) => {
       await setLauncherHidden(cdp, true);
       const scrolled = await agentCall(tab.id, found.entry, {
-        op: 'scrollTo', snapshotId: message.snapshotId, nodeId: message.nodeId,
+        op: 'scrollTo', snapshotId: found.snapshotId, nodeId: found.nodeId,
       }).catch((error) => ({ error: error?.message ?? STALE_PAGE }));
       if (scrolled?.error) throw new Error(scrolled.error);
       const state = scrolled.state;

@@ -233,12 +233,11 @@ test('a spoken choice is read back and consumes only the original question', asy
   const { context, extensionId, worker } = await launch();
   try {
     await resetMock();
-    await openFixture(context, '/grid-native');
+    const page = await openFixture(context, '/grid-native');
     const panel = await openPanel(context, extensionId);
     await sendText(panel, 'Select Monday two to three.');
     await answerWhen(panel, 'page text', 0);
     await expect(panel.locator('#ask-question')).toContainText('AM or PM');
-    const question = await panel.locator('#ask-question').textContent();
 
     await sendIntent(worker, intent('spoken-one'));
     await expect.poll(async () => (await voiceState(panel)).starts).toBe(2);
@@ -247,7 +246,9 @@ test('a spoken choice is read back and consumes only the original question', asy
     await expect.poll(async () => await announcements(panel)).toContain('I heard: one');
     await expect.poll(async () => await announcements(panel), { timeout: 10_000 })
       .toContain('Selected option 1: AM');
-    expect(await panel.locator('#ask-question').textContent()).not.toBe(question);
+    // The answer is consumed: the choice closes and the undoable selection runs.
+    await expect(panel.locator('#ask')).toBeHidden();
+    await expect(page.locator('input[aria-label="Monday 14:00"]')).toBeChecked();
     expect(occurrences(await announcements(panel), 'I heard: one')).toBe(1);
   } finally {
     await context.close();

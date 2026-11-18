@@ -4,7 +4,6 @@ import { PRESS_KEYS, PRESS_MODIFIERS, STEP_TYPES } from './protocol.js';
 
 export const PHASE = Object.freeze({
   guide: 'guide',
-  clarification: 'awaiting_clarification',
   consent: 'awaiting_consent',
   risk: 'awaiting_risk_consent',
   executing: 'executing',
@@ -37,7 +36,7 @@ export function riskFor(steps) {
       const unusual = step.button === 'right' || step.clickCount === 2
         || step.holdMs > 0 || (step.modifiers?.length ?? 0) > 0;
       if (step.point || step.kind === 'visual-region' || step.submits || unusual) current = 'irreversible';
-      else if (SAFE_CLICK_ROLES.has(step.role)) current = 'compensating';
+      else if (SAFE_CLICK_ROLES.has(step.role) && step.togglesChecked) current = 'compensating';
       else current = 'irreversible';
     } else if (step.type === 'hover' || step.type === 'blur') current = 'irreversible';
     else if (step.type === 'drag' || step.type === 'press_key') current = 'irreversible';
@@ -56,15 +55,10 @@ export function undoKindFor(risk) {
   return 'unavailable';
 }
 
-// A clock time needs AM/PM only when an hour is 1-12; 0 and 13-23 are already
-// unambiguous 24-hour values. A meridiem covers only its own clause, so
-// "2:00 to 3:00 PM" is clear but "Monday 2:00; Tuesday 3:00 PM" still asks.
-export function timeNeedsClarification(value) {
-  return String(value ?? '').split(/[;,\n]/u).some((clause) => {
-    if (/(?:^|\d|\s)[ap]\.?m\.?(?![a-z])/iu.test(clause)) return false;
-    return [...clause.matchAll(/(\d{1,2})\s*:/gu)]
-      .some((match) => Number(match[1]) !== 0 && Number(match[1]) < 13);
-  });
+// Undoable work needs no question: the user can undo it. Hover is irreversible
+// only because its result cannot be restored, and it changes nothing by itself.
+export function autoRuns(proposal) {
+  return proposal.risk !== 'irreversible' || proposal.steps.every((step) => step.type === 'hover');
 }
 
 function str(value) {
@@ -275,6 +269,8 @@ export function validateStep(raw, ctx) {
       step.clickCount = clickCount;
       step.holdMs = hold.value;
       step.modifiers = mods.modifiers;
+      // Undo reverses a click only by clicking again, which restores checked state alone.
+      step.togglesChecked = (target.ariaChecked ?? null) !== null || typeof target.checked === 'boolean';
       break;
     }
     case 'hover': {
@@ -374,29 +370,6 @@ export function validateStep(raw, ctx) {
   return { ok: true, step };
 }
 
-function checkRequirement(raw, ctx, index) {
-  if (!raw || typeof raw !== 'object') return { error: `Requirement ${index + 1} has an invalid format` };
-  const name = str(raw.name);
-  const value = str(raw.value);
-  const quote = str(raw.quote);
-  if (!name || !value) return { error: `Requirement ${index + 1} is missing a name or value` };
-  if (!quote) return { error: `Requirement ${index + 1} is missing its source quote` };
-  if (raw.source === 'user') {
-    if (!ctx.userText?.includes(quote)) return { error: `Requirement ${index + 1} quotes the user outside this turn's input` };
-  } else if (raw.source === 'page') {
-    if (!ctx.pageText?.includes(quote)) return { error: `Requirement ${index + 1} quotes page text outside the current snapshot` };
-  } else if (raw.source === 'choice') {
-    const confirmed = ctx.confirmedChoices ?? new Set();
-    if (!confirmed.has(quote) && !confirmed.has(value)) {
-      return { error: `Requirement ${index + 1} uses a choice outside the confirmed answers` };
-    }
-  } else {
-    return { error: `Requirement ${index + 1} has an invalid source` };
-  }
-  if (timeNeedsClarification(value)) return { error: `Requirement ${index + 1}: time is missing AM or PM` };
-  return { requirement: { name, value, source: raw.source, quote } };
-}
-
 export function isIsolatedStep(step) {
   if (step.type === 'hover' || step.type === 'blur' || step.type === 'drag') return true;
   if (step.point) return true;
@@ -434,7 +407,6 @@ export function validateProposal(raw, ctx) {
       } else errors.push(`Step ${index + 1}: ${outcome.error}`);
     });
   }
-  const requirements = [];
   // Actions whose trust comes from a fresh observation cannot share a proposal
   // with anything else: the second step would plan from stale page state.
   const isolated = steps.filter((step) => isIsolatedStep(step));
@@ -442,18 +414,7 @@ export function validateProposal(raw, ctx) {
   else if (isolated.length === 1 && steps.length > 1) {
     errors.push('An action that needs a fresh observation must be proposed alone; observe again after it');
   }
-  if (raw.requirements !== undefined && !Array.isArray(raw.requirements)) errors.push('requirements must be an array');
-  else {
-    (raw.requirements ?? []).forEach((candidate, index) => {
-      const outcome = checkRequirement(candidate, ctx, index);
-      if (outcome.requirement) requirements.push(outcome.requirement);
-      else errors.push(outcome.error);
-    });
-  }
-  const missingFields = Array.isArray(raw.missingFields)
-    ? raw.missingFields.filter((field) => typeof field === 'string' && field.trim()).map((field) => field.trim())
-    : [];
-  if (errors.length) return { ok: false, errors, needsClarification: errors.some((error) => error.includes('AM or PM')) };
+  if (errors.length) return { ok: false, errors };
   const proposal = {
     id: globalThis.crypto.randomUUID(),
     tabId: ctx.tabId,
@@ -463,19 +424,12 @@ export function validateProposal(raw, ctx) {
     snapshotId: ctx.snapshotId ?? null,
     summary,
     steps,
-    requirements,
-    missingFields,
     risk: riskFor(steps),
     undoKind: undoKindFor(riskFor(steps)),
     createdAt: ctx.now ?? Date.now(),
     status: 'proposed',
   };
-  return {
-    ok: true,
-    proposal,
-    needsClarification: missingFields.length > 0,
-    phase: missingFields.length > 0 ? PHASE.clarification : PHASE.consent,
-  };
+  return { ok: true, proposal };
 }
 
 export function cancelToGuide(session) {
@@ -492,6 +446,12 @@ export function armConsent(session, { choiceSetId, now = Date.now() }) {
       consent: { choiceSetId, expiresAt: now + CONSENT_TIMEOUT_MS, used: false },
     },
   };
+}
+
+export function autoConsent(session) {
+  if (session.phase !== PHASE.consent) return { error: 'There is no pending confirmation' };
+  if (!autoRuns(session.proposal)) return { error: 'This action needs the user to confirm it' };
+  return { session: { ...session, phase: PHASE.executing, consent: null } };
 }
 
 export function acceptConsent(session, { choiceSetId, optionValue, now = Date.now() }) {
