@@ -9,6 +9,7 @@ import {
   endCue,
   launch,
   mockRequests,
+  notifyIntent,
   openFirstUsePanel,
   openFixture,
   openPanel,
@@ -431,6 +432,79 @@ test('one warm open request focuses the choice once', async () => {
     await panel.evaluate(() => window.__aaReleaseClaim?.());
     await expect(panel.locator('#ask-options button').first()).toBeFocused();
     expect(await panel.evaluate(() => window.__aaFocus)).toEqual({ window: 1, choice: 2 });
+  } finally {
+    await context.close();
+  }
+});
+
+test('a warm listen shortcut focuses Listen before its claim, asking for the window once', async () => {
+  const { context, extensionId, worker } = await launch();
+  try {
+    await resetMock();
+    await openFixture(context, '/article');
+    const panel = await openPanel(context, extensionId);
+    await panel.locator('body[data-ready="true"]').waitFor({ state: 'attached' });
+    await panel.locator('#close-panel').focus();
+
+    await panel.evaluate(() => {
+      window.__aaWindowFocus = 0;
+      const originalWindowFocus = window.focus.bind(window);
+      window.focus = () => {
+        window.__aaWindowFocus += 1;
+        originalWindowFocus();
+      };
+      window.__aaReleaseClaim = null;
+      const send = chrome.runtime.sendMessage.bind(chrome.runtime);
+      chrome.runtime.sendMessage = async (message, ...rest) => {
+        if (message?.type !== 'CLAIM_INTENT') return send(message, ...rest);
+        const response = await send(message, ...rest);
+        await new Promise((resolve) => { window.__aaReleaseClaim = resolve; });
+        return response;
+      };
+    });
+
+    await sendIntent(worker, intent('held-voice'));
+    // Focus lands while the claim is still held, so a reader names Listen
+    // before "Listening." instead of arriving late and talking over it.
+    await expect(panel.locator('#listen')).toBeFocused();
+    expect(await panel.evaluate(() => window.__aaWindowFocus)).toBe(1);
+    expect((await voiceState(panel)).starts).toBe(0);
+
+    await expect.poll(() => panel.evaluate(() => typeof window.__aaReleaseClaim)).toBe('function');
+    await panel.evaluate(() => window.__aaReleaseClaim());
+    await expect.poll(async () => (await voiceState(panel)).starts).toBe(1);
+    await expect(panel.locator('#listen')).toBeFocused();
+    expect(await panel.evaluate(() => window.__aaWindowFocus)).toBe(1);
+  } finally {
+    await context.close();
+  }
+});
+
+test('an unclaimable listen notification moves focus but keeps the running listen', async () => {
+  const { context, extensionId, worker } = await launch();
+  try {
+    await resetMock();
+    await openFixture(context, '/article');
+    const panel = await openPanel(context, extensionId);
+    await sendIntent(worker, intent('running-listen'));
+    await expect(panel.locator('#mode-line')).toContainText('Listening. Speak now.');
+    await panel.locator('#close-panel').focus();
+    const before = await voiceState(panel);
+
+    // A notification with no stored intent behind it never wins the claim, so
+    // the early focus must not cancel the listen or change the mode.
+    const windowId = await worker.evaluate(async () => {
+      const tabs = await chrome.tabs.query({});
+      return tabs.find((tab) => /^https?:/u.test(tab.url ?? '')).windowId;
+    });
+    await notifyIntent(worker, { ...intent('never-stored'), windowId, at: Date.now() });
+    await expect(panel.locator('#listen')).toBeFocused();
+    await panel.waitForTimeout(300);
+    const after = await voiceState(panel);
+    expect(after.active).toBe(true);
+    expect(after.aborts).toBe(before.aborts);
+    expect(after.starts).toBe(before.starts);
+    await expect(panel.locator('#mode-line')).toContainText('Listening. Speak now.');
   } finally {
     await context.close();
   }

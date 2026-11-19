@@ -2463,16 +2463,37 @@ function focusEntryTarget({ requestWindowFocus = true } = {}) {
   // from the page; automatic replies keep deferring to the current control.
   if (requestWindowFocus) window.focus();
   state.deferChoiceFocus = false;
-  if (!$('ask').hidden) {
-    const first = $('ask-options').querySelector('button');
-    if (first) {
-      state.mode = 'idle';
-      updateModeLine();
-      if (document.activeElement !== first) first.focus();
-      return;
-    }
+  const target = entryControl();
+  if (target !== $('listen')) {
+    state.mode = 'idle';
+    updateModeLine();
+    if (document.activeElement !== target) target.focus();
+    return;
   }
   focusListen();
+}
+
+// The control an entry lands on: the first option of an open question, else Listen.
+function entryControl() {
+  if (!$('ask').hidden) {
+    const first = $('ask-options').querySelector('button');
+    if (first) return first;
+  }
+  return $('listen');
+}
+
+// Focus only. The claim may still fail, so this interrupts no output or voice
+// and leaves the mode alone; handleEntryIntent does that once the claim holds.
+function focusEntryControl() {
+  window.focus();
+  const target = entryControl();
+  if (document.activeElement !== target) target.focus();
+}
+
+// Both entry shortcuts are explicit requests for the panel, so both take focus
+// as soon as they are heard. Launcher and setup entries wait for the claim.
+function focusesBeforeClaim(intent) {
+  return intent.source === 'command' && (intent.mode === 'open' || intent.mode === 'voice');
 }
 
 async function handleEntryIntent(intent) {
@@ -2491,10 +2512,10 @@ async function handleEntryIntent(intent) {
     ],
   });
   cancelVoice();
-  // A warm open notification already transferred keyboard focus before the
-  // serialized claim; asking the window again would repeat its announcement.
-  const notified = intent.mode === 'open' && intent.source === 'command'
-    && state.requestedIntents.has(intent.id);
+  // A warm entry-shortcut notification already transferred keyboard focus
+  // before the serialized claim; asking the window again would repeat its
+  // announcement.
+  const notified = focusesBeforeClaim(intent) && state.requestedIntents.has(intent.id);
   focusEntryTarget({ requestWindowFocus: !notified });
   state.audioPaused = false;
   state.voiceRetry = false;
@@ -2970,10 +2991,11 @@ function receiveEntryIntent(intent) {
   if (!isForThisWindow(intent)) return;
   if (state.requestedIntents.has(intent.id) || state.consumedIntents.has(intent.id)) return;
   state.requestedIntents.add(intent.id);
-  // Act on the explicit open before the serialized claim resolves; waiting for
-  // storage would leave keyboard focus on the page. Cold-start handling in
-  // handleEntryIntent still focuses again after initialization.
-  if (intent.mode === 'open' && intent.source === 'command') focusEntryTarget();
+  // Act on an entry shortcut before the serialized claim resolves; waiting for
+  // storage would leave keyboard focus on the page, and a reader arriving late
+  // talks over "Listening.". Cold-start handling in handleEntryIntent still
+  // focuses again after initialization.
+  if (focusesBeforeClaim(intent)) focusEntryControl();
   claimEntry(intent.id);
 }
 
@@ -2982,6 +3004,11 @@ async function initializePanel() {
     await initializeSetupPage();
     return;
   }
+  // A reader that enters a document with nothing focused reads it from the top
+  // (VoiceOver's auto-speak, NVDA and JAWS say-all on load). Settle focus on a
+  // named control before the first await, and so before the load event, so the
+  // first thing a reader says is that control. Entries may retarget it later.
+  $('listen').focus({ preventScroll: true });
   const self = await chrome.tabs.getCurrent().catch(() => null);
   state.windowId = self?.windowId ?? (await chrome.windows.getCurrent().catch(() => ({}))).id ?? null;
   bindEvents();

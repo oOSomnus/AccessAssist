@@ -161,6 +161,28 @@ test('debug log export records the session without the API key', async () => {
   }
 });
 
+test('a cold panel focuses Listen before it finishes loading', async () => {
+  const { context, extensionId } = await launch();
+  try {
+    await resetMock();
+    await openFixture(context, '/article');
+    // A reader auto-reads a loaded document that has nothing focused, so focus
+    // must already be on a named control when the load event fires.
+    await context.addInitScript(() => {
+      if (location.protocol !== 'chrome-extension:') return;
+      addEventListener('load', () => {
+        window.__aaFocusAtLoad = document.activeElement?.id || document.activeElement?.tagName || null;
+      });
+    });
+    const panel = await openPanel(context, extensionId);
+    await expect.poll(() => panel.evaluate(() => window.__aaFocusAtLoad ?? null)).toBe('listen');
+    await panel.locator('body[data-ready="true"]').waitFor({ state: 'attached' });
+    await expect(panel.locator('#listen')).toBeFocused();
+  } finally {
+    await context.close();
+  }
+});
+
 test('a real option click returns focus to Listen, not the document', async () => {
   const { context, extensionId } = await launch();
   try {
