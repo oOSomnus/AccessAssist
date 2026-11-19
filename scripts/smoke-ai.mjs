@@ -182,7 +182,6 @@ async function checkFormat({ name, config, key }) {
     sessionId: `smoke-${name}`,
     system: 'You must call the provided tool to complete the task; do not answer with text only.',
     messages: [{ role: 'user', content: 'Call the observe_page tool and do nothing else.' }],
-    maxTokens: 4096,
   });
   summary.tool = redact(toolTurn);
   if (!toolTurn.toolCalls.some((call) => call.name === 'observe_page')) {
@@ -204,7 +203,6 @@ async function checkFormat({ name, config, key }) {
       ],
     }],
     tools: [],
-    maxTokens: 4096,
   });
   summary.vision = redact(vision);
   const digits = (vision.text.match(/\d/g) ?? []).join('');
@@ -225,7 +223,6 @@ async function checkFormat({ name, config, key }) {
       ],
     }],
     tools: GROUNDING_TOOLS,
-    maxTokens: 4096,
   });
   const call = grounding.toolCalls.find((candidate) => candidate.name === 'click_control');
   const point = call?.args ?? null;
