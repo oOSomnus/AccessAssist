@@ -323,6 +323,27 @@ test('a cold listen shortcut keeps the panel hidden from screen readers until li
   }
 });
 
+test('an open shortcut during a cold listen shows the panel and focuses Listen', async () => {
+  const { context, extensionId, worker } = await launch();
+  try {
+    await resetMock();
+    await openFixture(context, '/article');
+    await seedIntent(worker, intent('cold-listen-then-open'));
+    const panel = await openPanel(context, extensionId);
+    await expect.poll(async () => (await voiceState(panel)).starts).toBe(1);
+    expect(await panel.evaluate(() => document.body.dataset.quiet)).toBe('all');
+
+    // The open shortcut cancels the listen, whose end would have revealed the
+    // panel; it must not leave the panel hidden with nothing focused.
+    await sendIntent(worker, intent('open-during-listen', { mode: 'open' }));
+    await expect(panel.locator('#listen')).toBeFocused();
+    await expect(panel.locator('#listen')).not.toHaveAttribute('aria-hidden', 'true');
+    await panel.locator('body[data-revealed="true"]').waitFor({ state: 'attached' });
+  } finally {
+    await context.close();
+  }
+});
+
 test('revoking the microphone permission stops the active session', async () => {
   const { context, extensionId, worker } = await launch();
   try {

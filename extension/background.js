@@ -325,6 +325,7 @@ chrome.commands.onCommand.addListener(async (command, tab) => {
     // Cleanup must not gate the native close: intent storage and the panel
     // message can hang or have no receiver.
     void claimIntent(windowId).catch(() => null);
+    void storeChoiceKeys(windowId, null).catch(() => {});
     void chrome.runtime.sendMessage({ type: 'CLOSE_PANEL', windowId }).catch(() => {});
     try {
       await chrome.sidePanel.close({ windowId });
@@ -448,9 +449,21 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
       sendResponse({ error: 'Unauthorized launcher message' });
       return false;
     }
+    // A page that loads while a question is open learns its keys too.
+    const keys = choiceKeysFor(sender.tab.windowId).catch(() => null);
     queueLauncher(migrateLauncherPosition)
-      .then((position) => sendResponse({ position }))
+      .then(async (position) => sendResponse({ position, choiceKeys: await keys }))
       .catch(() => sendResponse({ error: 'Could not load the Assistant button position.' }));
+    return true;
+  }
+  if (message?.type === 'CHOICE_KEY') {
+    if (!launcherSender(sender)) {
+      sendResponse({ error: 'Unauthorized launcher message' });
+      return false;
+    }
+    forwardChoiceKey(message, sender.tab)
+      .then(sendResponse)
+      .catch(() => sendResponse({ ok: false, choiceKeys: null }));
     return true;
   }
   if (message?.type === 'SET_LAUNCHER_POSITION') {
@@ -553,6 +566,7 @@ async function route(message) {
     case 'ACTIVATE_TAB': return activateTab(message);
     case 'RESET_SESSION': return resetSession(message.tabId, { clearSnapshots: message.clearSnapshots === true });
     case 'GET_COMMANDS': return { commands: await chrome.commands.getAll() };
+    case 'SET_CHOICE_KEYS': return setChoiceKeys(message);
     default: return { error: 'Unknown message type' };
   }
 }
@@ -1857,6 +1871,75 @@ async function activateTab(message) {
     url: modelUrl(fresh.url),
     origin: originOf(fresh.url),
   };
+}
+
+// While the panel asks a question, the launcher in each page of that window
+// catches Control+Shift and the question's numbers, so the user can answer
+// even when keyboard focus is in the page (a page the assistant just brought
+// forward takes focus, for one). Kept in session storage: a question can
+// outlast the worker's idle shutdown.
+const CHOICE_KEYS_PREFIX = 'choiceKeys:';
+
+async function choiceKeysFor(windowId) {
+  if (!Number.isInteger(windowId)) return null;
+  const key = `${CHOICE_KEYS_PREFIX}${windowId}`;
+  const stored = await chrome.storage.session.get(key);
+  return stored[key] ?? null;
+}
+
+async function broadcastChoiceKeys(windowId, choiceKeys) {
+  const tabs = await chrome.tabs.query({ windowId }).catch(() => []);
+  await Promise.all(tabs
+    .filter((tab) => Number.isInteger(tab.id) && httpUrl(tab.url))
+    .map((tab) => chrome.tabs.sendMessage(tab.id, { type: 'CHOICE_KEYS', choiceKeys }, { frameId: 0 })
+      .catch(() => {})));
+}
+
+// Serialized: replacing a question withdraws the old keys and publishes the
+// new ones back to back, and the pages must end on the newest.
+let choiceKeysQueue = Promise.resolve();
+
+function storeChoiceKeys(windowId, choiceKeys) {
+  const run = async () => {
+    const key = `${CHOICE_KEYS_PREFIX}${windowId}`;
+    if (choiceKeys) await chrome.storage.session.set({ [key]: choiceKeys });
+    else await chrome.storage.session.remove(key);
+    await broadcastChoiceKeys(windowId, choiceKeys);
+  };
+  const next = choiceKeysQueue.then(run, run);
+  choiceKeysQueue = next.catch(() => {});
+  return next;
+}
+
+async function setChoiceKeys(message) {
+  if (!Number.isInteger(message.windowId)) return { error: 'Invalid window' };
+  const numbers = Array.isArray(message.numbers)
+    ? [...new Set(message.numbers.filter((number) => typeof number === 'string' && /^[1-9]$/u.test(number)))]
+    : [];
+  const choiceId = typeof message.choiceId === 'string' && message.choiceId ? message.choiceId : null;
+  await storeChoiceKeys(message.windowId, choiceId && numbers.length ? { choiceId, numbers } : null);
+  return { ok: true };
+}
+
+async function forwardChoiceKey(message, tab) {
+  const choiceKeys = await choiceKeysFor(tab.windowId);
+  if (!choiceKeys) return { ok: false, choiceKeys: null };
+  // Only the page in front of the user answers, never while the assistant's
+  // own input is running in it, and only the question it was told about.
+  if (!tab.active || activeExecutions.has(tab.id)
+    || message.choiceId !== choiceKeys.choiceId || !choiceKeys.numbers.includes(message.key)) {
+    return { ok: false, choiceKeys };
+  }
+  try {
+    await chrome.runtime.sendMessage({
+      type: 'CHOICE_KEY', windowId: tab.windowId, choiceId: choiceKeys.choiceId, key: message.key,
+    });
+  } catch {
+    // No panel received it: the question closed with the panel.
+    await storeChoiceKeys(tab.windowId, null).catch(() => {});
+    return { ok: false, choiceKeys: null };
+  }
+  return { ok: true, choiceKeys };
 }
 
 async function setLauncherPosition(position, sourceTabId) {

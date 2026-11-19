@@ -966,7 +966,19 @@ function choiceKeyboardHint() {
     : detectPlatform() === 'voiceover'
       ? 'Press Command plus Option plus Up or Down Arrow to cycle Chrome regions'
       : 'Use your browser region navigation to reach the assistant';
-  return `${base} once the assistant has keyboard focus. ${cycle}, then Tab into the assistant. Press Escape to cancel.`;
+  return `${base}; this works from the page too. To cancel, ${cycle.charAt(0).toLowerCase()}${cycle.slice(1)}, Tab into the assistant, and press Escape.`;
+}
+
+// Lets the page in front of the user answer with the same keys; see the
+// launcher. Null withdraws them.
+function publishChoiceKeys(set) {
+  if (SETUP_PAGE || !Number.isInteger(state.windowId)) return;
+  const numbers = set ? set.options.map((option) => String(option.number)) : [];
+  void send('SET_CHOICE_KEYS', {
+    windowId: state.windowId,
+    choiceId: set ? String(set.id) : null,
+    numbers,
+  }).catch(() => {});
 }
 
 // Programmatic focus is safe only when the user is not editing a field and no
@@ -1029,6 +1041,7 @@ function showChoice(set, sourceSites = []) {
     container.append(button);
   }
   reveal($('ask'));
+  publishChoiceKeys(set);
 }
 
 function choiceTriggerFor(element) {
@@ -1062,6 +1075,7 @@ function hideChoice() {
   sites.replaceChildren();
   sites.hidden = true;
   $('ask-options').replaceChildren();
+  publishChoiceKeys(null);
 }
 
 // Number keys act within the nearest data-number-scope group. Without one,
@@ -1103,7 +1117,16 @@ function defaultNumberScope(key) {
   if (numberTarget('voice', key)) return 'voice';
   if (choiceNumberAvailable(key)) return 'choice';
   if (numberTarget('composer', key)) return 'composer';
+  if (numberTarget('settings', key)) return 'settings';
   return null;
+}
+
+// What a number does in one group: answer the open question, or press a
+// control. Null when that group has nothing on the number.
+function numberAction(scope, key) {
+  if (scope === 'choice') return choiceNumberAvailable(key) ? { choice: true } : null;
+  const element = scope ? numberTarget(scope, key) : null;
+  return element ? { element } : null;
 }
 
 // Never bind any of these on their own. Control by itself silences speech in
@@ -1126,10 +1149,10 @@ function handleNumberShortcut(event) {
   if (!match) return;
   const key = match[1];
   const target = event.target;
-  // Native selects keep their own type-ahead.
-  if (target instanceof HTMLElement && target.matches('select')) return;
-  // A text field has no own number group, so an open question stays answerable
-  // from a settings field; other focused groups keep their own numbers.
+  // A select's type-ahead never sees Control+Shift digits, so the shortcut
+  // works there too. A text field has no own number group, so an open question
+  // stays answerable from a settings field; other focused groups keep their
+  // own numbers first.
   const editable = target instanceof HTMLElement && (
     target.matches('textarea, [contenteditable="true"]')
     || (target.matches('input') && !target.matches('input[type="radio"], input[type="checkbox"], input[type="button"], input[type="submit"]'))
@@ -1141,17 +1164,44 @@ function handleNumberShortcut(event) {
   if (deferred && scope === 'composer' && choiceNumberAvailable(key) && !numberTarget('voice', key)) {
     scope = 'choice';
   }
-  if (!scope) return;
-  if (scope === 'choice') {
-    if (!choiceNumberAvailable(key)) return;
-    event.preventDefault();
+  // Wherever focus is in the panel, a number the focused group lacks still
+  // reaches the visible control that shows it.
+  let action = numberAction(scope, key);
+  if (!action) {
+    const fallback = defaultNumberScope(key);
+    if (fallback !== scope) action = numberAction(fallback, key);
+  }
+  event.preventDefault();
+  if (!action) {
+    // Silence would leave a screen-reader user guessing whether the key or
+    // focus is at fault.
+    void say(`Nothing uses Control plus Shift plus ${key} right now.`);
+    return;
+  }
+  if (action.choice) {
     if (!selectOption(state.choice.set.id, key)) void say('There is no such choice.');
     return;
   }
-  const element = numberTarget(scope, key);
-  if (!element) return;
-  event.preventDefault();
-  element.click();
+  action.element.click();
+}
+
+// Chrome activates a focused button, summary, checkbox, or radio when Space
+// is released, even with Control, Alt, or Meta held. The open shortcut is
+// Control+Shift+Space, so without this it would also press whatever control
+// has focus: Close, a choice answer, or Listen. The key press itself is left
+// alone so Chrome still runs the shortcut; only the release is cancelled.
+function guardModifiedSpace() {
+  let armed = false;
+  window.addEventListener('keydown', (event) => {
+    if (event.code !== 'Space') return;
+    armed = event.ctrlKey || event.altKey || event.metaKey;
+  }, true);
+  window.addEventListener('keyup', (event) => {
+    if (event.code !== 'Space' || !armed) return;
+    armed = false;
+    event.preventDefault();
+  }, true);
+  window.addEventListener('blur', () => { armed = false; });
 }
 
 function finishChoice(choiceSetId, option, reason = 'answered') {
@@ -2706,6 +2756,10 @@ async function handleEntryIntent(intent, { cold = false } = {}) {
   // A cold entry was already given window focus when the panel started.
   const notified = (focusesBeforeClaim(intent) && state.requestedIntents.has(intent.id))
     || (cold && state.startFocused);
+  // cancelVoice above ended any cold listen without its end callback, which
+  // is what would have revealed the panel; any entry but another listen
+  // shortcut shows it now, so focus can land.
+  if (!isColdListen(intent)) exposeForEntry('entry');
   focusEntryTarget({ requestWindowFocus: !notified });
   state.audioPaused = false;
   state.voiceRetry = false;
@@ -2976,6 +3030,7 @@ function bindEvents() {
   $('export-log').addEventListener('click', () => void exportDebugLog());
   $('settings-form').addEventListener('submit', (event) => void saveSettings(event));
   $('protocol').addEventListener('change', toggleAnthropicFields);
+  guardModifiedSpace();
   document.addEventListener('keydown', handleNumberShortcut);
   document.addEventListener('keydown', (event) => {
     if (event.key !== 'Escape') return;
@@ -2992,6 +3047,8 @@ function bindEvents() {
   window.addEventListener('beforeunload', () => {
     interruptOutput();
     cancelVoice();
+    // The pages stop answering a question that closes with the panel.
+    if (state.choice) publishChoiceKeys(null);
     stopLocalWatch();
     speech.stopWorking();
     turns.current.cancel();
@@ -3206,7 +3263,11 @@ function receiveEntryIntent(intent) {
   // storage would leave keyboard focus on the page, and a reader arriving late
   // talks over "Listening.". Cold-start handling in handleEntryIntent still
   // focuses again after initialization.
-  if (focusesBeforeClaim(intent)) focusEntryControl();
+  if (focusesBeforeClaim(intent)) {
+    // Before init decides what to expose, the startup path handles it.
+    if (state.ready && !isColdListen(intent)) exposeForEntry('entry-notice');
+    focusEntryControl();
+  }
   claimEntry(intent.id);
 }
 
@@ -3262,6 +3323,14 @@ function exposeListen(cause) {
   document.body.dataset.quiet = 'listen';
   debugLog.add('panel.expose-listen', { cause, ...focusSnapshot() });
   quietTimer = setTimeout(() => revealPanel('timer'), QUIET_LOAD_MS);
+}
+
+// An entry that arrives while the panel is wholly hidden (a cold listen still
+// running) exposes it the same way an ordinary opening does.
+function exposeForEntry(cause) {
+  if (quietStage !== 'all') return;
+  if (entryControl() === $('listen')) exposeListen(cause);
+  else revealPanel(cause);
 }
 
 // Exposes everything marked data-quiet-load in sidepanel.html. Called once.
@@ -3387,6 +3456,7 @@ async function initializeSetupPage() {
   speech.attach({ liveEl: $('sr-status') });
   $('start-using').addEventListener('click', () => void startPreparation({ setup: true, force: true }));
   $('return-assistant').addEventListener('click', () => void returnToAssistant());
+  guardModifiedSpace();
   document.addEventListener('keydown', handleNumberShortcut);
   const status = await refreshVoiceStatus();
   if (status.local !== 'available') ensureLocalWatch();
@@ -3438,6 +3508,19 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
       ? message.error
       : 'The side panel did not close.';
     void say(`Could not close the assistant. ${detail}`, { urgent: true });
+    return;
+  }
+  if (message?.type === 'CHOICE_KEY') {
+    // Only the worker relays a page's key, after checking the page; the
+    // launcher's own broadcast of the same message carries a tab and is ignored.
+    if (SETUP_PAGE) return;
+    if (sender?.id !== chrome.runtime.id || sender.tab) return;
+    if (!Number.isInteger(state.windowId) || message.windowId !== state.windowId) return;
+    const current = state.choice;
+    if (!current || $('ask').hidden || String(current.set.id) !== message.choiceId) return;
+    debugLog.add('choice.page-key', { key: message.key });
+    state.deferChoiceFocus = false;
+    if (!selectOption(current.set.id, message.key)) void say('There is no such choice.');
     return;
   }
   if (message?.type !== 'ENTRY_INTENT') return;

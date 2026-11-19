@@ -371,8 +371,15 @@ test('bare digits stay native while the master combination chooses', async () =>
     await expect(panel.locator('#ask')).toBeVisible();
     await expect(panel.locator('#ask-question')).toHaveText(question);
 
-    // An unavailable number is not consumed and changes nothing.
+    // A number nothing uses changes nothing and says so.
     await panel.keyboard.press('Control+Shift+9');
+    await expect.poll(async () => await announcements(panel))
+      .toContain('Nothing uses Control plus Shift plus 9 right now.');
+    await expect(panel.locator('#ask')).toBeVisible();
+    await expect(panel.locator('#ask-question')).toHaveText(question);
+
+    // The open shortcut's Space never presses the focused choice.
+    await panel.keyboard.press('Control+Shift+Space');
     await panel.waitForTimeout(150);
     await expect(panel.locator('#ask')).toBeVisible();
     await expect(panel.locator('#ask-question')).toHaveText(question);
@@ -391,6 +398,62 @@ test('bare digits stay native while the master combination chooses', async () =>
     // and the undoable selection runs without a confirmation question.
     await panel.keyboard.press('Control+Shift+2');
     await expect(page.locator('input[aria-label="Monday 14:00"]')).toBeChecked();
+  } finally {
+    await context.close();
+  }
+});
+
+test('an open question answers Control+Shift numbers from the page in front', async () => {
+  const { context, extensionId } = await launch();
+  try {
+    await resetMock();
+    const page = await openFixture(context, '/grid-native');
+    await waitForLauncher(page);
+    await page.evaluate(() => {
+      window.__pageKeys = [];
+      window.addEventListener('keydown', (event) => {
+        if (event.ctrlKey && event.shiftKey && event.code.startsWith('Digit')) window.__pageKeys.push(event.code);
+      }, true);
+    });
+    const panel = await openPanel(context, extensionId);
+    await sendText(panel, 'Select Monday two to three.');
+    await answerWhen(panel, 'page text', 0);
+    await expect(panel.locator('#ask-question')).toContainText('AM or PM');
+
+    // Keyboard focus back in the page: the question's number still answers it,
+    // and the page never sees that key.
+    await page.bringToFront();
+    await page.locator('body').focus();
+    await page.keyboard.press('Control+Shift+2');
+    await expect(page.locator('input[aria-label="Monday 14:00"]')).toBeChecked();
+    expect(await page.evaluate(() => window.__pageKeys)).toEqual([]);
+
+    // With no question open, the same keys belong to the page again.
+    await expect(panel.locator('#ask')).toBeHidden();
+    await expect.poll(async () => {
+      await page.keyboard.press('Control+Shift+2');
+      return page.evaluate(() => window.__pageKeys.length);
+    }).toBeGreaterThan(0);
+  } finally {
+    await context.close();
+  }
+});
+
+test('a number the focused group lacks reaches the visible control that shows it', async () => {
+  const { context, extensionId } = await launch();
+  try {
+    await resetMock();
+    await openFixture(context, '/grid-native');
+    const panel = await openPanel(context, extensionId);
+    await sendText(panel, 'Select Monday two to three.');
+    await answerWhen(panel, 'page text', 0);
+    await expect(panel.locator('#ask-question')).toContainText('AM or PM');
+    await expect(panel.locator('#cancel')).toBeVisible();
+
+    // Focus on a choice, which has no 4: 4 Cancel still works.
+    await panel.locator('#ask-options button').first().focus();
+    await panel.keyboard.press('Control+Shift+4');
+    await expect(panel.locator('#ask')).toBeHidden();
   } finally {
     await context.close();
   }
@@ -1607,6 +1670,10 @@ test('Close panel uses native close, keeps settings, and reports a failure in pl
     expect(await panel.locator('#close-panel').getAttribute('data-number')).toBeNull();
     await panel.locator('#close-panel').focus();
     await panel.keyboard.press('Control+Shift+7');
+    await panel.waitForTimeout(150);
+    expect(await panel.evaluate(() => window.__closeCalls.length)).toBe(0);
+    // The open shortcut's Space never presses the focused Close button.
+    await panel.keyboard.press('Control+Shift+Space');
     await panel.waitForTimeout(150);
     expect(await panel.evaluate(() => window.__closeCalls.length)).toBe(0);
 

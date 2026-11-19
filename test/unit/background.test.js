@@ -332,7 +332,7 @@ test('legacy launcher corners migrate to normalized coordinates', async () => {
     calls.localSet.length = 0;
     behavior.localState = { launcherPosition: legacy, apiConfig: { model: 'keep' }, unrelated: 1 };
     const response = await launcherMessage({ type: 'GET_LAUNCHER_STATE' });
-    assert.deepEqual(response, { position: expected });
+    assert.deepEqual(response, { position: expected, choiceKeys: null });
     assert.deepEqual(behavior.localState.launcherPosition, expected);
     assert.deepEqual(behavior.localState.apiConfig, { model: 'keep' });
     assert.equal(behavior.localState.unrelated, 1);
@@ -346,7 +346,7 @@ test('a stored launcher object is preserved and corrupt or missing values become
   await settle();
   behavior.localState = { launcherPosition: { x: 0.25, y: 0.75 } };
   assert.deepEqual(await launcherMessage({ type: 'GET_LAUNCHER_STATE' }), {
-    position: { x: 0.25, y: 0.75 },
+    position: { x: 0.25, y: 0.75 }, choiceKeys: null,
   });
   assert.deepEqual(calls.localSet, []);
 
@@ -354,7 +354,7 @@ test('a stored launcher object is preserved and corrupt or missing values become
     calls.localSet.length = 0;
     behavior.localState = { launcherPosition };
     assert.deepEqual(await launcherMessage({ type: 'GET_LAUNCHER_STATE' }), {
-      position: { x: 1, y: 1 },
+      position: { x: 1, y: 1 }, choiceKeys: null,
     });
     assert.deepEqual(behavior.localState.launcherPosition, { x: 1, y: 1 });
     assert.equal(calls.localSet.length, 1);
@@ -362,7 +362,7 @@ test('a stored launcher object is preserved and corrupt or missing values become
   calls.localSet.length = 0;
   behavior.localState = {};
   assert.deepEqual(await launcherMessage({ type: 'GET_LAUNCHER_STATE' }), {
-    position: { x: 1, y: 1 },
+    position: { x: 1, y: 1 }, choiceKeys: null,
   });
   assert.equal(calls.localSet.length, 1);
 });
@@ -500,7 +500,7 @@ test('a queued launcher save wins over a delayed startup migration read', async 
   await settle();
   assert.deepEqual(behavior.localState.launcherPosition, 'br');
   behavior.releaseLocalGet();
-  assert.deepEqual(await pendingGet, { position: { x: 1, y: 1 } });
+  assert.deepEqual(await pendingGet, { position: { x: 1, y: 1 }, choiceKeys: null });
   assert.deepEqual(await pendingSet, { ok: true, position: { x: 0.2, y: 0.3 } });
   assert.deepEqual(behavior.localState.launcherPosition, { x: 0.2, y: 0.3 });
 });
