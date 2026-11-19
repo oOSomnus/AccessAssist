@@ -15,6 +15,7 @@ import {
   openPanel,
   releaseStart,
   resetMock,
+  seedIntent,
   sendIntent,
   sendText,
   setPermission,
@@ -279,6 +280,44 @@ test('a no-speech timeout consumes one authorization and the next listen starts 
     await emitFinal(panel, 'help');
     await expect.poll(async () => await announcements(panel), { timeout: 10_000 })
       .toContain('You can ask what this page is about');
+  } finally {
+    await context.close();
+  }
+});
+
+test('a cold listen shortcut keeps the panel hidden from screen readers until listening ends', async () => {
+  const { context, extensionId, worker } = await launch();
+  try {
+    await resetMock();
+    await openFixture(context, '/article');
+    await context.addInitScript(() => {
+      if (location.protocol !== 'chrome-extension:') return;
+      addEventListener('load', () => {
+        window.__aaQuietAtLoad = document.querySelectorAll('[data-quiet-load][aria-hidden="true"]').length;
+      });
+    });
+    // The shortcut leaves its intent before the panel loads.
+    await seedIntent(worker, intent('cold-listen'));
+    const panel = await openPanel(context, extensionId);
+    await expect.poll(async () => (await voiceState(panel)).starts).toBe(1);
+    await expect(panel.locator('#mode-line')).toContainText('Listening. Speak now.');
+
+    // While listening, a reader finds only the live region: nothing else is
+    // exposed, nothing in the panel holds focus, and "Listening." is all it said.
+    expect(await panel.evaluate(() => window.__aaQuietAtLoad)).toBe(8);
+    expect(await panel.evaluate(() => ({
+      stage: document.body.dataset.quiet,
+      hidden: document.querySelectorAll('[data-quiet-load][aria-hidden="true"]').length,
+      active: document.activeElement?.id || document.activeElement?.tagName,
+    }))).toEqual({ stage: 'all', hidden: 8, active: 'BODY' });
+    expect(await announcementEntries(panel)).toEqual(['Listening.']);
+
+    // The end of listening reveals the panel and puts focus on Listen.
+    await emitNoSpeech(panel);
+    await panel.locator('body[data-revealed="true"]').waitFor({ state: 'attached' });
+    expect(await panel.locator('[data-quiet-load], [aria-hidden="true"]:is(header, .panel-content, #composer button, #actions-heading)').count())
+      .toBe(0);
+    await expect(panel.locator('#listen')).toBeFocused();
   } finally {
     await context.close();
   }

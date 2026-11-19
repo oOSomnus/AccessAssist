@@ -325,6 +325,8 @@ function consumeListen() {
   state.listenRequest = null;
   state.entrySeq += 1;
   if ($('mode-line').textContent.startsWith('Listening')) updateModeLine();
+  // A cold listen shortcut kept the panel hidden for this listen.
+  revealPanel('listen-end', { focus: true });
 }
 
 let sayToken = 0;
@@ -1333,7 +1335,7 @@ function focusListen() {
   cancelVoice();
   state.mode = 'idle';
   updateModeLine();
-  if (document.activeElement !== $('listen')) $('listen').focus();
+  if (panelFocusable() && document.activeElement !== $('listen')) $('listen').focus();
 }
 
 function setSettingsOpen(open) {
@@ -2653,7 +2655,7 @@ function focusEntryTarget({ requestWindowFocus = true } = {}) {
   if (target !== $('listen')) {
     state.mode = 'idle';
     updateModeLine();
-    if (document.activeElement !== target) target.focus();
+    if (panelFocusable() && document.activeElement !== target) target.focus();
     return;
   }
   focusListen();
@@ -2673,7 +2675,7 @@ function entryControl() {
 function focusEntryControl() {
   window.focus();
   const target = entryControl();
-  if (document.activeElement !== target) target.focus();
+  if (panelFocusable() && document.activeElement !== target) target.focus();
 }
 
 // Both entry shortcuts are explicit requests for the panel, so both take focus
@@ -2732,8 +2734,12 @@ async function handleEntryIntent(intent, { cold = false } = {}) {
   if (state.busy && !state.choice) preemptTurn();
   const seq = ++state.entrySeq;
   state.listenRequest = intent.id;
-  if (!state.voiceReady && !(await prepareEntry(seq))) return;
-  await listenOnce(intent.id, seq);
+  // A listen that cannot start shows the panel that explains why.
+  if (!state.voiceReady && !(await prepareEntry(seq))) {
+    revealPanel('listen-unavailable', { focus: true });
+    return;
+  }
+  if (!(await listenOnce(intent.id, seq))) revealPanel('listen-unavailable', { focus: true });
 }
 
 // Entry-driven preparation keeps the single-use listen authorization alive only
@@ -3204,12 +3210,31 @@ function receiveEntryIntent(intent) {
   claimEntry(intent.id);
 }
 
-// How long after load the quiet regions stay hidden when nothing reveals them
-// sooner. Long enough for a reader's load-time reading of the one exposed
+// How long after Listen is exposed the rest stays hidden when nothing reveals
+// it sooner. Long enough for a reader's load-time reading of the one exposed
 // control to finish; short enough that a reader user exploring by reader
 // commands alone, which moves no focus, soon finds the whole panel.
 const QUIET_LOAD_MS = 1500;
-let quietRevealed = false;
+// A cold listen shortcut keeps the panel hidden until listening ends; this
+// only covers a listen that never reports an end.
+const QUIET_LISTEN_BACKSTOP_MS = 30_000;
+// 'all': everything but the live region is hidden from screen readers, and
+// nothing in the panel takes DOM focus (Chrome would drop aria-hidden from a
+// focused control). 'listen': only Listen is exposed, and focused. 'none':
+// the whole panel is exposed.
+let quietStage = 'all';
+let quietTimer = null;
+
+// The panel may not move DOM focus while it is wholly hidden.
+function panelFocusable() {
+  return quietStage !== 'all';
+}
+
+// A listen shortcut that opened the panel: the user wants the microphone, not
+// the panel read to them.
+function isColdListen(intent) {
+  return intent?.source === 'command' && intent.mode === 'voice';
+}
 
 function focusSnapshot() {
   const active = document.activeElement;
@@ -3221,29 +3246,53 @@ function focusSnapshot() {
   };
 }
 
+function exposeElement(element) {
+  element.removeAttribute('aria-hidden');
+  element.removeAttribute('data-quiet-load');
+}
+
+// Exposes and focuses Listen alone, then the rest shortly after. A reader's
+// load-time reading finds that one control.
+function exposeListen(cause) {
+  if (quietStage !== 'all') return;
+  quietStage = 'listen';
+  clearTimeout(quietTimer);
+  exposeElement($('listen'));
+  $('listen').focus({ preventScroll: true });
+  document.body.dataset.quiet = 'listen';
+  debugLog.add('panel.expose-listen', { cause, ...focusSnapshot() });
+  quietTimer = setTimeout(() => revealPanel('timer'), QUIET_LOAD_MS);
+}
+
 // Exposes everything marked data-quiet-load in sidepanel.html. Called once.
-function revealPanel(cause) {
-  if (quietRevealed) return;
-  quietRevealed = true;
-  for (const element of document.querySelectorAll('[data-quiet-load]')) {
-    element.removeAttribute('aria-hidden');
-    element.removeAttribute('data-quiet-load');
-  }
+// With focus, Listen takes focus only if nothing in the panel has it.
+function revealPanel(cause, { focus = false } = {}) {
+  if (quietStage === 'none') return;
+  quietStage = 'none';
+  clearTimeout(quietTimer);
+  quietTimer = null;
+  for (const element of document.querySelectorAll('[data-quiet-load]')) exposeElement(element);
+  document.body.dataset.quiet = 'none';
   document.body.dataset.revealed = 'true';
+  const active = document.activeElement;
+  if (focus && (!active || active === document.body)) $('listen').focus({ preventScroll: true });
   debugLog.add('panel.reveal', { cause, ...focusSnapshot() });
 }
 
 // A reader that auto-reads a freshly loaded document (VoiceOver's "speak web
-// page") reads only what is exposed when loading ends. Until the user acts,
-// or shortly after load, that is the Listen button. Any focus move to another
-// control reveals first, so focus never lands inside a hidden region.
+// page") reads only what is exposed when loading ends, and keeps reading
+// whatever is exposed while it reads. So the panel loads with nothing exposed
+// but the live region; initializePanel decides what to expose once it knows
+// why the panel opened. A key press, a click, or a focus move to another
+// control reveals everything first, so focus never lands inside a hidden region.
 function watchQuietLoad() {
+  document.body.dataset.quiet = 'all';
   debugLog.add('panel.focus', { at: 'script', ...focusSnapshot() });
   const onInput = (event) => revealPanel(event.type);
   document.addEventListener('keydown', onInput, { capture: true, once: true });
   document.addEventListener('pointerdown', onInput, { capture: true, once: true });
   document.addEventListener('focusin', (event) => {
-    if (event.target !== $('listen')) revealPanel('focusin');
+    if (quietStage === 'all' || event.target !== $('listen')) revealPanel('focusin');
   }, true);
   document.addEventListener('DOMContentLoaded', () => {
     debugLog.add('panel.focus', { at: 'DOMContentLoaded', ...focusSnapshot() });
@@ -3253,7 +3302,6 @@ function watchQuietLoad() {
   }, { once: true });
   const afterLoad = () => {
     debugLog.add('panel.focus', { at: 'load', ...focusSnapshot() });
-    setTimeout(() => revealPanel('timer'), QUIET_LOAD_MS);
   };
   if (document.readyState === 'complete') afterLoad();
   else window.addEventListener('load', afterLoad, { once: true });
@@ -3262,18 +3310,16 @@ function watchQuietLoad() {
 async function initializePanel() {
   watchQuietLoad();
   if (SETUP_PAGE) {
+    revealPanel('setup');
     await initializeSetupPage();
     return;
   }
-  // A reader that enters a document with nothing focused reads it from the top
-  // (VoiceOver's auto-speak, NVDA and JAWS say-all on load). Settle focus on a
-  // named control before the first await, and so before the load event, so the
-  // first thing a reader says is that control. A side panel opens without
-  // keyboard focus, which stays in the page, so DOM focus alone is not enough:
-  // the panel also takes window focus here. Every way it opens (toolbar,
-  // shortcut, the page's Assistant button, setup) is the user asking for it.
-  // Entries may retarget focus later.
-  $('listen').focus({ preventScroll: true });
+  // A side panel opens without keyboard focus, which stays in the page. Every
+  // way it opens (toolbar, shortcut, the page's Assistant button, setup) is the
+  // user asking for it, so the panel takes window focus before the first
+  // await. DOM focus waits: the panel is still hidden from screen readers, and
+  // initializePanel exposes and focuses Listen below unless a cold listen
+  // shortcut keeps it hidden until listening ends.
   if (!document.hasFocus()) window.focus();
   state.startFocused = true;
   debugLog.add('panel.focus', { at: 'init', ...focusSnapshot() });
@@ -3311,9 +3357,20 @@ async function initializePanel() {
   intent = latestIntent(intent, state.pendingIntent);
   state.pendingIntent = null;
   if (!isForThisWindow(intent)) intent = null;
-  if (intent && !state.consumedIntents.has(intent.id)) {
-    state.consumedIntents.add(intent.id);
-    await handleEntryIntent(intent, { cold: true });
+  const entry = intent && !state.consumedIntents.has(intent.id) ? intent : null;
+  // A cold listen shortcut stays silent to screen readers until listening
+  // ends, so the reader says "Listening." and nothing else over the tone and
+  // the open microphone. Every other opening names Listen first.
+  if (isColdListen(entry)) {
+    clearTimeout(quietTimer);
+    quietTimer = setTimeout(() => revealPanel('backstop', { focus: true }), QUIET_LISTEN_BACKSTOP_MS);
+    debugLog.add('panel.quiet-listen', focusSnapshot());
+  } else {
+    exposeListen(entry ? 'entry' : 'open');
+  }
+  if (entry) {
+    state.consumedIntents.add(entry.id);
+    await handleEntryIntent(entry, { cold: true });
   }
 }
 

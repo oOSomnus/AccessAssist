@@ -8,11 +8,13 @@
   <link rel="stylesheet" href="sidepanel.css">
 </head>
 <body>
-  <!-- data-quiet-load: hidden from screen readers only while the panel loads.
-       A reader that auto-reads a freshly loaded page (VoiceOver's "speak web
-       page") then finds just Listen, which already has focus, instead of every
-       line of the panel. sidepanel.js reveals these on the first key, pointer,
-       or focus move, or shortly after load. Nothing changes visually. -->
+  <!-- data-quiet-load: hidden from screen readers (not from view) while the
+       panel loads, so a reader that auto-reads a freshly loaded page
+       (VoiceOver's "speak web page") finds nothing but the live region.
+       sidepanel.js then exposes and focuses Listen, and reveals the rest on the
+       first key, pointer, or focus move, or shortly after. A cold listen
+       shortcut keeps everything hidden until listening ends, so the user hears
+       only "Listening." and the tone. Nothing changes visually. -->
   <header class="bar" data-quiet-load aria-hidden="true">
     <div class="bar-heading">
       <svg class="brand-mark" viewBox="0 0 32 32" aria-hidden="true" focusable="false"><rect class="mark-tile" width="32" height="32" rx="8"/><path class="mark-bubble" d="M9 7h14a4 4 0 0 1 4 4v7a4 4 0 0 1-4 4h-7l-6 5v-5H9a4 4 0 0 1-4-4v-7a4 4 0 0 1 4-4z"/><path class="mark-bars" d="M12 12.5v4M16 10.5v8M20 12.5v4"/></svg>
@@ -133,7 +135,7 @@
     <div id="composer" role="region" aria-labelledby="actions-heading">
       <h2 id="actions-heading" class="visually-hidden" data-quiet-load aria-hidden="true">Actions</h2>
       <div class="buttons" data-number-scope="composer">
-        <button id="listen" type="button" data-number="1">1 Prepare voice</button>
+        <button id="listen" type="button" data-quiet-load aria-hidden="true" data-number="1">1 Prepare voice</button>
         <button id="pause" type="button" data-quiet-load aria-hidden="true" data-number="2">2 Stop listening</button>
         <button id="repeat" type="button" data-quiet-load aria-hidden="true" data-number="3">3 Repeat choices</button>
         <button id="cancel" type="button" data-quiet-load aria-hidden="true" data-number="4">4 Cancel</button>

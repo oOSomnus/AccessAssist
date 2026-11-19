@@ -161,52 +161,48 @@ test('debug log export records the session without the API key', async () => {
   }
 });
 
-test('a cold panel focuses Listen before it finishes loading', async () => {
+test('a cold panel loads hidden from screen readers, then names Listen first', async () => {
   const { context, extensionId } = await launch();
   try {
     await resetMock();
     await openFixture(context, '/article');
-    // A reader auto-reads a loaded document that has nothing focused, so focus
-    // must already be on a named control when the load event fires.
+    // A reader auto-reads a freshly loaded document and keeps reading whatever
+    // is exposed while it reads, so at load only the live region is exposed and
+    // nothing in the panel holds focus.
     await context.addInitScript(() => {
       if (location.protocol !== 'chrome-extension:') return;
-      addEventListener('load', () => {
-        window.__aaFocusAtLoad = document.activeElement?.id || document.activeElement?.tagName || null;
+      const hidden = (id) => Boolean(document.getElementById(id).closest('[aria-hidden="true"]'));
+      const snapshot = () => ({
+        stage: document.body.dataset.quiet ?? null,
+        active: document.activeElement?.id || document.activeElement?.tagName || null,
+        listenHidden: hidden('listen'),
+        restHidden: hidden('settings-toggle') && hidden('transcript') && hidden('pause'),
+        statusHidden: hidden('sr-status'),
       });
-    });
-    const panel = await openPanel(context, extensionId);
-    await expect.poll(() => panel.evaluate(() => window.__aaFocusAtLoad ?? null)).toBe('listen');
-    await panel.locator('body[data-ready="true"]').waitFor({ state: 'attached' });
-    await expect(panel.locator('#listen')).toBeFocused();
-  } finally {
-    await context.close();
-  }
-});
-
-test('while the panel loads only Listen is exposed to screen readers', async () => {
-  const { context, extensionId } = await launch();
-  try {
-    await resetMock();
-    await openFixture(context, '/article');
-    await context.addInitScript(() => {
-      if (location.protocol !== 'chrome-extension:') return;
       addEventListener('load', () => {
-        const quiet = [...document.querySelectorAll('[data-quiet-load]')];
-        window.__aaQuietAtLoad = {
-          count: quiet.length,
-          allHidden: quiet.every((element) => element.getAttribute('aria-hidden') === 'true'),
-          listenExposed: !document.getElementById('listen').closest('[aria-hidden="true"]'),
-          statusExposed: !document.getElementById('sr-status').closest('[aria-hidden="true"]'),
+        window.__aaAtLoad = {
+          ...snapshot(),
+          quiet: document.querySelectorAll('[data-quiet-load][aria-hidden="true"]').length,
         };
       });
+      addEventListener('DOMContentLoaded', () => {
+        window.__aaStages = [];
+        new MutationObserver(() => window.__aaStages.push(snapshot()))
+          .observe(document.body, { attributes: true, attributeFilter: ['data-quiet'] });
+      });
     });
     const panel = await openPanel(context, extensionId);
-    await expect.poll(() => panel.evaluate(() => window.__aaQuietAtLoad ?? null)).toEqual({
-      count: 7, allHidden: true, listenExposed: true, statusExposed: true,
+    await expect.poll(() => panel.evaluate(() => window.__aaAtLoad ?? null)).toEqual({
+      stage: 'all', active: 'BODY', listenHidden: true, restHidden: true, statusHidden: false, quiet: 8,
     });
-    // With no input at all, the rest appears shortly after load.
+    // With no entry, Listen alone is exposed and focused; with no input at all,
+    // the rest appears shortly after.
     await panel.locator('body[data-revealed="true"]').waitFor({ state: 'attached' });
-    expect(await panel.locator('[aria-hidden="true"]:is(header, .panel-content, #composer button, #actions-heading)').count())
+    expect(await panel.evaluate(() => window.__aaStages)).toEqual([
+      { stage: 'listen', active: 'listen', listenHidden: false, restHidden: true, statusHidden: false },
+      { stage: 'none', active: 'listen', listenHidden: false, restHidden: false, statusHidden: false },
+    ]);
+    expect(await panel.locator('[data-quiet-load], [aria-hidden="true"]:is(header, .panel-content, #composer button, #actions-heading)').count())
       .toBe(0);
     await expect(panel.locator('#listen')).toBeFocused();
   } finally {
