@@ -183,6 +183,37 @@ test('a cold panel focuses Listen before it finishes loading', async () => {
   }
 });
 
+test('while the panel loads only Listen is exposed to screen readers', async () => {
+  const { context, extensionId } = await launch();
+  try {
+    await resetMock();
+    await openFixture(context, '/article');
+    await context.addInitScript(() => {
+      if (location.protocol !== 'chrome-extension:') return;
+      addEventListener('load', () => {
+        const quiet = [...document.querySelectorAll('[data-quiet-load]')];
+        window.__aaQuietAtLoad = {
+          count: quiet.length,
+          allHidden: quiet.every((element) => element.getAttribute('aria-hidden') === 'true'),
+          listenExposed: !document.getElementById('listen').closest('[aria-hidden="true"]'),
+          statusExposed: !document.getElementById('sr-status').closest('[aria-hidden="true"]'),
+        };
+      });
+    });
+    const panel = await openPanel(context, extensionId);
+    await expect.poll(() => panel.evaluate(() => window.__aaQuietAtLoad ?? null)).toEqual({
+      count: 7, allHidden: true, listenExposed: true, statusExposed: true,
+    });
+    // With no input at all, the rest appears shortly after load.
+    await panel.locator('body[data-revealed="true"]').waitFor({ state: 'attached' });
+    expect(await panel.locator('[aria-hidden="true"]:is(header, .panel-content, #composer button, #actions-heading)').count())
+      .toBe(0);
+    await expect(panel.locator('#listen')).toBeFocused();
+  } finally {
+    await context.close();
+  }
+});
+
 test('a real option click returns focus to Listen, not the document', async () => {
   const { context, extensionId } = await launch();
   try {

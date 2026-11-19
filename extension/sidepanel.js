@@ -129,6 +129,7 @@ const state = {
   actionContext: null,
   confirming: false,
   refreshSeq: 0,
+  startFocused: false,
 };
 
 // Session-scoped: cleared when the panel closes or reloads, kept across
@@ -2496,7 +2497,7 @@ function focusesBeforeClaim(intent) {
   return intent.source === 'command' && (intent.mode === 'open' || intent.mode === 'voice');
 }
 
-async function handleEntryIntent(intent) {
+async function handleEntryIntent(intent, { cold = false } = {}) {
   // A new entry owns the panel; any older preparation, output, or await is
   // stale from here on.
   state.deferChoiceFocus = false;
@@ -2515,7 +2516,9 @@ async function handleEntryIntent(intent) {
   // A warm entry-shortcut notification already transferred keyboard focus
   // before the serialized claim; asking the window again would repeat its
   // announcement.
-  const notified = focusesBeforeClaim(intent) && state.requestedIntents.has(intent.id);
+  // A cold entry was already given window focus when the panel started.
+  const notified = (focusesBeforeClaim(intent) && state.requestedIntents.has(intent.id))
+    || (cold && state.startFocused);
   focusEntryTarget({ requestWindowFocus: !notified });
   state.audioPaused = false;
   state.voiceRetry = false;
@@ -2999,7 +3002,63 @@ function receiveEntryIntent(intent) {
   claimEntry(intent.id);
 }
 
+// How long after load the quiet regions stay hidden when nothing reveals them
+// sooner. Long enough for a reader's load-time reading of the one exposed
+// control to finish; short enough that a reader user exploring by reader
+// commands alone, which moves no focus, soon finds the whole panel.
+const QUIET_LOAD_MS = 1500;
+let quietRevealed = false;
+
+function focusSnapshot() {
+  const active = document.activeElement;
+  return {
+    atMs: Math.round(performance.now()),
+    readyState: document.readyState,
+    hasFocus: document.hasFocus(),
+    active: active?.id || active?.tagName || null,
+  };
+}
+
+// Exposes everything marked data-quiet-load in sidepanel.html. Called once.
+function revealPanel(cause) {
+  if (quietRevealed) return;
+  quietRevealed = true;
+  for (const element of document.querySelectorAll('[data-quiet-load]')) {
+    element.removeAttribute('aria-hidden');
+    element.removeAttribute('data-quiet-load');
+  }
+  document.body.dataset.revealed = 'true';
+  debugLog.add('panel.reveal', { cause, ...focusSnapshot() });
+}
+
+// A reader that auto-reads a freshly loaded document (VoiceOver's "speak web
+// page") reads only what is exposed when loading ends. Until the user acts,
+// or shortly after load, that is the Listen button. Any focus move to another
+// control reveals first, so focus never lands inside a hidden region.
+function watchQuietLoad() {
+  debugLog.add('panel.focus', { at: 'script', ...focusSnapshot() });
+  const onInput = (event) => revealPanel(event.type);
+  document.addEventListener('keydown', onInput, { capture: true, once: true });
+  document.addEventListener('pointerdown', onInput, { capture: true, once: true });
+  document.addEventListener('focusin', (event) => {
+    if (event.target !== $('listen')) revealPanel('focusin');
+  }, true);
+  document.addEventListener('DOMContentLoaded', () => {
+    debugLog.add('panel.focus', { at: 'DOMContentLoaded', ...focusSnapshot() });
+  }, { once: true });
+  window.addEventListener('focus', () => {
+    debugLog.add('panel.focus', { at: 'window-focus', ...focusSnapshot() });
+  }, { once: true });
+  const afterLoad = () => {
+    debugLog.add('panel.focus', { at: 'load', ...focusSnapshot() });
+    setTimeout(() => revealPanel('timer'), QUIET_LOAD_MS);
+  };
+  if (document.readyState === 'complete') afterLoad();
+  else window.addEventListener('load', afterLoad, { once: true });
+}
+
 async function initializePanel() {
+  watchQuietLoad();
   if (SETUP_PAGE) {
     await initializeSetupPage();
     return;
@@ -3007,8 +3066,15 @@ async function initializePanel() {
   // A reader that enters a document with nothing focused reads it from the top
   // (VoiceOver's auto-speak, NVDA and JAWS say-all on load). Settle focus on a
   // named control before the first await, and so before the load event, so the
-  // first thing a reader says is that control. Entries may retarget it later.
+  // first thing a reader says is that control. A side panel opens without
+  // keyboard focus, which stays in the page, so DOM focus alone is not enough:
+  // the panel also takes window focus here. Every way it opens (toolbar,
+  // shortcut, the page's Assistant button, setup) is the user asking for it.
+  // Entries may retarget focus later.
   $('listen').focus({ preventScroll: true });
+  if (!document.hasFocus()) window.focus();
+  state.startFocused = true;
+  debugLog.add('panel.focus', { at: 'init', ...focusSnapshot() });
   const self = await chrome.tabs.getCurrent().catch(() => null);
   state.windowId = self?.windowId ?? (await chrome.windows.getCurrent().catch(() => ({}))).id ?? null;
   bindEvents();
@@ -3045,7 +3111,7 @@ async function initializePanel() {
   if (!isForThisWindow(intent)) intent = null;
   if (intent && !state.consumedIntents.has(intent.id)) {
     state.consumedIntents.add(intent.id);
-    await handleEntryIntent(intent);
+    await handleEntryIntent(intent, { cold: true });
   }
 }
 
