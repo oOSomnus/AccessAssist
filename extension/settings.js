@@ -53,22 +53,24 @@ export function needsUpload(consent, part) {
   return !consent || consent[part] !== true;
 }
 
-// A refusal mirrors consent: it belongs to one page origin and one receiver
-// configuration, and each part (text, image) is refused on its own. The marker
-// records which turn refused, so a later turn can tell it apart.
-export function refusalFor(existing, pageOrigin, fingerprint, part) {
-  if (!existing || existing.pageOrigin !== pageOrigin || existing.fingerprint !== fingerprint) return null;
-  return existing[part] ?? null;
+// Refusals are a collection keyed by page origin, receiver configuration, and
+// part (text, image), so declining one site never erases a decline recorded
+// for another. The marker records which turn refused, so a later turn can tell
+// it apart. The collection lives until the conversation resets.
+function refusalKey(pageOrigin, fingerprint, part) {
+  return JSON.stringify([pageOrigin, fingerprint, part]);
 }
 
-export function refuseUpload(existing, pageOrigin, fingerprint, part, marker) {
-  const base = existing && existing.pageOrigin === pageOrigin && existing.fingerprint === fingerprint
-    ? existing
-    : { pageOrigin, fingerprint, text: null, image: null };
-  return { ...base, [part]: marker };
+export function refusalFor(refusals, pageOrigin, fingerprint, part) {
+  return refusals?.[refusalKey(pageOrigin, fingerprint, part)] ?? null;
 }
 
-export function liftRefusal(existing, pageOrigin, fingerprint, part) {
-  if (!refusalFor(existing, pageOrigin, fingerprint, part)) return existing;
-  return { ...existing, [part]: null };
+export function refuseUpload(refusals, pageOrigin, fingerprint, part, marker) {
+  return { ...(refusals ?? {}), [refusalKey(pageOrigin, fingerprint, part)]: marker };
+}
+
+export function liftRefusal(refusals, pageOrigin, fingerprint, part) {
+  if (!refusalFor(refusals, pageOrigin, fingerprint, part)) return refusals;
+  const { [refusalKey(pageOrigin, fingerprint, part)]: _lifted, ...rest } = refusals;
+  return rest;
 }

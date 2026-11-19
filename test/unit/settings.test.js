@@ -69,6 +69,24 @@ test('an upload refusal is per page origin, API configuration and part', () => {
   assert.equal(liftRefusal(refusal, 'https://other.test', fingerprint, 'image'), refusal);
 });
 
+test('a refusal survives declining another site: A, then B, then back to A', () => {
+  const fingerprint = configFingerprint(config);
+  const first = { turn: 1 };
+  const second = { turn: 2 };
+  let refusals = refuseUpload(null, 'https://a.test', fingerprint, 'text', first);
+  refusals = refuseUpload(refusals, 'https://b.test', fingerprint, 'text', second);
+  assert.equal(refusalFor(refusals, 'https://a.test', fingerprint, 'text'), first);
+  assert.equal(refusalFor(refusals, 'https://b.test', fingerprint, 'text'), second);
+  // A refusal for another receiver is kept alongside, not swapped in.
+  const otherFingerprint = configFingerprint({ ...config, model: 'x' });
+  refusals = refuseUpload(refusals, 'https://a.test', otherFingerprint, 'text', second);
+  assert.equal(refusalFor(refusals, 'https://a.test', fingerprint, 'text'), first);
+  // Lifting one site leaves the other declined.
+  refusals = liftRefusal(refusals, 'https://b.test', fingerprint, 'text');
+  assert.equal(refusalFor(refusals, 'https://b.test', fingerprint, 'text'), null);
+  assert.equal(refusalFor(refusals, 'https://a.test', fingerprint, 'text'), first);
+});
+
 test('the screen-reader preference accepts only known readers', () => {
   assert.deepEqual(SCREEN_READER_CHOICES, ['auto', 'narrator', 'nvda', 'jaws', 'voiceover']);
   for (const value of SCREEN_READER_CHOICES) assert.equal(normalizeScreenReader(value), value);

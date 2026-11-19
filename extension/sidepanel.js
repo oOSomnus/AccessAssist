@@ -115,6 +115,9 @@ const state = {
   uploadRefusal: null,
   frameConsent: new Set(),
   frameSkipped: new Set(),
+  // Embedded sites the user explicitly declined, origin to { turn }. Unlike
+  // frameSkipped, which lasts one request, these last the conversation.
+  frameRefused: new Map(),
   visionLimited: false,
   apiSessionId: uid(),
   listening: null,
@@ -137,6 +140,11 @@ const state = {
   actionContext: null,
   confirming: false,
   refreshSeq: 0,
+  // Bumped only when the bound page actually changes; a refresh that finds the
+  // same tab and document leaves it alone, so an open question stays valid.
+  pageEpoch: 0,
+  // Bumped by an explicit stop, so a command still waiting to start is dropped.
+  requestSeq: 0,
   unreadablePage: null,
   startFocused: false,
 };
@@ -1674,8 +1682,12 @@ function drainTurns() {
     while (state.pendingInput) {
       const { text } = state.pendingInput;
       state.pendingInput = null;
+      // The page check awaits; a stop or a newer command in that time owns the
+      // panel, and this command must not start after it.
+      const request = state.requestSeq;
       await initialTabBind;
       await syncVisiblePage();
+      if (request !== state.requestSeq || state.pendingInput) continue;
       await runTurn(text);
     }
   })();
@@ -1724,7 +1736,9 @@ async function submitMessage(raw) {
     return;
   }
   if (/^(undo|undo last step|undo last)[.!?]?$/iu.test(text)) {
+    const request = state.requestSeq;
     await syncVisiblePage();
+    if (request !== state.requestSeq || state.pendingInput) return;
     const turn = turns.next();
     state.runningTurn = turn;
     state.busy = true;
@@ -1752,6 +1766,7 @@ async function submitMessage(raw) {
 }
 
 async function pauseAssistant() {
+  state.requestSeq += 1;
   state.audioPaused = true;
   interruptOutput();
   cancelVoice();
@@ -1791,7 +1806,7 @@ async function ensureUploadConsent(part, question, turn, { askAgain = false } = 
     url: tab.url,
     origin: tab.origin,
     fingerprint: configFingerprint(state.config),
-    refreshSeq: state.refreshSeq,
+    pageEpoch: state.pageEpoch,
   };
   const refusedMessage = part === 'image' ? IMAGE_REFUSED : TEXT_REFUSED;
   const refused = refusalFor(state.uploadRefusal, context.origin, context.fingerprint, part);
@@ -1801,8 +1816,9 @@ async function ensureUploadConsent(part, question, turn, { askAgain = false } = 
     if (!askAgain || refused.turn === turn || turn.askedAgain || turn.declined) return refusedMessage;
     turn.askedAgain = true;
   }
+  const reasking = Boolean(refused);
   const samePage = () => !turn.stale
-    && state.refreshSeq === context.refreshSeq
+    && state.pageEpoch === context.pageEpoch
     && state.tab?.tabId === context.tabId
     && state.tab?.documentId === context.documentId
     && state.tab?.url === context.url
@@ -1825,8 +1841,18 @@ async function ensureUploadConsent(part, question, turn, { askAgain = false } = 
     const listed = await discoverPageOrigins(context).catch(() => null);
     if (!samePage()) return 'The page changed; observe it again.';
     if (listed) {
+      const unasked = (origin) => !state.frameConsent.has(origin) && !state.frameSkipped.has(origin);
+      // A declined embedded site is listed again only when the user explicitly
+      // asks for the page again (ask_again), once per request.
+      const refusedFrames = listed.frameOrigins.filter((origin) => unasked(origin) && state.frameRefused.has(origin));
+      let reaskFrames = reasking;
+      if (!reaskFrames && askAgain && refusedFrames.length && !turn.askedAgain && !turn.declined
+        && refusedFrames.every((origin) => state.frameRefused.get(origin).turn !== turn)) {
+        turn.askedAgain = true;
+        reaskFrames = true;
+      }
       frameOrigins = listed.frameOrigins.filter((origin) => (
-        !state.frameConsent.has(origin) && !state.frameSkipped.has(origin)
+        unasked(origin) && (reaskFrames || !state.frameRefused.has(origin))
       ));
     }
   }
@@ -1871,7 +1897,10 @@ async function ensureUploadConsent(part, question, turn, { askAgain = false } = 
   if (!samePage()) return 'The page changed before the user answered.';
   if (choice?.value === 'allow' || choice?.value === 'allow-all') {
     if (textNeeded) state.uploadConsent = grantUpload(state.uploadConsent, context.origin, context.fingerprint, 'text');
-    for (const origin of frameOrigins) state.frameConsent.add(origin);
+    for (const origin of frameOrigins) {
+      state.frameConsent.add(origin);
+      state.frameRefused.delete(origin);
+    }
     return allow();
   }
   if (choice?.value === 'allow-main') {
@@ -1883,11 +1912,13 @@ async function ensureUploadConsent(part, question, turn, { askAgain = false } = 
     for (const origin of frameOrigins) state.frameSkipped.add(origin);
     return true;
   }
-  // Only the new embedded sites were in question: the page itself stays
-  // shared, and the declined sites are skipped rather than asked about again.
+  // An explicit decline covers every listed embedded site too, and lasts the
+  // conversation like the page's own refusal.
+  if (turn.declined) for (const origin of frameOrigins) state.frameRefused.set(origin, { turn });
+  // Only the new embedded sites were in question: the page itself stays shared.
   if (!textNeeded) {
-    if (turn.declined) for (const origin of frameOrigins) state.frameSkipped.add(origin);
-    return 'The user did not allow page text upload from the listed embedded sites. Do not ask again in this request.';
+    if (!turn.declined) return 'The user did not allow page text upload from the listed embedded sites: the question was not answered.';
+    return 'The user did not allow page text upload from the listed embedded sites: they declined. Do not ask again; only if the user explicitly asks in a new message to read those parts, call the tool again with ask_again true.';
   }
   return refuse();
 }
@@ -2354,10 +2385,10 @@ async function followOpenedPages(report, turn) {
   state.pendingMessages = [];
   state.frameConsent = new Set();
   state.frameSkipped = new Set();
-  if (previousOrigin !== adopted.origin) {
-    state.uploadConsent = null;
-    state.uploadRefusal = null;
-  }
+  state.pageEpoch += 1;
+  // Consent is per site and starts over on a new one; refusals are keyed by
+  // site already and last until the conversation resets.
+  if (previousOrigin !== adopted.origin) state.uploadConsent = null;
   return 'Switched to the page the user chose. Observe it again before acting; earlier snapshots no longer work.';
 }
 
@@ -2544,6 +2575,7 @@ async function refreshTab({ announce = false, reason = '', windowId = null } = {
   const pageName = spokenSites([info.title || info.url || 'Unknown'])[0];
   $('page-line').textContent = `Current page: ${pageName}${info.readable ? '' : ' (unreadable)'}`;
   if (changed) {
+    state.pageEpoch += 1;
     cancelVoice();
     resetConversation();
     if (previous?.tabId) await send('RESET_SESSION', { tabId: previous.tabId }).catch(() => {});
@@ -2566,6 +2598,7 @@ async function unbindPage(info, { announce, seq }) {
   state.unreadablePage = shown;
   $('page-line').textContent = shown ? `Current page: ${shown} (unreadable)` : 'No readable page';
   if (previous) {
+    state.pageEpoch += 1;
     cancelVoice();
     resetConversation();
     await send('RESET_SESSION', { tabId: previous.tabId }).catch(() => {});
@@ -2602,6 +2635,7 @@ function resetConversation() {
   state.uploadRefusal = null;
   state.frameConsent = new Set();
   state.frameSkipped = new Set();
+  state.frameRefused = new Map();
   state.visionLimited = false;
   state.audioPaused = false;
   speech.clearStatus();
@@ -2841,6 +2875,8 @@ async function exportDebugLog() {
       uploadConsent: state.uploadConsent,
       frameConsent: state.frameConsent,
       frameSkipped: state.frameSkipped,
+      uploadRefusal: state.uploadRefusal,
+      frameRefused: [...state.frameRefused.keys()],
       choice: state.choice?.set ?? null,
     },
     systemPrompt: SYSTEM_PROMPT,
@@ -3018,6 +3054,7 @@ async function cancelFromButton() {
     finishChoice(state.choice.set.id, null, 'cancelled');
     return;
   }
+  state.requestSeq += 1;
   state.audioPaused = false;
   state.pendingInput = null;
   if (state.busy) {
@@ -3041,7 +3078,9 @@ async function undoFromButton() {
   state.audioPaused = false;
   if (state.busy) preemptTurn();
   else interruptOutput();
+  const request = state.requestSeq;
   await syncVisiblePage();
+  if (request !== state.requestSeq || state.pendingInput) return;
   const turn = turns.next();
   await state.turnTask;
   if (!turn.isCurrent()) return;
@@ -3079,6 +3118,7 @@ async function restoreLauncherFocus() {
 }
 
 function preparePanelClose() {
+  state.requestSeq += 1;
   interruptOutput();
   cancelVoice();
   stopLocalWatch();
