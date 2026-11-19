@@ -358,3 +358,46 @@ test('switching tabs while an action waits for confirmation runs nothing out of 
     await context.close();
   }
 });
+
+test('a declined page sends nothing about it and is not asked about again', async () => {
+  const { context, extensionId } = await launch();
+  const consentQuestions = async (panel) => (await announcementEntries(panel))
+    .filter((text) => text.includes('Allow these sources')).length;
+  try {
+    await resetMock();
+    await openFixture(context, '/article');
+    const panel = await openPanel(context, extensionId);
+    await expect(panel.locator('#page-line')).toContainText('Event schedule');
+
+    await sendText(panel, 'Refusal check');
+    await expect(panel.locator('#ask-question')).toContainText('page text');
+    await panel.locator('#ask-options button', { hasText: 'Cancel' }).click();
+    await expect(panel.locator('#transcript')).toContainText('I could not read this page.');
+    // The model retried in the same request; the panel answered it without asking.
+    expect(await consentQuestions(panel)).toBe(1);
+
+    // A new request does not bring the question back on its own.
+    await expect(panel.locator('#transcript')).toHaveAttribute('aria-busy', 'false', { timeout: 30_000 });
+    await sendText(panel, 'Refusal check');
+    await expect.poll(async () => (await panel.locator('#transcript').textContent())
+      .split('I could not read this page.').length - 1).toBe(2);
+    expect(await consentQuestions(panel)).toBe(1);
+
+    // Nothing about the page reached the AI service: no title, no address.
+    let bodies = JSON.stringify((await mockRequests()).map((request) => request.body));
+    expect(bodies).not.toContain('Event schedule');
+    expect(bodies).not.toContain(`${PAGE_BASE}/article`);
+    expect(bodies).toContain('The user declined to share this page');
+
+    // An explicit request to read the page asks once more.
+    await expect(panel.locator('#transcript')).toHaveAttribute('aria-busy', 'false', { timeout: 30_000 });
+    await sendText(panel, 'Refusal check, read this page again');
+    await answerWhen(panel, 'page text', 0);
+    await expect(panel.locator('#transcript')).toContainText('I read Event schedule.');
+    expect(await consentQuestions(panel)).toBe(2);
+    bodies = JSON.stringify((await mockRequests()).map((request) => request.body));
+    expect(bodies).toContain('Current page: Event schedule');
+  } finally {
+    await context.close();
+  }
+});

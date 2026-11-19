@@ -2,7 +2,7 @@ import { normalizeConfig, requestTurn, REQUEST_TIMEOUT_MS } from './ai.js';
 import { consentRound } from './consent-round.js';
 import { createDebugLog } from './debug-log.js';
 import { closeChoiceSet, createChoiceSet, formatChoices, parseChoiceNumber, resolveChoice } from './protocol.js';
-import { keyBinding, keyForBinding, configFingerprint, configOrigin, DEFAULT_API_CONFIG, grantUpload, needsUpload, normalizeScreenReader, uploadConsentFor } from './settings.js';
+import { keyBinding, keyForBinding, configFingerprint, configOrigin, DEFAULT_API_CONFIG, grantUpload, liftRefusal, needsUpload, normalizeScreenReader, refusalFor, refuseUpload, uploadConsentFor } from './settings.js';
 import { Speech, spokenSites, voiceSetupView } from './speech.js';
 import { detectPlatform, guideFor, GUIDES, readerChoices, resolveReader } from './screen-reader-guide.js';
 import { createTurns } from './turn.js';
@@ -81,7 +81,14 @@ const SYSTEM_PROMPT = [
   '15. A hover, blur, drag, screenshot point, double, right, held, or modified click is proposed alone. After a focus change or scroll, observe again before a screenshot point action; an earlier screenshot no longer maps to the page. A DOM drag uses the mouse and cannot carry files.',
   '16. If a new page opens, the user may choose to continue there. After switching, observe the new page first; earlier snapshots belong to the previous page and will fail.',
   '17. When the user asks how to do something, give every step in one reply, in order. Never split instructions across turns or ask whether to continue; the user can replay the conversation.',
+  '18. When the user declines or cancels a question, accept it. Do not ask again, retry, or try another way to get the same thing in this request; say briefly what was not done and stop. A declined page or screenshot stays declined for this site: set ask_again only when the user\'s newest message explicitly asks you to read or look at the page.',
 ].join('\n');
+
+// Tool results for refusals. The "did not allow" wording is what the model and
+// the scripted test model both key on; the rest tells the model to stop asking.
+const TEXT_REFUSED = 'The user did not allow page text upload: they declined to share this page with the AI service. Do not ask for it again or try another tool to read it. Answer only from what the user said, or say you cannot see the page. Only if the user explicitly asks in a new message to read or look at this page, call the tool again with ask_again true.';
+const IMAGE_REFUSED = 'The user did not allow screenshot upload: they declined to share pixels of this page with the AI service. Do not ask again in this request. Only if the user explicitly asks in a new message to look at the page or image, call the tool again with ask_again true.';
+const DECLINED_EARLIER = 'Not asked: the user declined a question earlier in this request. Do not ask again or try another way; say briefly what was not done and stop.';
 
 const state = {
   tab: null,
@@ -105,6 +112,7 @@ const state = {
   busy: false,
   callsThisTurn: 0,
   uploadConsent: null,
+  uploadRefusal: null,
   frameConsent: new Set(),
   frameSkipped: new Set(),
   visionLimited: false,
@@ -1146,7 +1154,11 @@ function finishChoice(choiceSetId, option, reason = 'answered') {
   // not be read out after it is gone.
   speech.dropPending(choiceTag(current.set.id));
   current.set = closeChoiceSet(current.set, reason);
-  debugLog.add('choice.finish', { id: current.set.id, reason, option });
+  // An expired, replaced, or reset question is not an answer; only an explicit
+  // cancel is a refusal.
+  const declined = current.declinable && (reason === 'cancelled' || option?.value === 'cancel');
+  if (declined) current.turn.declined = true;
+  debugLog.add('choice.finish', { id: current.set.id, reason, option, declined });
   hideChoice();
   let feedback = null;
   if (option) {
@@ -1231,14 +1243,18 @@ function repeatChoice() {
   void announceChoice(current);
 }
 
-function presentSet(set, { timeoutMs = 0, sourceSites = [] } = {}) {
+// declinable: Cancel, Escape, or a spoken "cancel" on this question is the
+// user saying no. That marks the turn, so the turn asks nothing more.
+function presentSet(set, { timeoutMs = 0, sourceSites = [], declinable = false } = {}) {
   if (state.choice) finishChoice(state.choice.set.id, null, 'replaced');
   if (state.pendingInput) {
     // A newer instruction already replaced this turn; do not ask again.
     return Promise.resolve(null);
   }
   return new Promise((resolve) => {
-    const current = { set, resolve, timer: null, sourceSites: [...sourceSites] };
+    const current = {
+      set, resolve, timer: null, sourceSites: [...sourceSites], declinable, turn: turns.current,
+    };
     state.choice = current;
     debugLog.add('choice.show', { set, sourceSites: current.sourceSites, timeoutMs });
     state.choiceTrigger = choiceTriggerFor(document.activeElement);
@@ -1262,7 +1278,7 @@ function presentSet(set, { timeoutMs = 0, sourceSites = [] } = {}) {
   });
 }
 
-async function askChoice({ question, options, sourceSites = [] }) {
+async function askChoice({ question, options, sourceSites = [], declinable = false }) {
   let set;
   try {
     set = createChoiceSet({ id: uid(), question, options });
@@ -1270,7 +1286,7 @@ async function askChoice({ question, options, sourceSites = [] }) {
     await say(`Cannot show choices: ${error.message}`, { urgent: true });
     return null;
   }
-  return presentSet(set, { sourceSites });
+  return presentSet(set, { sourceSites, declinable });
 }
 
 async function handleChoiceText(raw, choiceSetId) {
@@ -1417,6 +1433,22 @@ function stripImages() {
 
 const MAX_MODEL_CALLS_PER_TURN = 16;
 
+// What the model may know about the page before it reads it. The title and
+// address are page content too: they go only to a receiver the user allowed
+// for this site, never before the question and never after a refusal.
+function pageLineForModel() {
+  const tab = state.tab;
+  if (!tab) return 'No readable page is on screen.';
+  const fingerprint = configFingerprint(state.config);
+  if (refusalFor(state.uploadRefusal, tab.origin, fingerprint, 'text')) {
+    return 'Current page: not shared. The user declined to share this page; its title, address, and content are unavailable. Work only from what the user says.';
+  }
+  if (!needsUpload(uploadConsentFor(state.uploadConsent, tab.origin, fingerprint), 'text')) {
+    return `Current page: ${tab.title || ''}; address: ${tab.url}`;
+  }
+  return 'Current page: not shared yet. Its title, address, and content are sent only after the user allows it; call observe_page to ask.';
+}
+
 async function requestModel(turn, { retried = false } = {}) {
   if (!(await apiReady())) return null;
   if (!turn.isCurrent()) return null;
@@ -1437,7 +1469,7 @@ async function requestModel(turn, { retried = false } = {}) {
       config: state.config,
       apiKey: state.apiKey,
       sessionId: state.apiSessionId,
-      system: `${SYSTEM_PROMPT}\n${state.tab ? `Current page: ${state.tab.title || ''}; address: ${state.tab.url}` : 'Current page unknown'}`,
+      system: `${SYSTEM_PROMPT}\n${pageLineForModel()}`,
       messages: state.history,
       signal: turn.signal,
     });
@@ -1742,13 +1774,17 @@ async function discoverPageOrigins(context) {
   return listed;
 }
 
-async function ensureUploadConsent(part, question, turn) {
+// Returns true when the upload may go ahead; otherwise the tool result that
+// explains why not. A refusal is remembered for this site, so the panel never
+// asks again on its own; askAgain (the model's ask_again, honored once per
+// later turn) is the only way back to the question.
+async function ensureUploadConsent(part, question, turn, { askAgain = false } = {}) {
   const tab = state.tab;
   if (!tab?.origin || !Number.isInteger(tab.tabId)) {
     await say('This page has no usable site address.', { urgent: true });
-    return false;
+    return 'This page has no usable site address.';
   }
-  if (turn.stale) return false;
+  if (turn.stale) return 'The user interrupted.';
   const context = {
     tabId: tab.tabId,
     documentId: tab.documentId,
@@ -1757,16 +1793,37 @@ async function ensureUploadConsent(part, question, turn) {
     fingerprint: configFingerprint(state.config),
     refreshSeq: state.refreshSeq,
   };
+  const refusedMessage = part === 'image' ? IMAGE_REFUSED : TEXT_REFUSED;
+  const refused = refusalFor(state.uploadRefusal, context.origin, context.fingerprint, part);
+  if (refused) {
+    // Asked again only for a new request that explicitly wants the page, and
+    // only once in that request.
+    if (!askAgain || refused.turn === turn || turn.askedAgain || turn.declined) return refusedMessage;
+    turn.askedAgain = true;
+  }
   const samePage = () => !turn.stale
     && state.refreshSeq === context.refreshSeq
     && state.tab?.tabId === context.tabId
     && state.tab?.documentId === context.documentId
     && state.tab?.url === context.url
     && state.tab?.origin === context.origin;
+  // Only an explicit decline is remembered; an expired or replaced question
+  // is not an answer and may be asked again.
+  const refuse = () => {
+    if (!turn.declined) {
+      return `The user did not allow ${part === 'image' ? 'screenshot' : 'page text'} upload: the question was not answered.`;
+    }
+    state.uploadRefusal = refuseUpload(state.uploadRefusal, context.origin, context.fingerprint, part, { turn });
+    return refusedMessage;
+  };
+  const allow = () => {
+    state.uploadRefusal = liftRefusal(state.uploadRefusal, context.origin, context.fingerprint, part);
+    return true;
+  };
   let frameOrigins = [];
   if (part === 'text') {
     const listed = await discoverPageOrigins(context).catch(() => null);
-    if (!samePage()) return false;
+    if (!samePage()) return 'The page changed; observe it again.';
     if (listed) {
       frameOrigins = listed.frameOrigins.filter((origin) => (
         !state.frameConsent.has(origin) && !state.frameSkipped.has(origin)
@@ -1777,17 +1834,20 @@ async function ensureUploadConsent(part, question, turn) {
   const receiver = spokenSites([configOrigin(state.config)])[0];
   if (part === 'image') {
     if (!needsUpload(consent, 'image')) return true;
+    if (turn.declined) return DECLINED_EARLIER;
     const choice = await askChoice({
       question: `${question} The receiver is ${receiver}.`,
       options: [{ label: 'Allow', value: 'allow' }, { label: 'Cancel', value: 'cancel' }],
+      declinable: true,
     });
-    if (!samePage()) return false;
-    if (choice?.value !== 'allow') return false;
+    if (!samePage()) return 'The page changed before the user answered.';
+    if (choice?.value !== 'allow') return refuse();
     state.uploadConsent = grantUpload(state.uploadConsent, context.origin, context.fingerprint, 'image');
-    return true;
+    return allow();
   }
   const textNeeded = needsUpload(consent, 'text');
   if (!textNeeded && !frameOrigins.length) return true;
+  if (turn.declined) return DECLINED_EARLIER;
   const sourceSites = [...(textNeeded ? [context.origin] : []), ...frameOrigins];
   const options = textNeeded && frameOrigins.length
     ? [
@@ -1806,23 +1866,30 @@ async function ensureUploadConsent(part, question, turn) {
     question: `Reading page text from the listed sites sends it to ${receiver}. Allow these sources for this page?`,
     options,
     sourceSites,
+    declinable: true,
   });
-  if (!samePage()) return false;
+  if (!samePage()) return 'The page changed before the user answered.';
   if (choice?.value === 'allow' || choice?.value === 'allow-all') {
     if (textNeeded) state.uploadConsent = grantUpload(state.uploadConsent, context.origin, context.fingerprint, 'text');
     for (const origin of frameOrigins) state.frameConsent.add(origin);
-    return true;
+    return allow();
   }
   if (choice?.value === 'allow-main') {
     if (textNeeded) state.uploadConsent = grantUpload(state.uploadConsent, context.origin, context.fingerprint, 'text');
     for (const origin of frameOrigins) state.frameSkipped.add(origin);
-    return true;
+    return allow();
   }
   if (choice?.value === 'skip-sites') {
     for (const origin of frameOrigins) state.frameSkipped.add(origin);
     return true;
   }
-  return false;
+  // Only the new embedded sites were in question: the page itself stays
+  // shared, and the declined sites are skipped rather than asked about again.
+  if (!textNeeded) {
+    if (turn.declined) for (const origin of frameOrigins) state.frameSkipped.add(origin);
+    return 'The user did not allow page text upload from the listed embedded sites. Do not ask again in this request.';
+  }
+  return refuse();
 }
 
 function pageForModel(value) {
@@ -1838,10 +1905,10 @@ function pageForModel(value) {
 }
 
 // Reading the page in the panel keeps the per-origin upload consent gate.
-async function readPage(turn, cursor) {
-  const allowed = await ensureUploadConsent('text', 'Reading this page sends page text to the model service.', turn);
+async function readPage(turn, cursor, { askAgain = false } = {}) {
+  const allowed = await ensureUploadConsent('text', 'Reading this page sends page text to the model service.', turn, { askAgain });
   if (turn.stale) return { error: 'The user interrupted; the page was not read.' };
-  if (!allowed) return { error: 'The user did not allow page text upload.' };
+  if (allowed !== true) return { error: allowed };
   const observation = await send('OBSERVE_PAGE', {
     tabId: state.tab.tabId,
     expectedDocumentId: state.tab.documentId,
@@ -1853,7 +1920,8 @@ async function readPage(turn, cursor) {
 }
 
 async function toolObserve(call, ok, fail, turn) {
-  const read = await readPage(turn, call.args?.cursor);
+  const askAgain = call.args?.ask_again === true;
+  const read = await readPage(turn, call.args?.cursor, { askAgain });
   if (read.error) return fail(read.error);
   const observation = read.observation;
   const wantsVisual = call.args?.visual === true;
@@ -1868,10 +1936,11 @@ async function toolObserve(call, ok, fail, turn) {
     'image',
     'Reading this page visually sends a screenshot to the model service.',
     turn,
+    { askAgain },
   );
   if (turn.stale) return fail('The user interrupted; no screenshot was sent.');
-  if (!imageAllowed) {
-    return ok({ ...pageForModel(observation), visual: { allowed: false, reason: 'The user did not allow screenshot upload.' } });
+  if (imageAllowed !== true) {
+    return ok({ ...pageForModel(observation), visual: { allowed: false, reason: imageAllowed } });
   }
   const seen = await send('OBSERVE_PAGE', {
     tabId: state.tab.tabId,
@@ -1904,9 +1973,11 @@ async function toolObserve(call, ok, fail, turn) {
 }
 
 async function toolReadTarget(call, ok, fail, turn) {
-  const allowed = await ensureUploadConsent('text', 'Reading this part sends its text to the model service.', turn);
+  const allowed = await ensureUploadConsent('text', 'Reading this part sends its text to the model service.', turn, {
+    askAgain: call.args?.ask_again === true,
+  });
   if (turn.stale) return fail('The user interrupted; the text was not read.');
-  if (!allowed) return fail('The user did not allow page text upload.');
+  if (allowed !== true) return fail(allowed);
   const outcome = await send('READ_TARGET', {
     tabId: state.tab.tabId,
     id: call.args?.id,
@@ -1918,9 +1989,11 @@ async function toolReadTarget(call, ok, fail, turn) {
 }
 
 async function toolFocusTarget(call, ok, fail, turn) {
-  const allowed = await ensureUploadConsent('text', 'Focusing a target sends page content to the model service.', turn);
+  const allowed = await ensureUploadConsent('text', 'Focusing a target sends page content to the model service.', turn, {
+    askAgain: call.args?.ask_again === true,
+  });
   if (turn.stale) return fail('The user interrupted; focus did not change.');
-  if (!allowed) return fail('The user did not allow page text upload.');
+  if (allowed !== true) return fail(allowed);
   const outcome = await send('FOCUS_TARGET', {
     tabId: state.tab.tabId,
     id: call.args?.id,
@@ -1947,14 +2020,21 @@ async function toolAskUser(call, ok, fail, turn) {
   } catch (error) {
     return fail(`Invalid choices: ${error.message}`);
   }
-  const choice = await presentSet(set);
+  if (turn.declined) return fail(DECLINED_EARLIER);
+  const choice = await presentSet(set, { declinable: true });
   if (turn.stale) return fail('The turn was replaced before the question was answered.');
-  if (!choice) return fail('The user cancelled this choice.');
+  if (!choice) {
+    return fail(turn.declined
+      ? 'The user cancelled this choice. Do not ask again in this request; say briefly what was not done and stop.'
+      : 'The question was not answered.');
+  }
   return ok(`User choice: ${choice.label}.`);
 }
 
 async function toolDescribeImage(call, ok, fail, turn) {
+  if (turn.declined) return fail(DECLINED_EARLIER);
   const choice = await askChoice({
+    declinable: true,
     question: 'How should I describe this image?',
     options: [
       { label: 'Read it', value: 'ai' },
@@ -1963,7 +2043,9 @@ async function toolDescribeImage(call, ok, fail, turn) {
     ],
   });
   if (turn.stale) return fail('The turn was replaced before image reading started.');
-  if (!choice || choice.value === 'cancel') return fail('The user cancelled image reading.');
+  if (!choice || choice.value === 'cancel') {
+    return fail('The user cancelled image reading. Do not ask again in this request; say briefly what was not done and stop.');
+  }
   if (choice.value === 'guide') {
     await runGuide();
     return ok('The user chose system screen-reader guidance.');
@@ -1972,9 +2054,13 @@ async function toolDescribeImage(call, ok, fail, turn) {
     await say('Screenshots are unavailable in this conversation. Page text still works.');
     return ok('Visual reading is unavailable because the model service did not accept images.');
   }
-  const allowed = await ensureUploadConsent('image', 'Reading this image sends a screenshot to the model service.', turn);
+  // Choosing "Read it" just now is the user explicitly asking for AI reading,
+  // so an earlier refusal of screenshots on this site is asked about once more.
+  const allowed = await ensureUploadConsent('image', 'Reading this image sends a screenshot to the model service.', turn, {
+    askAgain: true,
+  });
   if (turn.stale) return fail('The user interrupted; no screenshot was sent.');
-  if (!allowed) return fail('The user did not allow screenshot upload.');
+  if (allowed !== true) return fail(allowed);
   const shot = await send('CAPTURE_TARGET', {
     tabId: state.tab.tabId,
     expectedDocumentId: state.tab.documentId,
@@ -2268,12 +2354,16 @@ async function followOpenedPages(report, turn) {
   state.pendingMessages = [];
   state.frameConsent = new Set();
   state.frameSkipped = new Set();
-  if (previousOrigin !== adopted.origin) state.uploadConsent = null;
+  if (previousOrigin !== adopted.origin) {
+    state.uploadConsent = null;
+    state.uploadRefusal = null;
+  }
   return 'Switched to the page the user chose. Observe it again before acting; earlier snapshots no longer work.';
 }
 
 async function toolProposeAction(call, ok, fail, turn) {
   // The spoken result needs one more model call, and one more when the page cannot be attached; never say "Confirming." without them.
+  if (turn.declined) return fail(DECLINED_EARLIER);
   if (MAX_MODEL_CALLS_PER_TURN - state.callsThisTurn < 2) {
     return fail('Not run: this turn has too few model calls left to confirm the result. Ask the user to give the instruction again.');
   }
@@ -2298,7 +2388,7 @@ async function toolProposeAction(call, ok, fail, turn) {
     if (consent.cancelled) {
       return ok(consent.stale
         ? 'The turn was replaced before this action was confirmed.'
-        : 'The user cancelled this action.');
+        : 'The user cancelled this action. Do not propose it again or try another way in this request; say briefly what was not done and stop.');
     }
     const finished = await finishProposal(consent.report, turn);
     if (turn.stale) return ok(finished);
@@ -2509,6 +2599,7 @@ function resetConversation() {
   state.pendingMessages = [];
   state.callsThisTurn = 0;
   state.uploadConsent = null;
+  state.uploadRefusal = null;
   state.frameConsent = new Set();
   state.frameSkipped = new Set();
   state.visionLimited = false;

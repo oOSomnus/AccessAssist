@@ -67,6 +67,7 @@ export const TOOLS = Object.freeze([
     parameters: schema({
       cursor: { type: 'string', description: 'Cursor to continue reading' },
       visual: { type: 'boolean', description: 'Request a masked viewport screenshot and visual-region target after separate consent' },
+      ask_again: { type: 'boolean', description: 'Only when the user explicitly asked in their newest message to read or look at the page after declining earlier: ask them once more' },
     }),
   },
   {
@@ -75,12 +76,16 @@ export const TOOLS = Object.freeze([
     parameters: schema({
       id: { type: 'string' },
       cursor: { type: 'string' },
+      ask_again: { type: 'boolean', description: 'Only when the user explicitly asked in their newest message to read or look at the page after declining earlier: ask them once more' },
     }, ['id']),
   },
   {
     name: 'focus_target',
     description: 'Scroll to and focus the target without activating it.',
-    parameters: schema({ id: { type: 'string' } }, ['id']),
+    parameters: schema({
+      id: { type: 'string' },
+      ask_again: { type: 'boolean', description: 'Only when the user explicitly asked in their newest message to read or look at the page after declining earlier: ask them once more' },
+    }, ['id']),
   },
   {
     name: 'scroll_page',
@@ -93,7 +98,10 @@ export const TOOLS = Object.freeze([
   {
     name: 'describe_image',
     description: 'Ask about an image. The extension first asks the user to choose AI reading or system screen reader guidance; it takes a screenshot only when the user chooses AI.',
-    parameters: schema({ id: { type: 'string' } }, ['id']),
+    parameters: schema({
+      id: { type: 'string' },
+      ask_again: { type: 'boolean', description: 'Only when the user explicitly asked in their newest message to read or look at the page after declining earlier: ask them once more' },
+    }, ['id']),
   },
   {
     name: 'propose_action',

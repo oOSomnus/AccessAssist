@@ -22,6 +22,14 @@ test('point, key, and visual observation schemas stay constrained', () => {
   assert.equal(observe.parameters.properties.visual.type, 'boolean');
 });
 
+test('every tool that may ask for page or image upload accepts ask_again', () => {
+  for (const name of ['observe_page', 'read_target', 'focus_target', 'describe_image']) {
+    const tool = TOOLS.find((entry) => entry.name === name);
+    assert.equal(tool.parameters.properties.ask_again.type, 'boolean', name);
+    assert.ok(!(tool.parameters.required ?? []).includes('ask_again'), name);
+  }
+});
+
 test('labels stay short and reject empty labels', () => {
   assert.equal(labelViolation('Screen reader'), null);
   assert.equal(labelViolation('Run anyway'), null);

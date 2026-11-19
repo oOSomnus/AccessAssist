@@ -52,3 +52,23 @@ export function grantUpload(existing, pageOrigin, fingerprint, part) {
 export function needsUpload(consent, part) {
   return !consent || consent[part] !== true;
 }
+
+// A refusal mirrors consent: it belongs to one page origin and one receiver
+// configuration, and each part (text, image) is refused on its own. The marker
+// records which turn refused, so a later turn can tell it apart.
+export function refusalFor(existing, pageOrigin, fingerprint, part) {
+  if (!existing || existing.pageOrigin !== pageOrigin || existing.fingerprint !== fingerprint) return null;
+  return existing[part] ?? null;
+}
+
+export function refuseUpload(existing, pageOrigin, fingerprint, part, marker) {
+  const base = existing && existing.pageOrigin === pageOrigin && existing.fingerprint === fingerprint
+    ? existing
+    : { pageOrigin, fingerprint, text: null, image: null };
+  return { ...base, [part]: marker };
+}
+
+export function liftRefusal(existing, pageOrigin, fingerprint, part) {
+  if (!refusalFor(existing, pageOrigin, fingerprint, part)) return existing;
+  return { ...existing, [part]: null };
+}

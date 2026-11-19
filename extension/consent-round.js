@@ -12,7 +12,8 @@ export async function consentRound({ send, present, newId, stale }, { tabId, pro
   });
   await send('ARM_CONSENT', { proposalId, choiceSetId: set.id });
   if (stale()) return { stale: true };
-  const choice = await present(set, { timeoutMs: CONSENT_TIMEOUT_MS });
+  // Keeping things as they are is the user saying no to this change.
+  const choice = await present(set, { timeoutMs: CONSENT_TIMEOUT_MS, declinable: true });
   if (stale()) return { stale: true };
   const optionValue = choice?.value === 'execute' ? 'execute' : 'cancel';
   const confirm = send('CONFIRM_PROPOSAL', { tabId, proposalId, choiceSetId: set.id, optionValue });
