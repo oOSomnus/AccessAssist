@@ -567,6 +567,9 @@ async function route(message) {
     case 'RESET_SESSION': return resetSession(message.tabId, { clearSnapshots: message.clearSnapshots === true });
     case 'GET_COMMANDS': return { commands: await chrome.commands.getAll() };
     case 'SET_CHOICE_KEYS': return setChoiceKeys(message);
+    // Sent during a turn only so Chrome does not stop this worker, and its
+    // in-memory snapshots, while the model thinks or the user decides.
+    case 'KEEP_ALIVE': return { ok: true };
     default: return { error: 'Unknown message type' };
   }
 }

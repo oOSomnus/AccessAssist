@@ -665,3 +665,10 @@ test('a cancel confirmation still reaches a page that is out of sight', async ()
   });
   assert.doesNotMatch(response.error ?? '', /no longer on screen/u);
 });
+
+test('a keep-alive from the panel answers without side effects', async () => {
+  reset();
+  await settle();
+  assert.deepEqual(await panelMessage({ type: 'KEEP_ALIVE' }), { ok: true });
+  assert.deepEqual(calls.tabMessages, []);
+});

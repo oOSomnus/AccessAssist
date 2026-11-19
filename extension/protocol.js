@@ -63,7 +63,7 @@ const stepSchema = {
 export const TOOLS = Object.freeze([
   {
     name: 'observe_page',
-    description: 'Re-read the visible content, sections and target list of the current page. Set visual true only when page structure is not enough: the user must separately allow a screenshot, and the result explains CSS viewport coordinates for a single point action. Observe again after the page changes.',
+    description: 'Re-read the visible content, sections and target list of the current page. Targets are visible and on screen unless they say visible false or inViewport false; tag is given only when it differs from role; near holds the text of a label above or left of an unnamed control. A target\'s style names an entry in styles (its colors and class); targets with the same style look alike, which often means the same state. Set visual true only when page structure is not enough: the user must separately allow a screenshot, and the result explains CSS viewport coordinates for a single point action. Observe again after the page changes.',
     parameters: schema({
       cursor: { type: 'string', description: 'Cursor to continue reading' },
       visual: { type: 'boolean', description: 'Request a masked viewport screenshot and visual-region target after separate consent' },

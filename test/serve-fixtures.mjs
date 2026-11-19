@@ -870,10 +870,37 @@ function lastCall(context, name) {
 // newer observation than any earlier observe_page result.
 function pageOf(result) {
   try {
-    return JSON.parse(result.content).page ?? null;
+    const page = JSON.parse(result.content).page;
+    return page && typeof page === 'object' ? expandPage(page) : null;
   } catch {
     return null;
   }
+}
+
+// The panel sends targets in a compact form (see pageForModel); the scripted
+// model reads them in the full form, so it is restored here once.
+function expandPage(page) {
+  if (!page || !Array.isArray(page.targets)) return page;
+  const styles = page.styles ?? {};
+  const targets = page.targets.map((target) => {
+    const { style, near, ...rest } = target;
+    const full = {
+      ...rest,
+      name: rest.name ?? '',
+      tag: rest.tag ?? rest.role,
+      visible: rest.visible ?? true,
+      inViewport: rest.inViewport ?? true,
+    };
+    if (style) full.styleState = styles[style] ?? null;
+    if (near) {
+      full.near = {
+        above: near.above === undefined ? null : { text: near.above },
+        left: near.left === undefined ? null : { text: near.left },
+      };
+    }
+    return full;
+  });
+  return { ...page, targets };
 }
 
 function observationOf(context) {
@@ -887,7 +914,7 @@ function observationOf(context) {
     }
     if (call.name !== 'observe_page') continue;
     try {
-      return JSON.parse(result.content);
+      return expandPage(JSON.parse(result.content));
     } catch {
       return null;
     }

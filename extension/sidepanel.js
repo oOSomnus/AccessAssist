@@ -287,8 +287,9 @@ function reveal(element) {
 }
 
 async function send(type, payload = {}) {
-  // GET_COMMANDS fires on every focus; logging it would bury everything else.
-  const log = type !== 'GET_COMMANDS';
+  // GET_COMMANDS fires on every focus and KEEP_ALIVE every few seconds of a
+  // turn; logging them would bury everything else.
+  const log = type !== 'GET_COMMANDS' && type !== 'KEEP_ALIVE';
   if (log) debugLog.add('worker.request', { type, payload });
   const started = performance.now();
   let response;
@@ -1509,6 +1510,69 @@ function pageLineForModel() {
   return 'Current page: not shared yet. Its title, address, and content are sent only after the user allows it; call observe_page to ask.';
 }
 
+const SUPERSEDED_PAGE = 'Superseded by a newer page reading below; use only the newest reading and its target ids.';
+
+// A page reading stops mattering once a newer full reading exists, but the
+// history keeps every one, and each can be tens of thousands of tokens: one
+// grid page grew a request from 3k to 258k tokens over 15 calls. The model is
+// sent a copy where every reading but the newest is replaced by a short note;
+// state.history keeps them all. A reading continued with a cursor is a further
+// part of the same page, so it does not supersede the part before it.
+// Anthropic history stays append-only: editing earlier turns would invalidate
+// the preserved thinking that refers to them.
+function historyForModel(history, protocol) {
+  if (protocol === 'anthropic') return history;
+  const argsById = new Map();
+  for (const message of history) {
+    if (message.role !== 'assistant') continue;
+    for (const call of message.toolCalls ?? []) argsById.set(call.id, call.args ?? {});
+  }
+  const readings = [];
+  history.forEach((message, messageIndex) => {
+    if (message.role !== 'tool') return;
+    (message.results ?? []).forEach((result, resultIndex) => {
+      const kind = pageReadingKind(result);
+      if (!kind) return;
+      const continued = kind === 'observe' && Boolean(argsById.get(result.id)?.cursor);
+      readings.push({ messageIndex, resultIndex, kind, continued });
+    });
+  });
+  // The newest fresh reading supersedes everything before it.
+  let newestFresh = -1;
+  readings.forEach((reading, index) => { if (!reading.continued) newestFresh = index; });
+  if (newestFresh <= 0) return history;
+  const stale = readings.slice(0, newestFresh);
+  const copy = history.slice();
+  for (const { messageIndex, resultIndex, kind } of stale) {
+    const message = copy[messageIndex];
+    const results = message.results.slice();
+    const result = results[resultIndex];
+    results[resultIndex] = { ...result, content: supersededContent(result.content, kind) };
+    copy[messageIndex] = { ...message, results };
+  }
+  return copy;
+}
+
+// 'observe' for an observe_page result, 'action' for an action result that
+// carries the page after it, null for anything else.
+function pageReadingKind(result) {
+  if (result.isError || (result.name !== 'observe_page' && result.name !== 'propose_action')) return null;
+  let value;
+  try {
+    value = JSON.parse(result.content);
+  } catch {
+    return null;
+  }
+  if (result.name === 'observe_page') return Array.isArray(value?.targets) ? 'observe' : null;
+  return Array.isArray(value?.page?.targets) ? 'action' : null;
+}
+
+function supersededContent(content, kind) {
+  const value = JSON.parse(content);
+  if (kind === 'action') return JSON.stringify({ ...value, page: SUPERSEDED_PAGE });
+  return JSON.stringify({ title: value.title, url: value.url, superseded: SUPERSEDED_PAGE });
+}
+
 async function requestModel(turn, { retried = false } = {}) {
   if (!(await apiReady())) return null;
   if (!turn.isCurrent()) return null;
@@ -1530,7 +1594,7 @@ async function requestModel(turn, { retried = false } = {}) {
       apiKey: state.apiKey,
       sessionId: state.apiSessionId,
       system: `${SYSTEM_PROMPT}\n${pageLineForModel()}`,
-      messages: state.history,
+      messages: historyForModel(state.history, state.config.protocol),
       signal: turn.signal,
     });
     debugLog.add('model.response', {
@@ -1681,8 +1745,15 @@ function preemptTurn() {
   syncWorking();
 }
 
+// Chrome stops an idle extension worker after about 30 seconds, and the page
+// snapshots and pending proposals live in its memory. A model call or a
+// question to the user often takes longer, after which every target id was
+// refused ("Observe the page first"). Any message resets the idle timer.
+const WORKER_KEEPALIVE_MS = 20_000;
+
 async function runTurn(text) {
   const turn = turns.next();
+  const keepAlive = setInterval(() => void send('KEEP_ALIVE').catch(() => {}), WORKER_KEEPALIVE_MS);
   state.runningTurn = turn;
   state.busy = true;
   state.audioPaused = false;
@@ -1709,6 +1780,7 @@ async function runTurn(text) {
     debugLog.add('turn.error', { error });
     if (turn.isCurrent()) await announceFailure(error);
   } finally {
+    clearInterval(keepAlive);
     debugLog.add('turn.end', {
       calls: state.callsThisTurn,
       current: turn.isCurrent(),
@@ -1975,13 +2047,53 @@ async function ensureUploadConsent(part, question, turn, { askAgain = false } = 
   return refuse();
 }
 
+// Shrinks a target for the model without losing information the model can
+// use. Defaults the observe_page description states are left out: a target is
+// visible and on screen unless it says otherwise, its tag equals its role
+// unless given, and an empty name is no name. A label next to an unnamed
+// control keeps its text; the control's own rect already places it.
+function compactTarget(target, styleIdFor) {
+  const { styleState, near, ...rest } = target;
+  const out = { ...rest };
+  if (out.name === '') delete out.name;
+  if (out.tag === out.role) delete out.tag;
+  if (out.visible === true) delete out.visible;
+  if (out.inViewport === true) delete out.inViewport;
+  if (near && (near.above || near.left)) {
+    out.near = {};
+    if (near.above) out.near.above = near.above.text;
+    if (near.left) out.near.left = near.left.text;
+  }
+  if (styleState) out.style = styleIdFor(styleState);
+  return out;
+}
+
+// Pages repeat the same few looks across many controls (160 grid cells shared
+// 8 looks on one page), so each look is listed once in styles and targets name
+// it. Targets that share a style look alike, which often means the same state.
 function pageForModel(value) {
+  const styles = {};
+  const styleIds = new Map();
+  const styleIdFor = (styleState) => {
+    const key = JSON.stringify(styleState);
+    let id = styleIds.get(key);
+    if (!id) {
+      id = `s${styleIds.size + 1}`;
+      styleIds.set(key, id);
+      styles[id] = styleState;
+    }
+    return id;
+  };
+  const targets = Array.isArray(value.targets)
+    ? value.targets.map((target) => compactTarget(target, styleIdFor))
+    : value.targets;
   return {
     title: value.title,
     url: value.url,
     viewport: value.viewport,
     sections: value.sections,
-    targets: value.targets,
+    targets,
+    ...(styleIds.size ? { styles } : {}),
     nextCursor: value.nextCursor,
     blockedFrames: value.blockedFrames,
   };

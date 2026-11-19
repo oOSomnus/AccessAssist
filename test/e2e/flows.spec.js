@@ -403,6 +403,43 @@ test('bare digits stay native while the master combination chooses', async () =>
   }
 });
 
+test('the model gets compact targets and only the newest page reading in full', async () => {
+  const { context, extensionId } = await launch();
+  try {
+    await resetMock();
+    const page = await openFixture(context, '/grid-native');
+    const panel = await openPanel(context, extensionId);
+    await sendText(panel, 'Select Monday two to three.');
+    await answerWhen(panel, 'page text', 0);
+    await answerWhen(panel, 'AM or PM', 1);
+    await expect(page.locator('input[aria-label="Monday 14:00"]')).toBeChecked();
+
+    // The request after the action carries the observe result and the page
+    // after the action: the older reading is reduced to a note.
+    const toolContents = (request) => (request.body.messages ?? [])
+      .filter((message) => message.role === 'tool')
+      .map((message) => String(message.content));
+    let contents = [];
+    await expect.poll(async () => {
+      const requests = await mockRequests();
+      const last = requests.findLast((request) => toolContents(request).some((text) => text.includes('"page":{')));
+      contents = last ? toolContents(last) : [];
+      return contents.some((text) => text.includes('Superseded by a newer page reading'));
+    }).toBe(true);
+    const newest = JSON.parse(contents.findLast((text) => text.includes('"page":{'))).page;
+    expect(newest.targets.length).toBeGreaterThan(0);
+    for (const target of newest.targets) {
+      expect(target).not.toHaveProperty('styleState');
+      expect(target.visible).not.toBe(true);
+      expect(target.inViewport).not.toBe(true);
+      expect(target.name).not.toBe('');
+      if (target.style) expect(newest.styles[target.style]).toBeTruthy();
+    }
+  } finally {
+    await context.close();
+  }
+});
+
 test('an open question answers Control+Shift numbers from the page in front', async () => {
   const { context, extensionId } = await launch();
   try {
