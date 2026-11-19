@@ -39,6 +39,8 @@ Speech recognition runs on this device. The speech pack download needs a network
 
 AccessAssist handles ordinary buttons, links, and form fields, plus common custom controls such as time grids built from table cells. Before it reads page text, it lists the current site and every embedded source in one confirmation. "Allow listed sites" reads that whole snapshot; "Current site only" leaves embedded sites unread. A source that appears later gets its own confirmation. Screenshots and page changes need separate consent.
 
+AccessAssist always works on the tab in front of you. When you switch tabs, it follows and says the new page; a tab that is not a web page, such as a new tab page, is reported as unreadable, and the page you left is never read or changed out of sight. If you switch while an action is waiting for your confirmation, it is not run; an action already running finishes on its page, and the panel then moves to your tab.
+
 A screenshot can guide a click or drag on visual targets such as canvases, but only on a page with no embedded frame and no password field, including hidden fields and fields inside shadow roots. AccessAssist refuses the screenshot on those pages rather than masking it; page text and ordinary controls still work. A screenshot stays in memory, maps to one observation and viewport position, and expires when the page scrolls or navigates.
 
 Some custom controls save a change as soon as they are clicked. The panel says whether it saw a change and whether it verified the requested result, asks again before an action it cannot undo, and never claims a color change or server save it could not confirm.

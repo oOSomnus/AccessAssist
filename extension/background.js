@@ -177,25 +177,48 @@ async function targetTab(tabId, windowId) {
     }
   }
   if (!Number.isInteger(windowId)) return null;
-  const [active] = await chrome.tabs.query({ active: true, windowId });
-  if (active && httpUrl(active.url)) return active;
-  const remembered = lastHttpTab.get(windowId);
-  if (remembered) {
-    try {
-      const tab = await chrome.tabs.get(remembered.tabId);
-      if (httpUrl(tab.url) && tab.windowId === windowId) return tab;
-    } catch {}
-    lastHttpTab.delete(windowId);
+  return (await visibleTab(windowId)).tab;
+}
+
+// The page the user sees in a window is its active tab. Only when that tab is
+// this panel's own document (the panel shown as a tab rather than docked) is
+// the last web page of that window the one it serves. A web page out of sight
+// is never substituted: acting there would act where the user cannot look.
+async function visibleTab(windowId) {
+  const [active] = await chrome.tabs.query({ active: true, windowId }).catch(() => []);
+  if (!active) return { tab: null, active: null };
+  if (httpUrl(active.url)) return { tab: active, active };
+  if (typeof active.url === 'string' && active.url.startsWith(PANEL_URL)) {
+    const remembered = lastHttpTab.get(windowId);
+    if (remembered) {
+      try {
+        const tab = await chrome.tabs.get(remembered.tabId);
+        if (httpUrl(tab.url) && tab.windowId === windowId) return { tab, active };
+      } catch {}
+      lastHttpTab.delete(windowId);
+    }
+    // A restarted worker forgets the last page; the window's most recently
+    // used web page is the one this panel tab was opened beside.
+    const tabs = await chrome.tabs.query({ windowId }).catch(() => []);
+    const newest = tabs
+      .filter((tab) => httpUrl(tab.url))
+      .sort((left, right) => (right.lastAccessed ?? 0) - (left.lastAccessed ?? 0))[0];
+    if (newest) {
+      trackTab(newest);
+      return { tab: newest, active };
+    }
   }
-  // A restarted worker or a panel opened before any page event forgets the
-  // last page; bind the window's most recently used web page instead.
-  const tabs = await chrome.tabs.query({ windowId });
-  const newest = tabs
-    .filter((tab) => httpUrl(tab.url))
-    .sort((left, right) => (right.lastAccessed ?? 0) - (left.lastAccessed ?? 0))[0];
-  if (!newest) return null;
-  trackTab(newest);
-  return newest;
+  return { tab: null, active };
+}
+
+const NOT_ON_SCREEN = 'That page is no longer on screen; the user switched to another tab. Nothing was done there.';
+
+// Every request that reads or changes a page must name the page on screen.
+async function visiblePageTab(tabId) {
+  const tab = requireTab(await targetTab(tabId));
+  const { tab: visible } = await visibleTab(tab.windowId);
+  if (visible?.id !== tab.id) throw new Error(NOT_ON_SCREEN);
+  return tab;
 }
 
 function requireTab(tab) {
@@ -475,7 +498,18 @@ async function route(message) {
     }
     case 'GET_TAB_INFO': {
       const tab = await targetTab(message.tabId, message.windowId);
-      if (!tab) return { error: 'No web page tab is available' };
+      if (!tab) {
+        // Name the tab on screen so the panel can say which page it cannot use.
+        const shown = Number.isInteger(message.tabId) ? null
+          : Number.isInteger(message.windowId) ? (await visibleTab(message.windowId)).active : null;
+        if (shown) {
+          return {
+            error: 'This tab is not a regular web page, so it cannot be read or operated.',
+            title: shown.title || shown.url || '',
+          };
+        }
+        return { error: 'No web page tab is available' };
+      }
       trackTab(tab);
       const documentId = await topDocument(tab.id).then((top) => top.documentId).catch(() => null);
       return {
@@ -489,26 +523,33 @@ async function route(message) {
       };
     }
     case 'GET_PAGE_ORIGINS': {
-      const tab = requireTab(await targetTab(message.tabId));
+      const tab = await visiblePageTab(message.tabId);
       return pageOrigins(tab, message.expectedDocumentId);
     }
     case 'OBSERVE_PAGE': {
-      const tab = requireTab(await targetTab(message.tabId));
+      const tab = await visiblePageTab(message.tabId);
       return observePage(
         tab,
         Array.isArray(message.allowedFrameOrigins) ? message.allowedFrameOrigins : [],
         { visual: message.visual === true, expectedDocumentId: message.expectedDocumentId, cursor: message.cursor },
       );
     }
-    case 'READ_TARGET': return readTarget(requireTab(await targetTab(message.tabId)), message);
-    case 'FOCUS_TARGET': return focusTarget(requireTab(await targetTab(message.tabId)), message);
-    case 'SCROLL_PAGE': return scrollPage(requireTab(await targetTab(message.tabId)), message);
-    case 'PROPOSE_ACTION': return proposeAction(requireTab(await targetTab(message.tabId)), message);
+    case 'READ_TARGET': return readTarget(await visiblePageTab(message.tabId), message);
+    case 'FOCUS_TARGET': return focusTarget(await visiblePageTab(message.tabId), message);
+    case 'SCROLL_PAGE': return scrollPage(await visiblePageTab(message.tabId), message);
+    case 'PROPOSE_ACTION': return proposeAction(await visiblePageTab(message.tabId), message);
     case 'ARM_CONSENT': return armProposalConsent(message);
-    case 'CONFIRM_PROPOSAL': return confirmProposal(requireTab(await targetTab(message.tabId)), message);
-    case 'RUN_PROPOSAL': return runProposal(requireTab(await targetTab(message.tabId)), message);
-    case 'UNDO_REQUEST': return requestUndo(requireTab(await targetTab(message.tabId)));
-    case 'CAPTURE_TARGET': return captureTarget(requireTab(await targetTab(message.tabId)), message);
+    case 'CONFIRM_PROPOSAL': {
+      // A cancel must always reach the worker so the proposal is dropped, even
+      // when the user has already moved to another tab.
+      const tab = message.optionValue === 'execute'
+        ? await visiblePageTab(message.tabId)
+        : requireTab(await targetTab(message.tabId));
+      return confirmProposal(tab, message);
+    }
+    case 'RUN_PROPOSAL': return runProposal(await visiblePageTab(message.tabId), message);
+    case 'UNDO_REQUEST': return requestUndo(await visiblePageTab(message.tabId));
+    case 'CAPTURE_TARGET': return captureTarget(await visiblePageTab(message.tabId), message);
     case 'ACTIVATE_TAB': return activateTab(message);
     case 'RESET_SESSION': return resetSession(message.tabId, { clearSnapshots: message.clearSnapshots === true });
     case 'GET_COMMANDS': return { commands: await chrome.commands.getAll() };
@@ -1063,6 +1104,9 @@ async function executeAccepted(tab, proposalId, session) {
       undoKind: report.record?.undoKind ?? 'unavailable',
       details: report.details ?? [],
       openedTabs: report.record?.openedTabs ?? [],
+      // Every page the action opened, loaded or not, so the panel can tell
+      // them from a tab the user switched to.
+      openedTabIds: report.record?.openedTabIds ?? [],
       openedTabsOverflow: report.record?.openedTabsOverflow === true,
     },
     phase: finished.phase,
@@ -1191,6 +1235,7 @@ async function executeProposal(tab, proposal) {
         }
         if (execution && execution.openedTabIds.size) {
           const opened = await describeOpenedTabs(tab, execution);
+          record.openedTabIds = [...execution.openedTabIds];
           record.openedTabs = opened.openedTabs;
           record.openedTabsOverflow = opened.openedTabsOverflow;
           if (opened.openedTabs.length || opened.openedTabsOverflow) {

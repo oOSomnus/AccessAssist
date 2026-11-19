@@ -1042,6 +1042,23 @@ function imageScenario(context) {
   return { text: 'I did not receive an image.' };
 }
 
+// Refusal check: observes, and after a refusal tries once more, as a model
+// that ignored the refusal would. The panel must answer that retry itself.
+// "read this page again" is an explicit new request, so it sends ask_again.
+function refusalScenario(context) {
+  const observes = context.calls.filter((call) => call.name === 'observe_page');
+  const results = observes.map((call) => context.results.get(call.id)?.content ?? '');
+  const observation = observationOf(context);
+  if (observation) return { text: `I read ${observation.title}.` };
+  if (!observes.length) {
+    return toolReply(context, 'observe_page', /read this page again/iu.test(context.lastUser) ? { ask_again: true } : {});
+  }
+  if (observes.length === 1 && results.every((result) => /did not allow/u.test(result))) {
+    return toolReply(context, 'observe_page', {});
+  }
+  return { text: 'I could not read this page.' };
+}
+
 function submitScenario(context) {
   const observation = observationOf(context);
   if (!observation) return toolReply(context, 'observe_page', {});
@@ -1666,6 +1683,7 @@ function decide(context) {
   if (/interaction (fill name|clear name|autocomplete|long note|huge archive note|readonly code|focus stealing|rich note|keys|meta enter|control a|tab|date|clipboard)/iu.test(current)) {
     return inputsScenario(context);
   }
+  if (/refusal check/iu.test(current)) return refusalScenario(context);
   if (/intermediate message/iu.test(current)) return intermediateScenario(context);
   if (/observe twice/iu.test(current)) return observeTwiceScenario(context);
   const late = /late name change at (\d+)/iu.exec(current);

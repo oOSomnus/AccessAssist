@@ -507,7 +507,8 @@ test('a queued launcher save wins over a delayed startup migration read', async 
 
 test('a local undo is marked as an execution', async () => {
   reset();
-  behavior.tab = { id: 7, windowId: 3, url: 'https://example.test/page' };
+  behavior.tab = { id: 7, windowId: 3, active: true, url: 'https://example.test/page' };
+  behavior.activeTabs = [behavior.tab];
   const response = await panelMessage({ type: 'UNDO_REQUEST', tabId: 7 });
   assert.deepEqual(response, { unavailable: true, reason: 'No action to undo' });
   // A worker killed mid-undo must be reported on restart, so the undo door
@@ -521,7 +522,8 @@ test('a local undo is marked as an execution', async () => {
 // A page whose agent answers observe/state/setAlt, then fails every injection
 // like a document that navigated under the worker.
 function fakePage(tabId) {
-  behavior.tab = { id: tabId, windowId: 3, title: 'Page', url: 'https://example.test/page' };
+  behavior.tab = { id: tabId, windowId: 3, active: true, title: 'Page', url: 'https://example.test/page' };
+  behavior.activeTabs = [behavior.tab];
   behavior.frames = [{ frameId: 0, documentId: 'doc-1', url: 'https://example.test/page' }];
   const alts = new Map();
   let gone = false;
@@ -601,4 +603,65 @@ test('a failure before any step reports nothing done and stores no undo record',
   assert.equal(response.report.undoKind, 'unavailable');
   assert.equal(response.phase, 'guide');
   assert.equal('undo:12' in behavior.sessionState, false);
+});
+
+test('the bound page is the web page on screen, never a hidden one', async () => {
+  reset();
+  const web = { id: 21, windowId: 5, active: true, title: 'Web', url: 'https://example.test/web' };
+  behavior.tab = web;
+  behavior.activeTabs = [web];
+  behavior.frames = [{ frameId: 0, documentId: 'doc-21', url: web.url }];
+  const first = await panelMessage({ type: 'GET_TAB_INFO', windowId: 5 });
+  assert.equal(first.tabId, 21);
+  // The user moves to a new tab page: the remembered web page is out of sight,
+  // so nothing is bound rather than the page they left.
+  behavior.activeTabs = [{ id: 22, windowId: 5, active: true, url: 'chrome://newtab/' }];
+  const hidden = await panelMessage({ type: 'GET_TAB_INFO', windowId: 5 });
+  assert.equal(hidden.tabId, undefined);
+  assert.match(hidden.error, /cannot be read/u);
+  assert.equal(hidden.title, 'chrome://newtab/');
+});
+
+test('the panel shown as a tab serves the last web page in its window', async () => {
+  reset();
+  const web = { id: 31, windowId: 6, active: true, title: 'Web', url: 'https://example.test/web' };
+  behavior.tab = web;
+  behavior.activeTabs = [web];
+  behavior.frames = [{ frameId: 0, documentId: 'doc-31', url: web.url }];
+  await panelMessage({ type: 'GET_TAB_INFO', windowId: 6 });
+  behavior.tab = { ...web, active: false };
+  behavior.activeTabs = [{ id: 32, windowId: 6, active: true, url: 'chrome-extension://test-extension/sidepanel.html' }];
+  const info = await panelMessage({ type: 'GET_TAB_INFO', windowId: 6 });
+  assert.equal(info.tabId, 31);
+});
+
+test('page requests for a tab that is no longer on screen are refused', async () => {
+  reset();
+  fakePage(41);
+  const proposalId = await observeAndPropose(41);
+  // The user switches to another web page in the same window.
+  behavior.tab = { ...behavior.tab, active: false };
+  behavior.activeTabs = [{ id: 42, windowId: 3, active: true, url: 'https://other.test/' }];
+  for (const message of [
+    { type: 'OBSERVE_PAGE', tabId: 41, expectedDocumentId: 'doc-1' },
+    { type: 'READ_TARGET', tabId: 41, id: 'abcdef01-1' },
+    { type: 'SCROLL_PAGE', tabId: 41, direction: 'down' },
+    { type: 'RUN_PROPOSAL', tabId: 41, proposalId },
+    { type: 'UNDO_REQUEST', tabId: 41 },
+  ]) {
+    const response = await panelMessage(message);
+    assert.match(response.error ?? '', /no longer on screen/u, message.type);
+  }
+});
+
+test('a cancel confirmation still reaches a page that is out of sight', async () => {
+  reset();
+  fakePage(51);
+  const proposalId = await observeAndPropose(51);
+  behavior.tab = { ...behavior.tab, active: false };
+  behavior.activeTabs = [{ id: 52, windowId: 3, active: true, url: 'https://other.test/' }];
+  const response = await panelMessage({
+    type: 'CONFIRM_PROPOSAL', tabId: 51, proposalId, choiceSetId: 'set-x', optionValue: 'cancel',
+  });
+  assert.doesNotMatch(response.error ?? '', /no longer on screen/u);
 });

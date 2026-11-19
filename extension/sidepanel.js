@@ -129,6 +129,7 @@ const state = {
   actionContext: null,
   confirming: false,
   refreshSeq: 0,
+  unreadablePage: null,
   startFocused: false,
 };
 
@@ -282,7 +283,11 @@ async function send(type, payload = {}) {
     throw error;
   }
   if (log) debugLog.add('worker.response', { type, elapsedMs: Math.round(performance.now() - started), response });
-  if (response?.error) throw new Error(response.error);
+  if (response?.error) {
+    const error = new Error(response.error);
+    error.response = response;
+    throw error;
+  }
   return response ?? {};
 }
 
@@ -1638,6 +1643,7 @@ function drainTurns() {
       const { text } = state.pendingInput;
       state.pendingInput = null;
       await initialTabBind;
+      await syncVisiblePage();
       await runTurn(text);
     }
   })();
@@ -1686,6 +1692,7 @@ async function submitMessage(raw) {
     return;
   }
   if (/^(undo|undo last step|undo last)[.!?]?$/iu.test(text)) {
+    await syncVisiblePage();
     const turn = turns.next();
     state.runningTurn = turn;
     state.busy = true;
@@ -2125,8 +2132,8 @@ async function handleActivated(tabId, windowId) {
     context.deferredTabId = tabId;
     return;
   }
-  const tab = await chrome.tabs.get(tabId).catch(() => null);
-  if (!tab || !/^https?:/u.test(tab.url ?? '')) return;
+  // Every tab the user brings forward is followed, web page or not: an
+  // unreadable tab releases the old page instead of leaving it as a hidden target.
   if (windowId !== boundWindow) return;
   if (tabId === state.tab?.tabId) return;
   await refreshTab({ announce: true, windowId: boundWindow });
@@ -2285,6 +2292,9 @@ async function toolProposeAction(call, ok, fail, turn) {
       ? await autoRunProposal(proposed, turn)
       : await consentForProposal(proposed, turn);
     if (turn.stale) return ok('The turn was replaced before this action was confirmed.');
+    if (state.actionContext && consent.report) {
+      state.actionContext.openedTabIds = consent.report.openedTabIds ?? [];
+    }
     if (consent.cancelled) {
       return ok(consent.stale
         ? 'The turn was replaced before this action was confirmed.'
@@ -2299,7 +2309,21 @@ async function toolProposeAction(call, ok, fail, turn) {
     if (after.observation) return ok({ outcome, page: pageForModel(after.observation) });
     return ok(`${outcome} The page could not be read afterwards (${after.error}); call observe_page before describing the result.`);
   } finally {
+    // A tab the user switched to while the action ran was only deferred; it
+    // owns the panel now, so the finished action must not read the page left behind.
+    const context = state.actionContext;
+    const deferred = context?.deferredTabId;
     endActionContext();
+    if (Number.isInteger(deferred) && deferred !== state.tab?.tabId) {
+      // A page the action opened, that the user did not choose (one that never
+      // loaded, say), is not their switch: put the page they were working on
+      // back in front so the screen and the panel agree again.
+      if (context.openedTabIds?.includes(deferred) && Number.isInteger(context.sourceTabId)
+        && context.sourceTabId === state.tab?.tabId) {
+        await send('ACTIVATE_TAB', { tabId: context.sourceTabId, windowId: context.windowId }).catch(() => {});
+      }
+      await refreshTab({ announce: true });
+    }
   }
 }
 
@@ -2311,6 +2335,9 @@ async function handleToolCall(call, turn) {
     isError: false,
   });
   const fail = (message) => ({ id: call.id, name: call.name, content: String(message), isError: true });
+  if (!state.tab && call.name !== 'ask_user') {
+    return fail('No readable page is on screen: the user is on a tab that cannot be read or operated.');
+  }
   try {
     switch (call.name) {
       case 'observe_page': return await toolObserve(call, ok, fail, turn);
@@ -2338,6 +2365,8 @@ async function handleToolCall(call, turn) {
       default: return fail(`Unknown tool: ${call.name}`);
     }
   } catch (error) {
+    // The worker refused a page that left the screen; follow the user there.
+    if (/no longer on screen/u.test(error?.message ?? '')) void refreshTab({ announce: true });
     return fail(error?.message ?? 'Tool execution failed');
   }
 }
@@ -2403,18 +2432,16 @@ async function refreshTab({ announce = false, reason = '', windowId = null } = {
     });
   } catch (error) {
     if (seq !== state.refreshSeq) return false;
-    $('page-line').textContent = 'Page unavailable';
-    if (announce) await say(`Page unavailable: ${error.message}`, { urgent: true });
-    return false;
+    if (!error?.response) {
+      $('page-line').textContent = 'Page unavailable';
+      if (announce) await say(`Page unavailable: ${error.message}`, { urgent: true });
+      return false;
+    }
+    info = error.response;
   }
   // A slower query must not overwrite a newer page binding.
   if (seq !== state.refreshSeq) return false;
-  if (info.error || !info.tabId) {
-    state.tab = null;
-    $('page-line').textContent = 'No readable page';
-    if (announce) await say(info.error ?? 'No readable page.');
-    return false;
-  }
+  if (info.error || !info.tabId) return unbindPage(info, { announce, seq });
   const previous = state.tab;
   const changed = previous?.tabId !== info.tabId || previous?.url !== info.url
     || Boolean(previous?.documentId && previous.documentId !== info.documentId);
@@ -2423,6 +2450,7 @@ async function refreshTab({ announce = false, reason = '', windowId = null } = {
     cancelVoice();
   }
   state.tab = info;
+  state.unreadablePage = null;
   const pageName = spokenSites([info.title || info.url || 'Unknown'])[0];
   $('page-line').textContent = `Current page: ${pageName}${info.readable ? '' : ' (unreadable)'}`;
   if (changed) {
@@ -2435,6 +2463,38 @@ async function refreshTab({ announce = false, reason = '', windowId = null } = {
     }
   }
   return true;
+}
+
+// The tab on screen is not a web page (a new tab page, browser settings, a
+// file). The page the user left is out of sight, so it is released rather than
+// kept as a hidden target, and the user hears which page cannot be used.
+async function unbindPage(info, { announce, seq }) {
+  const previous = state.tab;
+  const shown = info.title ? spokenSites([info.title])[0] : '';
+  const changed = Boolean(previous) || state.unreadablePage !== shown;
+  state.tab = null;
+  state.unreadablePage = shown;
+  $('page-line').textContent = shown ? `Current page: ${shown} (unreadable)` : 'No readable page';
+  if (previous) {
+    cancelVoice();
+    resetConversation();
+    await send('RESET_SESSION', { tabId: previous.tabId }).catch(() => {});
+    if (seq !== state.refreshSeq) return false;
+  }
+  if (announce && changed) {
+    await say(shown
+      ? `Current page: ${shown}. This tab is not a regular web page, so I cannot read or operate it.`
+      : (info.error ?? 'No readable page.'));
+  }
+  return false;
+}
+
+// Every request the user makes belongs to the page on screen when they make
+// it. Tab events normally keep the binding current; this re-checks at the
+// moment of the request, so a missed event can never aim a command at a page
+// the user has left.
+async function syncVisiblePage() {
+  await refreshTab({ announce: true });
 }
 
 function resetConversation() {
@@ -2522,6 +2582,9 @@ async function handleEntryIntent(intent, { cold = false } = {}) {
   focusEntryTarget({ requestWindowFocus: !notified });
   state.audioPaused = false;
   state.voiceRetry = false;
+  // The shortcut was pressed on the page in front of the user; bind to it
+  // before anything is heard or done.
+  if (intent.mode === 'open' || intent.mode === 'voice') await syncVisiblePage();
   if (intent.mode === 'open') {
     return;
   }
@@ -2805,10 +2868,17 @@ function bindEvents() {
   });
   chrome.tabs.onActivated.addListener(({ tabId, windowId }) => { void handleActivated(tabId, windowId); });
   chrome.tabs.onRemoved.addListener((tabId) => { void handleRemoved(tabId); });
-  chrome.tabs.onUpdated.addListener((tabId, info) => {
-    if (info.status === 'complete' && tabId === state.tab?.tabId) {
+  chrome.tabs.onUpdated.addListener((tabId, info, tab) => {
+    if (info.status !== 'complete') return;
+    if (tabId === state.tab?.tabId) {
       void refreshTab({ announce: Boolean(state.tab), reason: 'Page updated' });
+      return;
     }
+    // Another tab finished loading while on screen, such as a new tab the user
+    // typed an address into: that is now the page in front of them.
+    const boundWindow = state.tab?.windowId ?? state.windowId;
+    if (!tab?.active || tab.windowId !== boundWindow || state.actionContext) return;
+    void refreshTab({ announce: true, windowId: boundWindow });
   });
   chrome.webNavigation.onHistoryStateUpdated.addListener((details) => {
     if (details.frameId === 0 && details.tabId === state.tab?.tabId) {
@@ -2880,6 +2950,7 @@ async function undoFromButton() {
   state.audioPaused = false;
   if (state.busy) preemptTurn();
   else interruptOutput();
+  await syncVisiblePage();
   const turn = turns.next();
   await state.turnTask;
   if (!turn.isCurrent()) return;

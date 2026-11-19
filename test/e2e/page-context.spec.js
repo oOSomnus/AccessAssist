@@ -1,5 +1,6 @@
 import { test, expect } from '@playwright/test';
 import {
+  announcementEntries,
   answer,
   answerWhen,
   launch,
@@ -285,6 +286,74 @@ test('cancelling the page choice keeps both pages and the original binding', asy
       const [tab] = await chrome.tabs.query({ active: true, lastFocusedWindow: true });
       return tab?.url ?? '';
     })).toBe(`${PAGE_BASE}/action-pages`);
+  } finally {
+    await context.close();
+  }
+});
+
+test('the panel follows the tab on screen and the next command reads that page', async () => {
+  const { context, extensionId } = await launch();
+  try {
+    await resetMock();
+    await openFixture(context, '/article');
+    const panel = await openPanel(context, extensionId);
+    await expect(panel.locator('#page-line')).toContainText('Event schedule');
+
+    await openFixture(context, '/images');
+    await expect(panel.locator('#page-line')).toContainText('Image test');
+    await expect.poll(async () => (await announcementEntries(panel)).some((text) => text.includes('Current page: Image test')))
+      .toBe(true);
+
+    await sendText(panel, 'Refusal check');
+    await answerWhen(panel, 'page text', 0);
+    await expect(panel.locator('#transcript')).toContainText('I read Image test.');
+    const bodies = JSON.stringify((await mockRequests()).map((request) => request.body));
+    expect(bodies).not.toContain('Event schedule');
+  } finally {
+    await context.close();
+  }
+});
+
+test('a tab that is not a web page releases the page left behind', async () => {
+  const { context, extensionId } = await launch();
+  try {
+    await resetMock();
+    await openFixture(context, '/article');
+    const panel = await openPanel(context, extensionId);
+    await expect(panel.locator('#page-line')).toContainText('Event schedule');
+
+    const blank = await context.newPage();
+    await blank.bringToFront();
+    await expect(panel.locator('#page-line')).toContainText(/unreadable|No readable page/u);
+
+    await sendText(panel, 'Refusal check');
+    await expect(panel.locator('#transcript')).toContainText('I could not read this page.');
+    expect((await announcementEntries(panel)).some((text) => text.includes('page text'))).toBe(false);
+    const bodies = JSON.stringify((await mockRequests()).map((request) => request.body));
+    expect(bodies).not.toContain('Event schedule');
+    expect(bodies).toContain('No readable page is on screen');
+  } finally {
+    await context.close();
+  }
+});
+
+test('switching tabs while an action waits for confirmation runs nothing out of sight', async () => {
+  const { context, extensionId } = await launch();
+  try {
+    await resetMock();
+    const page = await openFixture(context, '/article');
+    const panel = await openPanel(context, extensionId);
+    await sendText(panel, 'Submit the form.');
+    await answerWhen(panel, 'page text', 0);
+    await expect(panel.locator('#ask-question')).toContainText('Run this?');
+
+    await openFixture(context, '/images');
+    await panel.waitForTimeout(250);
+    await answer(panel, 0);
+
+    await expect(panel.locator('#page-line')).toContainText('Image test');
+    await expect(panel.locator('#ask')).toBeHidden();
+    await expect(page.locator('#submits')).toHaveText('0');
   } finally {
     await context.close();
   }
