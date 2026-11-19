@@ -6,6 +6,16 @@ export const DEFAULT_API_CONFIG = Object.freeze({
   effort: 'default',
 });
 
+// Kept out of apiConfig on purpose: configOrigin and configFingerprint hash
+// that object, so an extra field there would clear the session key and upload
+// consent every time this preference changed.
+export const SCREEN_READER_CHOICES = Object.freeze(['auto', 'narrator', 'nvda', 'jaws', 'voiceover']);
+
+export function normalizeScreenReader(raw) {
+  const value = typeof raw === 'string' ? raw.trim().toLowerCase() : '';
+  return SCREEN_READER_CHOICES.includes(value) ? value : 'auto';
+}
+
 export function configOrigin(config) {
   try {
     return new URL(config.baseUrl).origin;

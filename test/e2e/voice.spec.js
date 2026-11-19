@@ -97,12 +97,16 @@ test('a missing announcement target blocks capture before the microphone', async
     const panel = await openPanel(context, extensionId);
     await panel.evaluate(() => document.getElementById('sr-status').remove());
     await sendIntent(worker, intent('prompt-missing'));
-    await expect.poll(async () => await announcements(panel))
-      .toContain('Listening did not start because its prompt could not be delivered');
+    // There is exactly one announcement channel, so with it gone the refusal
+    // cannot be spoken either. What must hold is the behaviour: a prompt that
+    // cannot be delivered never opens the microphone. The failure tone is the
+    // refusal path finishing; only then is the absence of capture meaningful.
+    await expect.poll(async () => (await voiceState(panel)).tones, { timeout: 10_000 }).toContain(220);
     const state = await voiceState(panel);
     expect(state.starts).toBe(0);
     expect(state.gumCalls).toBe(0);
     expect(state.active).toBe(false);
+    expect(await panel.locator('#mode-line').textContent()).not.toContain('Listening');
     expect((await mockRequests()).length).toBe(0);
   } finally {
     await context.close();
@@ -315,7 +319,7 @@ test('a browser that refuses local mode explains without starting', async () => 
   }
 });
 
-test('readback and working append to the log and never use the alert channel', async () => {
+test('readback and working reach the one live region in order', async () => {
   const { context, extensionId, worker } = await launch();
   try {
     await resetMock();
@@ -332,7 +336,9 @@ test('readback and working append to the log and never use the alert channel', a
     const entries = await announcementEntries(panel);
     expect(entries.indexOf('I heard: What is this page about?'))
       .toBeLessThan(entries.indexOf('working'));
-    await expect(panel.locator('#sr-alert')).toHaveText('');
+    // Cleared after its hold, so the hidden region never becomes a second,
+    // stale copy of the transcript in the accessibility tree.
+    await expect(panel.locator('#sr-status')).toHaveText('');
   } finally {
     await context.close();
   }
@@ -353,7 +359,8 @@ test('a spoken answer does not move focus, and the next number answers the new c
     expect(await panel.evaluate(() => document.activeElement?.id)).toBe('listen');
     await panel.keyboard.press('Control+Shift+1');
     await expect(panel.locator('#ask')).toBeHidden();
-    expect(occurrences(await announcements(panel), 'Selected option 1: Allow.')).toBe(1);
+    // The selection is read after its cue, so it lands after the question hides.
+    await expect.poll(async () => occurrences(await announcements(panel), 'Selected option 1: Allow.')).toBe(1);
   } finally {
     await context.close();
   }
@@ -480,7 +487,9 @@ test('a pending install completes preparation without listening', async () => {
     await expect(panel.locator('#voice-setup')).toBeHidden({ timeout: 20_000 });
     await expect(panel.locator('#listen')).toHaveText('1 Listen');
     expect((await voiceState(panel)).starts).toBe(0);
-    await expect(panel.locator('#sr-alert')).toHaveText('');
+    // Cleared after its hold, so the hidden region never becomes a second,
+    // stale copy of the transcript in the accessibility tree.
+    await expect(panel.locator('#sr-status')).toHaveText('');
   } finally {
     await context.close();
   }

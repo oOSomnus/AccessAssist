@@ -2,9 +2,9 @@ import { normalizeConfig, requestTurn, REQUEST_TIMEOUT_MS } from './ai.js';
 import { consentRound } from './consent-round.js';
 import { createDebugLog } from './debug-log.js';
 import { closeChoiceSet, createChoiceSet, formatChoices, parseChoiceNumber, resolveChoice } from './protocol.js';
-import { keyBinding, keyForBinding, configFingerprint, configOrigin, DEFAULT_API_CONFIG, grantUpload, needsUpload, uploadConsentFor } from './settings.js';
+import { keyBinding, keyForBinding, configFingerprint, configOrigin, DEFAULT_API_CONFIG, grantUpload, needsUpload, normalizeScreenReader, uploadConsentFor } from './settings.js';
 import { Speech, spokenSites, voiceSetupView } from './speech.js';
-import { detectPlatform, guideFor } from './screen-reader-guide.js';
+import { detectPlatform, guideFor, GUIDES, readerChoices, resolveReader } from './screen-reader-guide.js';
 import { createTurns } from './turn.js';
 
 const $ = (id) => document.getElementById(id);
@@ -45,6 +45,7 @@ function introText() {
     'Voice needs microphone access and a one-time English speech pack. Choose Prepare voice to set it up; Chrome asks once for the microphone.',
     'A double tone means the microphone is ready; say your command. I say "working" before I start. Choices are numbered: say one, two, or press Control plus Shift plus a number key.',
     'You can say help, repeat choices, cancel, or undo at any time.',
+    'Press Control on its own to stop speech already being read; that works in VoiceOver, Narrator, NVDA, and JAWS.',
     'Speech is recognized on this device. Spoken commands and page content you allow are sent only to the AI service you configure.',
     replaySentence(),
   ].join(' ');
@@ -96,6 +97,7 @@ const state = {
   commands: [],
   ready: false,
   config: { ...DEFAULT_API_CONFIG },
+  screenReader: 'auto',
   apiKey: null,
   keyStale: false,
   history: [],
@@ -143,9 +145,8 @@ window.addEventListener('unhandledrejection', (event) => debugLog.add('panel.rej
 
 const speech = new Speech({ lang: 'en-US' });
 speech.attach({
-  statusEl: $('sr-status'),
-  alertEl: $('sr-alert'),
-  onWrite: (text, alert) => debugLog.add(alert ? 'speech.alert' : 'speech.status', { text }),
+  liveEl: $('sr-status'),
+  onWrite: (text, urgent) => debugLog.add(urgent ? 'speech.urgent' : 'speech.status', { text }),
 });
 
 const turns = createTurns();
@@ -311,6 +312,12 @@ let initialTabBind = Promise.resolve();
 
 // Preempts only output ownership: it never consumes a ChoiceSet, clears the
 // draft, or resets history.
+// Deliberately leaves the announcement queue alone. This also fires from
+// focusin and pointerdown handlers, so the panel reaches it while announcing
+// its own messages — openSettingsForKey focusing the key field is one path.
+// Dropping the queue here would discard the failure the panel just enqueued.
+// An urgent message already clears what it supersedes, and the explicit stop
+// paths below call speech.cancelQueue() themselves.
 function interruptOutput() {
   sayToken += 1;
   state.sayPending = false;
@@ -335,11 +342,11 @@ function syncWorking() {
   );
 }
 
-async function say(text, { alert = false } = {}) {
+async function say(text, { urgent = false, tag = null } = {}) {
   const token = ++sayToken;
   state.sayPending = true;
   syncWorking();
-  const outcome = await speech.announce(text, { alert });
+  const outcome = await speech.announce(text, { urgent, tag });
   const current = token === sayToken;
   if (current) {
     state.sayPending = false;
@@ -347,6 +354,8 @@ async function say(text, { alert = false } = {}) {
   }
   return {
     delivered: current && outcome.delivered === true,
+    // Reached the region, even if a newer output took over meanwhile.
+    written: outcome.delivered === true,
     interrupted: !current || outcome.interrupted === true,
     reason: outcome.reason ?? null,
   };
@@ -437,7 +446,7 @@ async function listenOnce(requestId, seq) {
         focusVoiceSetup();
       }
       await speech.play('fail');
-      await say(voiceStartError(error), { alert: true });
+      await say(voiceStartError(error), { urgent: true });
       updateModeLine();
       syncWorking();
     } finally {
@@ -468,8 +477,13 @@ async function onVoiceResult(text, info, choiceSetId) {
   if (!unchanged) return;
   if (!readback.delivered) {
     if (!readback.interrupted) {
+      // Withdrawn means a more urgent message replaced the readback before it
+      // was written; otherwise there was no region to write it to.
+      const why = readback.reason === 'withdrawn'
+        ? 'another message replaced its readback'
+        : 'its readback could not be delivered. Check that your screen reader is working';
       speech.writeStatus(
-        `Your spoken input was not used because its readback could not finish. Check that your screen reader is working. ${listenAction()} to try again.`,
+        `Your spoken input was not used because ${why}. ${listenAction()} to try again.`,
         true,
       );
     }
@@ -499,7 +513,7 @@ async function onVoiceError(error) {
     state.micState = 'denied';
     updateModeLine();
     updateVoiceSetup({ local: speech.localStatus, mic: 'denied', ready: false });
-    await say(`Microphone permission was denied. Allow it in Chrome and system settings. ${listenAction()} to try again.`, { alert: true });
+    await say(`Microphone permission was denied. Allow it in Chrome and system settings. ${listenAction()} to try again.`, { urgent: true });
     focusVoiceSetup();
     return;
   }
@@ -508,17 +522,17 @@ async function onVoiceError(error) {
     state.voiceReady = false;
     state.voiceRetry = true;
     updateVoiceSetup({ local: speech.localStatus, mic: state.micState, ready: false });
-    await say(`No microphone is available. Connect one. ${listenAction()} to try again.`, { alert: true });
+    await say(`No microphone is available. Connect one. ${listenAction()} to try again.`, { urgent: true });
   } else if (error === 'language-not-supported') {
     state.voiceReady = false;
     state.voiceRetry = true;
     updateVoiceSetup({ local: 'unavailable', mic: state.micState, ready: false });
-    await say('Chrome cannot recognize English on this device.', { alert: true });
+    await say('Chrome cannot recognize English on this device.', { urgent: true });
   } else {
     state.voiceReady = false;
     state.voiceRetry = true;
     updateVoiceSetup({ local: speech.localStatus, mic: state.micState, ready: false });
-    await say(`Speech recognition stopped: ${error}. ${listenAction()} to try again.`, { alert: true });
+    await say(`Speech recognition stopped: ${error}. ${listenAction()} to try again.`, { urgent: true });
   }
   updateModeLine();
 }
@@ -979,13 +993,14 @@ function showChoice(set, sourceSites = []) {
     button.type = 'button';
     const number = document.createElement('span');
     number.className = 'choice-number';
-    number.setAttribute('aria-hidden', 'true');
     number.textContent = String(option.number);
     const label = document.createElement('span');
     label.className = 'choice-label';
     label.textContent = option.label;
+    // The name is the visible text, so speech input can act on what is read
+    // out. The word "Choice" still reaches the user from formatChoices and
+    // from the section heading.
     button.append(number, document.createTextNode(' '), label);
-    button.setAttribute('aria-label', `Choice ${option.number}, ${option.label}`);
     button.addEventListener('click', () => selectOption(set.id, String(option.number)));
     container.append(button);
   }
@@ -1067,6 +1082,9 @@ function defaultNumberScope(key) {
   return null;
 }
 
+// Never bind any of these on their own. Control by itself silences speech in
+// VoiceOver, Narrator, NVDA, and JAWS, and the introduction tells the user so;
+// Caps Lock and Insert are screen-reader modifiers.
 const PURE_MODIFIER_KEYS = new Set(['Shift', 'Control', 'Alt', 'Meta', 'AltGraph', 'CapsLock', 'OS']);
 
 function handleNumberShortcut(event) {
@@ -1118,6 +1136,9 @@ function finishChoice(choiceSetId, option, reason = 'answered') {
   if (choiceSetId && current.set.id !== choiceSetId) return false;
   state.choice = null;
   clearTimeout(current.timer);
+  // A question answered or replaced before its reading left the queue must
+  // not be read out after it is gone.
+  speech.dropPending(choiceTag(current.set.id));
   current.set = closeChoiceSet(current.set, reason);
   debugLog.add('choice.finish', { id: current.set.id, reason, option });
   hideChoice();
@@ -1172,17 +1193,25 @@ function selectOption(choiceSetId, rawInput) {
 }
 
 // Reads the question, every numbered choice, then the speech-only source
-// names. A long list is split for TTS but sent once to the live region.
+// names. The keyboard hint is deliberately not spoken: questions are the most
+// frequent interaction here, and repeating the keys every time costs seconds of
+// speech. It stays on screen in #choice-shortcut-hint, in the introduction, and
+// in the Settings shortcut list.
 async function announceChoice(current) {
   const { set, sourceSites = [] } = current;
   const sites = spokenSites(sourceSites);
   const parts = [
     `${set.question} ${formatChoices(set)}.`,
     ...(sites.length ? [`Sites included: ${sites.join(', ')}.`] : []),
-    choiceKeyboardHint(),
   ];
-  const outcome = await say(parts.join(' '));
+  const outcome = await say(parts.join(' '), { tag: choiceTag(set.id) });
   return outcome;
+}
+
+// Ties a question's reading to that question, so finishChoice can withdraw it
+// if it is still waiting to be read when the question closes.
+function choiceTag(choiceSetId) {
+  return `choice:${choiceSetId}`;
 }
 
 function repeatChoice() {
@@ -1232,7 +1261,7 @@ async function askChoice({ question, options, sourceSites = [] }) {
   try {
     set = createChoiceSet({ id: uid(), question, options });
   } catch (error) {
-    await say(`Cannot show choices: ${error.message}`, { alert: true });
+    await say(`Cannot show choices: ${error.message}`, { urgent: true });
     return null;
   }
   return presentSet(set, { sourceSites });
@@ -1307,10 +1336,15 @@ async function announcePage() {
 }
 
 let introGeneration = 0;
+const INTRO_TAG = 'intro';
 async function runIntro({ page = true } = {}) {
   const token = ++introGeneration;
-  const outcome = await say(introText());
+  // Tagged so a new entry clearing the queue lets the introduction through
+  // instead of dropping it; the first run is marked seen when it is claimed.
+  const outcome = await say(introText(), { tag: INTRO_TAG });
   if (!outcome.delivered) {
+    // It reached the region; a newer output only took over afterwards.
+    if (outcome.written) return false;
     if (token === introGeneration) {
       speech.writeStatus('The introduction was interrupted. Use Replay introduction to hear it again.');
     }
@@ -1323,13 +1357,13 @@ async function runIntro({ page = true } = {}) {
 async function apiReady() {
   const normalized = normalizeConfig(state.config);
   if (normalized.errors.length) {
-    await say(`API settings have a problem: ${normalized.errors.join('; ')}`, { alert: true });
+    await say(`API settings have a problem: ${normalized.errors.join('; ')}`, { urgent: true });
     openSettingsForKey({ advanced: true });
     return false;
   }
   state.config = normalized.config;
   if (!state.apiKey) {
-    await say('Paste your OpenCode Go API key. The service and model are already set.', { alert: true });
+    await say('Paste your OpenCode Go API key. The service and model are already set.', { urgent: true });
     openSettingsForKey();
     return false;
   }
@@ -1356,7 +1390,7 @@ function errorText(error) {
 
 async function announceFailure(error) {
   speech.play('fail');
-  await say(errorText(error), { alert: true });
+  await say(errorText(error), { urgent: true });
 }
 
 function stripImages() {
@@ -1681,6 +1715,8 @@ async function pauseAssistant() {
   state.audioPaused = true;
   interruptOutput();
   cancelVoice();
+  // An explicit pause: nothing still waiting to be read is wanted any more.
+  speech.cancelQueue();
   syncWorking();
   await speech.play('cancel');
   speech.writeStatus(`Paused. ${listenSentence()}.`);
@@ -1701,7 +1737,7 @@ async function discoverPageOrigins(context) {
 async function ensureUploadConsent(part, question, turn) {
   const tab = state.tab;
   if (!tab?.origin || !Number.isInteger(tab.tabId)) {
-    await say('This page has no usable site address.', { alert: true });
+    await say('This page has no usable site address.', { urgent: true });
     return false;
   }
   if (turn.stale) return false;
@@ -2007,7 +2043,7 @@ async function finishProposal(report, turn) {
   if (!report.completed) {
     const failed = `Operation not completed: ${report.failedStep ?? 'no confirmable result'}`;
     if (!turn.isCurrent()) return `${failed} The turn was replaced before this result could be confirmed.`;
-    await say(report.failedStep ?? 'The operation did not complete.', { alert: true });
+    await say(report.failedStep ?? 'The operation did not complete.', { urgent: true });
     return failed;
   }
   const resultText = [
@@ -2311,21 +2347,45 @@ async function runGuide() {
   const tabId = state.tab?.tabId ?? null;
   // Choosing an option cancels voice, so generation must not end the guide.
   const alive = () => turn.isCurrent() && (state.tab?.tabId ?? null) === tabId;
-  let platform = detectPlatform();
-  if (!platform) {
-    const choice = await askChoice({
-      question: 'Which system are you using?',
-      options: [
-        { label: 'VoiceOver', value: 'voiceover' },
-        { label: 'Narrator', value: 'narrator' },
-        { label: 'Back', value: 'cancel' },
-      ],
-    });
-    if (!alive()) return;
-    if (!choice || choice.value === 'cancel') return;
-    platform = choice.value;
+  // A saved preference answers this outright. Detection can only separate
+  // Windows from macOS, so a Windows user is asked once which reader they run
+  // rather than handed Narrator's keys; the answer is stored so it is asked
+  // once, not once per image.
+  let reader = state.screenReader === 'auto' ? null : resolveReader(state.screenReader);
+  if (!reader) {
+    const candidates = readerChoices(detectPlatform());
+    if (candidates.length === 1) {
+      // macOS leaves nothing to ask; no need to store a guess either.
+      [reader] = candidates;
+    } else {
+      const choice = await askChoice({
+        question: 'Which screen reader are you using?',
+        options: [
+          ...candidates.map((id) => ({ label: GUIDES[id].name, value: id })),
+          { label: 'Back', value: 'cancel' },
+        ],
+      });
+      if (!alive()) return;
+      if (!choice || choice.value === 'cancel') return;
+      reader = choice.value;
+      // Stored so this is asked once, not once per image.
+      state.screenReader = normalizeScreenReader(reader);
+      const saved = await chrome.storage.local.set({ screenReader: state.screenReader })
+        .then(() => true, () => false);
+      // Only this field: fillSettings would also clear a key the user is
+      // part-way through typing.
+      $('screen-reader').value = state.screenReader;
+      // The choice stays saved, but a cancel during the write owns the panel.
+      if (!alive()) return;
+      if (!saved) {
+        const notice = 'Your screen reader choice could not be saved. This panel will use it, but a new panel will ask again. You can set it in Settings.';
+        addTranscript('assistant', notice);
+        await say(notice);
+        if (!alive()) return;
+      }
+    }
   }
-  const guide = guideFor(platform);
+  const guide = guideFor(reader);
   if (!guide) return;
   // All steps at once: the user replays the conversation instead of paging through steps.
   const text = [guide.intro, ...guide.steps, `${listenAction()} to return to voice.`].join(' ');
@@ -2343,7 +2403,7 @@ async function refreshTab({ announce = false, reason = '', windowId = null } = {
   } catch (error) {
     if (seq !== state.refreshSeq) return false;
     $('page-line').textContent = 'Page unavailable';
-    if (announce) await say(`Page unavailable: ${error.message}`, { alert: true });
+    if (announce) await say(`Page unavailable: ${error.message}`, { urgent: true });
     return false;
   }
   // A slower query must not overwrite a newer page binding.
@@ -2420,6 +2480,16 @@ async function handleEntryIntent(intent) {
   // stale from here on.
   state.deferChoiceFocus = false;
   interruptOutput();
+  // A new entry owns the panel; messages queued for the old one are stale.
+  // Two are not: the question of a choice that stays open, which the entry
+  // focuses but does not read again, and a first-run introduction that has
+  // already been marked seen. A replay entry reads the introduction itself.
+  speech.cancelQueue({
+    keep: [
+      state.choice ? choiceTag(state.choice.set.id) : null,
+      intent.mode === 'intro' ? null : INTRO_TAG,
+    ],
+  });
   cancelVoice();
   // A warm open notification already transferred keyboard focus before the
   // serialized claim; asking the window again would repeat its announcement.
@@ -2470,6 +2540,7 @@ function fillSettings() {
   $('base-url').value = state.config.baseUrl;
   $('model').value = state.config.model;
   $('effort').value = state.config.effort ?? 'default';
+  $('screen-reader').value = state.screenReader;
   $('anthropic-version').value = state.config.anthropicVersion ?? '2026-10-21';
   toggleAnthropicFields();
   $('api-key').value = '';
@@ -2506,7 +2577,7 @@ async function saveSettings(event) {
     const message = `Settings not saved: ${normalized.errors.join('; ')}`;
     $('settings-status').textContent = message;
     firstInvalidField(normalized.errors).focus();
-    await say(message, { alert: true });
+    await say(message, { urgent: true });
     return;
   }
   cancelVoice();
@@ -2514,9 +2585,17 @@ async function saveSettings(event) {
   const previousFingerprint = configFingerprint(state.config);
   const next = normalized.config;
   const originChanged = previousOrigin !== configOrigin(next);
+  const keyValue = $('api-key').value.trim();
+  // The Screen reader preference reaches no model, so changing only that keeps
+  // the conversation, its pending messages, and upload consent.
+  const apiChanged = Boolean(keyValue)
+    || previousFingerprint !== configFingerprint(next)
+    || (state.config.effort ?? 'default') !== (next.effort ?? 'default');
   // Page text consented for the old receiver must not reach a newly configured one.
-  turns.current.cancel();
-  await chrome.storage.local.set({ apiConfig: next });
+  if (apiChanged) turns.current.cancel();
+  const screenReader = normalizeScreenReader($('screen-reader').value);
+  state.screenReader = screenReader;
+  await chrome.storage.local.set({ apiConfig: next, screenReader });
   if (originChanged) {
     await chrome.storage.session.remove('apiKey');
     state.apiKey = null;
@@ -2525,7 +2604,6 @@ async function saveSettings(event) {
     state.uploadConsent = null;
   }
   state.config = next;
-  const keyValue = $('api-key').value.trim();
   if (!originChanged && keyValue) {
     await chrome.storage.session.set({ apiKey: keyBinding(keyValue, next) });
     state.apiKey = keyValue;
@@ -2536,17 +2614,25 @@ async function saveSettings(event) {
     originChanged,
     keyReplaced: Boolean(!originChanged && keyValue),
   });
-  await send('RESET_SESSION', { tabId: state.tab?.tabId }).catch(() => {});
-  resetConversation();
+  if (apiChanged) {
+    await send('RESET_SESSION', { tabId: state.tab?.tabId }).catch(() => {});
+    resetConversation();
+  }
   fillSettings();
   $('settings-status').textContent = 'Saved.';
   updateModeLine();
   if (originChanged) {
-    await say('Saved. The API address changed, so the old key was cleared. Enter the key again.', { alert: true });
+    await say('Saved. The API address changed, so the old key was cleared. Enter the key again.', { urgent: true });
     openSettingsForKey();
     return;
   }
-  await say(keyValue ? `Settings saved. ${listenSentence()}.` : 'Settings saved.');
+  if (apiChanged) {
+    await say(keyValue ? `Settings saved. ${listenSentence()}.` : 'Settings saved.');
+  } else {
+    // A reader-only save leaves the turn running; say() would take output
+    // ownership and mark that turn's queued message as interrupted.
+    speech.writeStatus('Settings saved.');
+  }
   if (!state.apiKey) openSettingsForKey();
 }
 
@@ -2756,6 +2842,8 @@ async function cancelFromButton() {
   }
   cancelVoice();
   interruptOutput();
+  // An explicit stop: nothing still waiting to be read is wanted any more.
+  speech.cancelQueue();
   await speech.play('cancel');
   speech.writeStatus('Cancelled the current action.');
 }
@@ -2827,14 +2915,15 @@ async function closePanel() {
     await chrome.sidePanel.close({ windowId: state.windowId });
   } catch (error) {
     // A rejected close is not a closure; report it and keep both documents.
-    void say(`Could not close the assistant. ${error?.message ?? 'The side panel did not close.'}`, { alert: true });
+    void say(`Could not close the assistant. ${error?.message ?? 'The side panel did not close.'}`, { urgent: true });
   }
 }
 
 async function loadPreferences() {
-  const stored = await chrome.storage.local.get(['apiConfig', 'outputMode']);
+  const stored = await chrome.storage.local.get(['apiConfig', 'outputMode', 'screenReader']);
   if ('outputMode' in stored) await chrome.storage.local.remove('outputMode');
   state.config = stored.apiConfig ?? { ...DEFAULT_API_CONFIG };
+  state.screenReader = normalizeScreenReader(stored.screenReader);
   const session = await chrome.storage.session.get(['apiKey', 'allowNetwork']);
   state.apiKey = keyForBinding(session.apiKey, state.config);
   if (session.apiKey?.value && !state.apiKey) {
@@ -2907,15 +2996,19 @@ async function initializePanel() {
   // microphone, or starts listening.
   if (status.local !== 'available') ensureLocalWatch();
   const claim = await send('CLAIM_INTENT', { windowId: state.windowId, cold: true }).catch(() => ({}));
-  if (claim.notices?.length) await say(claim.notices.join(' '));
+  // Startup messages are queued, not awaited: an announcement now settles only
+  // when it is written, and holding readiness behind each hold would drop the
+  // user's first clicks. The queue keeps their order, and the introduction is
+  // tagged so a cold-start entry below lets it through instead of dropping it.
+  if (claim.notices?.length) void say(claim.notices.join(' '));
   let intent = isForThisWindow(claim.intent) ? claim.intent : null;
 
   const intro = await send('CLAIM_INTRO').catch(() => ({ seen: true }));
-  if (!intro.seen) await runIntro();
-  else if (!intent) await say(replaySentence());
+  if (!intro.seen) void runIntro();
+  else if (!intent) void say(replaySentence());
 
   if (state.keyStale) {
-    await say('The saved API key was bound to an older address format and was cleared. Paste it again in Settings.', { alert: true });
+    void say('The saved API key was bound to an older address format and was cleared. Paste it again in Settings.', { urgent: true });
     openSettingsForKey();
   }
   state.ready = true;
@@ -2937,7 +3030,9 @@ async function initializeSetupPage() {
   // The setup page returns before loadPreferences; drop only the obsolete
   // output preference and leave the rest of the stored configuration alone.
   await chrome.storage.local.remove('outputMode').catch(() => {});
-  speech.attach({ statusEl: $('voice-status'), alertEl: $('sr-alert') });
+  // Same hidden channel as the panel. The visible #voice-status line is written
+  // separately by setVoiceStatus, so the ephemeral clear cannot wipe it.
+  speech.attach({ liveEl: $('sr-status') });
   $('start-using').addEventListener('click', () => void startPreparation({ setup: true, force: true }));
   $('return-assistant').addEventListener('click', () => void returnToAssistant());
   document.addEventListener('keydown', handleNumberShortcut);
@@ -2967,7 +3062,7 @@ async function returnToAssistant() {
     $('return-assistant').disabled = false;
     const message = failure?.message ?? String(failure);
     setVoiceStatus(message);
-    await say(message, { alert: true });
+    await say(message, { urgent: true });
     return;
   }
   if (state.setupTabId != null) await chrome.tabs.remove(state.setupTabId).catch(() => {});
@@ -2990,7 +3085,7 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     const detail = typeof message.error === 'string' && message.error
       ? message.error
       : 'The side panel did not close.';
-    void say(`Could not close the assistant. ${detail}`, { alert: true });
+    void say(`Could not close the assistant. ${detail}`, { urgent: true });
     return;
   }
   if (message?.type !== 'ENTRY_INTENT') return;

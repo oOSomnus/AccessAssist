@@ -1,5 +1,5 @@
 import { expect, test } from '@playwright/test';
-import { announcements, answer, launch, openFixture, openPanel, resetMock, sendText, voiceState } from './helpers.js';
+import { announcementEntries, announcements, answer, answerWhen, launch, openFixture, openPanel, resetMock, sendText, voiceState } from './helpers.js';
 
 async function attachScreenshot(page, testInfo, name) {
   await testInfo.attach(name, {
@@ -473,8 +473,10 @@ test('appearance: narrow source consent preserves complete origins and keyboard 
     await expect(panel.locator('#ask-options button').first()).toBeFocused();
     expect(await panel.locator('#ask-options button').allTextContents())
       .toEqual(['1 Allow listed sites', '2 Current site only', '3 Cancel']);
+    // The name is the visible text, so speech input can act on what is read
+    // out: "click 1 Allow listed sites" has to match.
     await expect(panel.locator('#ask-options button').first())
-      .toHaveAccessibleName('Choice 1, Allow listed sites');
+      .toHaveAccessibleName('1 Allow listed sites');
 
     for (const size of [
       { width: 391, height: 904 },
@@ -859,6 +861,91 @@ test('appearance: the panel follows the newest message and open question', async
       if (size.height > 840) expect(await panel.evaluate(() => window.scrollY)).toBe(0);
       await panel.close();
     }
+  } finally {
+    await context.close();
+  }
+});
+
+test('appearance: one announcement region, reachable controls, and distinct control names', async () => {
+  const { context, extensionId } = await launch({
+    voice: { available: 'downloadable', permission: 'prompt', gum: 'grant' },
+  });
+  try {
+    await resetMock();
+    await openFixture(context, '/article');
+    const panel = await openPanel(context, extensionId);
+
+    // One region, atomic and polite. A second region would let each screen
+    // reader resolve the order between them for itself, and role="log" is the
+    // least reliably spoken of them in VoiceOver.
+    await expect(panel.locator('#sr-status')).toHaveAttribute('role', 'status');
+    await expect(panel.locator('#sr-status')).toHaveAttribute('aria-atomic', 'true');
+    await expect(panel.locator('#sr-status')).toHaveAttribute('aria-live', 'polite');
+    // Every live region, explicit aria-live or a role that is live without it
+    // (output is an implicit status). #sr-status is the only announcement
+    // channel; the other two are the visible status lines of the settings form
+    // and voice setup, and no new region may join them unnoticed.
+    const liveRegions = await panel.evaluate(() => [...document.querySelectorAll(
+      '[aria-live]:not([aria-live="off"]), [role="status"], [role="alert"], [role="log"], [role="marquee"], [role="timer"], output',
+    )].map((node) => node.id || node.tagName));
+    expect(liveRegions.sort()).toEqual(['settings-status', 'sr-status', 'voice-status']);
+
+    // The primary controls must be reachable by landmark and heading, not only
+    // by tabbing from the top of the panel.
+    await expect(panel.locator('#composer')).toHaveAttribute('role', 'region');
+    await expect(panel.locator('#composer')).toHaveAccessibleName('Actions');
+    await expect(panel.locator('#actions-heading')).toHaveText('Actions');
+
+    // The section heading already names the conversation. The options are a
+    // group named by the question, so focus that lands straight on an option
+    // still hears what it answers after the live region has cleared.
+    expect(await panel.locator('#transcript').getAttribute('aria-label')).toBeNull();
+    await expect(panel.locator('#ask-options')).toHaveAttribute('role', 'group');
+    await expect(panel.locator('#ask-options')).toHaveAttribute('aria-labelledby', 'ask-question');
+
+    // Two buttons that do different things must not answer to the same name.
+    await expect(panel.locator('#voice-setup')).toBeVisible();
+    await expect(panel.locator('#start-using')).toHaveAccessibleName('1 Set up voice');
+    await expect(panel.locator('#listen')).toHaveAccessibleName('1 Prepare voice');
+
+    await panel.locator('#settings-toggle').click();
+    await expect(panel.locator('#screen-reader')).toBeVisible();
+    await expect(panel.locator('#screen-reader')).toHaveValue('auto');
+  } finally {
+    await context.close();
+  }
+});
+
+test('appearance: the live region holds one message at a time instead of accumulating', async () => {
+  const { context, extensionId } = await launch();
+  try {
+    await resetMock();
+    await openFixture(context, '/article');
+    const panel = await openPanel(context, extensionId);
+    await sendText(panel, 'What is this page about?');
+    // Readback, working, and the source question are separate announcements,
+    // written in that order.
+    const inOrder = (entries) => {
+      const readback = entries.indexOf('I heard: What is this page about?');
+      const working = entries.indexOf('working', readback + 1);
+      const question = entries.findIndex((entry, index) => index > working && entry.includes('Allow these sources'));
+      return readback >= 0 && working > readback && question > working;
+    };
+    await expect.poll(async () => inOrder(await announcementEntries(panel)), { timeout: 30_000 })
+      .toBe(true);
+    // The mock's answer follows the question once the sources are allowed.
+    const asked = (await announcementEntries(panel)).length;
+    await answerWhen(panel, 'Allow these sources', 0);
+    await expect.poll(async () => (await announcementEntries(panel)).slice(asked)
+      .some((entry) => entry.includes('Event schedule')), { timeout: 30_000 }).toBe(true);
+
+    // Everything said stays in #transcript. A region that kept its history
+    // would be a second, stale copy for a reader to wander into, so it holds
+    // at most the message being read and is empty once that is done.
+    expect(await panel.locator('#sr-status').evaluate((node) => node.childElementCount))
+      .toBeLessThanOrEqual(1);
+    await expect(panel.locator('#sr-status')).toHaveText('');
+    expect(await panel.locator('#transcript').textContent()).toContain('What is this page about?');
   } finally {
     await context.close();
   }

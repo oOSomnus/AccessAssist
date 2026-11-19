@@ -21,7 +21,15 @@ The first Listen or Prepare voice downloads Chrome's English speech pack and ask
 
 ### Speech output
 
-AccessAssist always uses the system screen reader: every status, readback, question, and answer is appended to a live region, and VoiceOver or Narrator speaks it. There is no extension voice or output selector. A live region confirms delivery to the page, not that a screen reader finished speaking. The working pattern plays while a request runs, and each numbered choice is named before its source sites. Choice numbers use `Control+Shift+1` through `Control+Shift+9` in the panel; plain digits stay with your screen reader. Pressing `Control+Shift+Space` asks the panel to take keyboard focus and focuses the current choice, or the Listen button when there is no question. Chrome can still keep native side-panel focus on the page in some versions; then use F6/Shift+F6 on Windows or Command+Option+Up/Down on macOS to reach the assistant, then Tab.
+AccessAssist always uses the system screen reader: every status, readback, question, and answer goes to one live region, and VoiceOver, Narrator, NVDA, or JAWS speaks it. There is no extension voice or output selector. A live region confirms delivery to the page, not that a screen reader finished speaking.
+
+One region, written one message at a time, is deliberate. The panel queues its messages and holds each one for an estimate of how long a reader needs, capped at six seconds, so the order you hear is the order the panel intended rather than one each screen reader resolves for itself. A message that matters more, such as losing microphone permission, drops the status messages still waiting and goes next, ahead of an open question, which stays queued until it is answered or closed. It waits only for the current estimated hold to end; the panel cannot tell when the reader actually finishes, so a long message may still be being read when it arrives. Each message is announced once and then cleared, so the region does not become a second, stale copy of the conversation to wander into; the transcript keeps the durable copy. Press `Control` on its own to stop speech already being read — that works in all four readers, and AccessAssist never binds `Control` by itself.
+
+The working pattern plays while a request runs and stays quiet while a message is still being read. Each numbered choice is named before its source sites. Choice numbers use `Control+Shift+1` through `Control+Shift+9` in the panel; plain digits stay with your screen reader. The choice keys are not read out with every question — they are in the introduction, in Settings, and on screen. Pressing `Control+Shift+Space` asks the panel to take keyboard focus and focuses the current choice, or the Listen button when there is no question. Chrome can still keep native side-panel focus on the page in some versions; then use F6/Shift+F6 on Windows or Command+Option+Up/Down on macOS to reach the assistant, then Tab.
+
+### Which screen reader you use
+
+Settings has a Screen reader choice. It affects only the keys AccessAssist reads out when you want to explore an image with your own reader, and it covers Narrator, NVDA, JAWS, and VoiceOver. A web page cannot detect a screen reader, only the operating system, so leaving it on "Detect from this system" means a Windows profile is asked once which reader it runs and the answer is remembered.
 
 ### Local speech versus the AI service
 
@@ -42,6 +50,8 @@ See [CONTRIBUTING.md](CONTRIBUTING.md) for tests, the live AI check, and packagi
 ## Known limits
 
 - OpenCode Go is designed for coding-agent requests. This project's use of the service has not been confirmed by OpenCode.
-- Automated tests use a scripted voice and an extension tab; they cannot prove OS shortcut registration, native side-panel focus or closure, audible speech, or real VoiceOver and Narrator behavior. Check those on Windows and macOS with the actual side panel.
+- Automated tests use a scripted voice and an extension tab; they cannot prove OS shortcut registration, native side-panel focus or closure, audible speech, or real screen-reader behavior. They check that the panel delivers messages in the intended order, not that a reader speaks them that way. Check VoiceOver, Narrator, NVDA, and JAWS on Windows and macOS with the actual side panel.
+- The hold between announcements is an estimate from message length, not a signal from the screen reader; no such signal exists for a web page. A reader set to a slow rate can still be speaking when the next message arrives.
+- The image-exploration keys for each screen reader depend on that reader's version and settings, and Narrator's and JAWS's description features may use online services. AccessAssist cannot enable or configure any of them. The JAWS guide names Picture Smart but gives no keys: Freedom Scientific's documentation could not be checked, so add them only once they are verified.
 - Side-panel keyboard focus belongs to Chrome. The panel focuses the current choice, but Chrome builds before 148 may leave browser focus on the page when the shortcut opens the panel; Chrome 148 beta and later reportedly fix that handoff. Until then, use F6/Shift+F6 on Windows or Command+Option+Up/Down on macOS.
 - A managed browser policy can block the English speech pack or microphone.

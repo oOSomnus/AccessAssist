@@ -1,12 +1,14 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import {
+  SCREEN_READER_CHOICES,
   configFingerprint,
   configOrigin,
   grantUpload,
   keyBinding,
   keyForBinding,
   needsUpload,
+  normalizeScreenReader,
   uploadConsentFor,
 } from '../../extension/settings.js';
 
@@ -44,4 +46,23 @@ test('upload consent is per page origin and API configuration', () => {
   assert.equal(needsUpload(consent, 'image'), false);
   const changedFingerprint = configFingerprint({ ...config, model: 'different' });
   assert.equal(uploadConsentFor(consent, 'https://example.test', changedFingerprint), null);
+});
+
+test('the screen-reader preference accepts only known readers', () => {
+  assert.deepEqual(SCREEN_READER_CHOICES, ['auto', 'narrator', 'nvda', 'jaws', 'voiceover']);
+  for (const value of SCREEN_READER_CHOICES) assert.equal(normalizeScreenReader(value), value);
+  assert.equal(normalizeScreenReader('NVDA'), 'nvda');
+  assert.equal(normalizeScreenReader('  jaws  '), 'jaws');
+  // Anything unrecognized falls back to detection rather than to a guide miss.
+  assert.equal(normalizeScreenReader('orca'), 'auto');
+  assert.equal(normalizeScreenReader(undefined), 'auto');
+  assert.equal(normalizeScreenReader(null), 'auto');
+  assert.equal(normalizeScreenReader(7), 'auto');
+  assert.equal(normalizeScreenReader(''), 'auto');
+});
+
+test('the screen-reader preference is not part of the API fingerprint', () => {
+  // Folding it into apiConfig would clear the session key whenever it changed.
+  const before = configFingerprint(config);
+  assert.equal(configFingerprint({ ...config, screenReader: 'nvda' }), before);
 });

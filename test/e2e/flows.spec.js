@@ -581,6 +581,17 @@ test('authentication failure is spoken and focuses the key form', async () => {
 
 test('image choice cancels without upload and AI choice sends a cropped screenshot', async () => {
   const { context, extensionId } = await launch();
+  // Windows, through both inputs detection reads, so the reader is asked and
+  // the offered readers are known.
+  await context.addInitScript(() => {
+    if (!location.protocol.startsWith('chrome-extension:')) return;
+    Object.defineProperty(Navigator.prototype, 'platform', { configurable: true, get: () => 'Win32' });
+    Object.defineProperty(Navigator.prototype, 'userAgentData', {
+      configurable: true,
+      get: () => ({ platform: 'Windows', mobile: false, brands: [] }),
+    });
+  });
+  const guideEntries = (panel) => panel.locator('.message-body', { hasText: 'Here are the NVDA keys' }).count();
   try {
     await resetMock();
     const page = await openFixture(context, '/images');
@@ -599,19 +610,30 @@ test('image choice cancels without upload and AI choice sends a cropped screensh
     await sendText(panel, 'What is this image?');
     await answerWhen(panel, 'Allow these sources', 1);
     await answerWhen(panel, 'How should I describe this image?', 1);
-    await answerWhen(panel, 'Which system', 0);
-    await expect(panel.locator('#transcript')).toContainText('VO plus Shift plus L');
+    // Detection can only tell Windows from macOS, so on Windows the reader
+    // itself is asked, offering the three Windows readers.
+    await expect(panel.locator('#ask-question')).toContainText('Which screen reader');
+    expect(await panel.locator('#ask-options button').allTextContents())
+      .toEqual(['1 Narrator', '2 NVDA', '3 JAWS', '4 Back']);
+    await panel.locator('#ask-options button', { hasText: 'NVDA' }).click();
+    await expect(panel.locator('#transcript')).toContainText('NVDA plus R');
+    expect(await guideEntries(panel)).toBe(1);
     expect(await announcements(panel)).not.toContain('Continue?');
     await expect(panel.locator('#transcript')).toContainText('screen-reader guide');
     requests = await mockRequests();
     expect(requests.some((request) => JSON.stringify(request.body).includes('image_url'))).toBe(false);
+    expect(await panel.locator('#screen-reader').inputValue()).toBe('nvda');
 
     await page.bringToFront();
     await sendText(panel, 'What is this image?');
     await answerWhen(panel, 'Allow these sources', 1);
+    // The stored answer means the reader is asked once, not once per image:
+    // the guide follows the describe choice directly. Wait for that second
+    // guide, so a picker opened late would still be caught below.
+    const guidesBefore = await guideEntries(panel);
     await answerWhen(panel, 'How should I describe this image?', 1);
-    await answerWhen(panel, 'Which system', 0);
-    await expect(panel.locator('#transcript')).toContainText('VO plus Shift plus L');
+    await expect.poll(() => guideEntries(panel), { timeout: 30_000 }).toBe(guidesBefore + 1);
+    await expect(panel.locator('#ask')).toBeHidden();
     expect(await announcements(panel)).not.toContain('Continue?');
     await expect(panel.locator('#transcript')).toContainText('screen-reader guide');
     requests = await mockRequests();
@@ -910,13 +932,26 @@ test('HTTPS www receiver and source are spoken as domains without changing origi
     await answerWhen(panel, 'How should I describe this image?', 0);
     await expect(panel.locator('#ask-question')).toContainText('The receiver is opencode.ai');
     await expect(panel.locator('#ask-sites')).toBeHidden();
+    const receiverEntries = async () => (await announcementEntries(panel))
+      .filter((entry) => entry.includes('The receiver is opencode.ai')).length;
+    // The question's own first reading must land before the baseline, or it
+    // alone would satisfy the check below even if Repeat did nothing.
+    await expect.poll(receiverEntries).toBe(1);
     const beforeRepeat = (await announcementEntries(panel)).length;
     await panel.locator('#repeat').click();
-    await expect.poll(async () => (await announcementEntries(panel)).length).toBeGreaterThan(beforeRepeat);
+    await expect.poll(receiverEntries).toBe(2);
+    // Let the repeated reading's hold run out. The queue writes its next
+    // message in the same step that clears the region, so an empty region
+    // means nothing queued behind the repeat is still unwritten.
+    await expect(panel.locator('#sr-status')).toHaveText('');
     const repeated = (await announcementEntries(panel)).slice(beforeRepeat).join(' ');
-    expect(repeated).toContain('opencode.ai');
     expect(repeated).not.toContain('https://www');
-    await expect(panel.locator('#sr-alert')).toHaveText('');
+    // The previous question was answered before this one appeared; its reading
+    // must not surface afterwards.
+    expect(repeated).not.toContain('How should I describe this image?');
+    // Cleared after its hold, so the hidden region never becomes a second,
+    // stale copy of the transcript in the accessibility tree.
+    await expect(panel.locator('#sr-status')).toHaveText('');
 
     // Screenshot capture needs the page tab active; clicking the panel through
     // Playwright does not bring the panel tab to the front.
@@ -1050,6 +1085,36 @@ test('reasoning effort saves without clearing the key and reaches each protocol'
     requests = (await mockRequests()).slice(count);
     expect(requests.every((request) => request.body.reasoning_effort === undefined)).toBe(true);
     expect(requests.every((request) => request.body.output_config === undefined)).toBe(true);
+  } finally {
+    await context.close();
+  }
+});
+
+test('a reader-only save is announced and leaves the running turn alone', async () => {
+  const { context, extensionId } = await launch();
+  try {
+    await resetMock();
+    await openFixture(context, '/article');
+    const panel = await openPanel(context, extensionId);
+    await expect(panel.locator('#page-line')).toContainText('Event schedule');
+
+    await sendText(panel, 'What is this page about?');
+    await expect(panel.locator('#ask-question')).toContainText('page text');
+    const requestsBefore = (await mockRequests()).length;
+
+    await panel.locator('#settings-toggle').click();
+    await panel.locator('#screen-reader').selectOption('nvda');
+    await panel.locator('#save-settings').click();
+    await expect(panel.locator('#settings-status')).toContainText('Saved');
+    await expect.poll(() => announcementEntries(panel)).toContain('Settings saved.');
+    expect(await panel.evaluate(async () => (await chrome.storage.local.get('screenReader')).screenReader))
+      .toBe('nvda');
+
+    // Nothing reached the model, so the open question and its turn continue.
+    expect((await mockRequests()).length).toBe(requestsBefore);
+    await answerWhen(panel, 'page text', 0);
+    await expect(panel.locator('#transcript')).toContainText('Event schedule', { timeout: 30_000 });
+    await expect(panel.locator('#transcript')).toContainText('What is this page about?');
   } finally {
     await context.close();
   }
@@ -1569,7 +1634,6 @@ test('a background close notification performs cleanup without closing natively'
     );
     await expect.poll(async () => await announcements(panel))
       .toContain('Could not close the assistant. native close failed');
-    await expect(panel.locator('#sr-alert')).toHaveText('Could not close the assistant. native close failed');
     expect(await panel.evaluate(() => window.__closeCalls.length)).toBe(0);
   } finally {
     await context.close();

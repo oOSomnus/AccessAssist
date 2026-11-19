@@ -25,19 +25,21 @@ function cumulativeEvent(items) {
   return { results, resultIndex: 0 };
 }
 
-function fakeLog() {
-  const entries = [];
+function fakeLive() {
+  const children = [];
   return {
-    entries,
-    getAttribute(name) { return name === 'role' ? 'log' : null; },
-    append(node) { entries.push(node); },
-    get textContent() { return entries.map((node) => node.textContent).join(''); },
-    set textContent(value) {
-      entries.length = 0;
-      if (value) entries.push({ textContent: String(value) });
-    },
+    children,
     ownerDocument: {
       createElement() { return { textContent: '' }; },
+    },
+    replaceChildren(...nodes) {
+      children.length = 0;
+      children.push(...nodes);
+    },
+    get textContent() { return children.map((node) => node.textContent).join(''); },
+    set textContent(value) {
+      children.length = 0;
+      if (value) children.push({ textContent: String(value) });
     },
   };
 }
@@ -878,73 +880,275 @@ test('microphone requests share one pending prompt, stop tracks, and propagate r
   }
 });
 
-test('screen-reader delivery appends every message to the log and never speaks', async () => {
-  const control = fakeBrowser();
-  const statusEl = fakeLog();
-  const alertEl = { textContent: '' };
+// Tracks a queued announcement without awaiting it: a queued message settles
+// only once it is written or withdrawn, which needs the mocked clock to move.
+function track(promise) {
+  const box = { outcome: undefined };
+  promise.then((outcome) => { box.outcome = outcome; });
+  return box;
+}
+const settle = async () => {
+  for (let index = 0; index < 4; index += 1) await Promise.resolve();
+};
+
+test('one live region carries every message in order and is cleared after its hold', async (t) => {
+  fakeBrowser();
+  t.mock.timers.enable({ apis: ['setTimeout', 'Date'] });
+  const liveEl = fakeLive();
   try {
     const speech = new Speech();
-    speech.attach({ statusEl, alertEl });
+    speech.attach({ liveEl });
+    // An idle queue writes at once.
     const normal = await speech.announce('An ordinary answer.');
     assert.deepEqual(normal, { delivered: true, interrupted: false, reason: null });
-    assert.deepEqual(statusEl.entries.map((entry) => entry.textContent), ['An ordinary answer.']);
+    assert.equal(liveEl.textContent, 'An ordinary answer.');
+    // One mutation per message: an empty-then-fill write makes some readers
+    // announce the same text twice.
+    assert.equal(liveEl.children.length, 1);
 
-    const status = await speech.announce('working');
-    assert.deepEqual(status, { delivered: true, interrupted: false, reason: null });
-    // Identical messages remain distinct additions so a screen reader reads
-    // each one instead of seeing an unchanged region.
-    await speech.announce('working');
-    assert.deepEqual(statusEl.entries.map((entry) => entry.textContent), [
-      'An ordinary answer.',
-      'working',
-      'working',
+    // A queued message waits instead of overwriting one that may be unread,
+    // and is not reported delivered until it is written.
+    const status = track(speech.announce('working'));
+    await settle();
+    assert.equal(status.outcome, undefined);
+    assert.equal(liveEl.textContent, 'An ordinary answer.');
+
+    t.mock.timers.tick(10_000);
+    await settle();
+    assert.equal(liveEl.textContent, 'working');
+    assert.deepEqual(status.outcome, { delivered: true, interrupted: false, reason: null });
+
+    // Cleared so the hidden region never becomes a browsable second copy of
+    // the transcript.
+    t.mock.timers.tick(10_000);
+    assert.equal(liveEl.textContent, '');
+    assert.equal(liveEl.children.length, 0);
+  } finally {
+    t.mock.timers.reset();
+    clearBrowser();
+  }
+});
+
+test('an urgent message drops what is still pending and never cuts off the current one', async (t) => {
+  fakeBrowser();
+  t.mock.timers.enable({ apis: ['setTimeout', 'Date'] });
+  const liveEl = fakeLive();
+  try {
+    const speech = new Speech();
+    speech.attach({ liveEl });
+    await speech.announce('Reading the page.');
+    const second = track(speech.announce('Second.'));
+    const third = track(speech.announce('Third.'));
+    const urgent = track(speech.announce('Microphone permission was revoked.', { urgent: true }));
+    await settle();
+    // Second and Third described a state the urgent message supersedes, and
+    // their callers learn they were never written.
+    assert.deepEqual(second.outcome, { delivered: false, interrupted: false, reason: 'withdrawn' });
+    assert.equal(third.outcome.delivered, false);
+    // The message already with the reader is never interrupted.
+    assert.equal(liveEl.textContent, 'Reading the page.');
+    assert.equal(urgent.outcome, undefined);
+
+    t.mock.timers.tick(10_000);
+    await settle();
+    assert.equal(liveEl.textContent, 'Microphone permission was revoked.');
+    assert.equal(urgent.outcome.delivered, true);
+
+    t.mock.timers.tick(10_000);
+    assert.equal(liveEl.textContent, '');
+  } finally {
+    t.mock.timers.reset();
+    clearBrowser();
+  }
+});
+
+test('an urgent message goes ahead of an open question without discarding it', async (t) => {
+  fakeBrowser();
+  t.mock.timers.enable({ apis: ['setTimeout', 'Date'] });
+  const liveEl = fakeLive();
+  try {
+    const speech = new Speech();
+    speech.attach({ liveEl });
+    await speech.announce('Reading the page.');
+    const question = track(speech.announce('Allow upload? Choice 1. Allow.', { tag: 'choice:a' }));
+    const status = track(speech.announce('Superseded.'));
+    speech.writeStatus('Microphone permission was revoked.', true);
+    await settle();
+    assert.equal(status.outcome.delivered, false);
+    // The question's own caller is still waiting for it, not told it failed.
+    assert.equal(question.outcome, undefined);
+
+    const heard = [];
+    for (let step = 0; step < 3; step += 1) {
+      t.mock.timers.tick(10_000);
+      heard.push(liveEl.textContent);
+    }
+    await settle();
+    assert.deepEqual(heard, [
+      'Microphone permission was revoked.',
+      'Allow upload? Choice 1. Allow.',
+      '',
     ]);
-
-    const alert = await speech.announce('Failed.', { alert: true });
-    assert.equal(alert.delivered, true);
-    assert.equal(alertEl.textContent, 'Failed.');
-    assert.equal(statusEl.entries.length, 3);
-
-    speech.clearStatus();
-    assert.equal(statusEl.entries.length, 0);
+    assert.equal(question.outcome.delivered, true);
   } finally {
+    t.mock.timers.reset();
     clearBrowser();
   }
 });
 
-test('a single-value status target still shows only the latest message', async () => {
+test('a withdrawn message is never written, but the one being read is not cut off', async (t) => {
   fakeBrowser();
-  const statusEl = { textContent: '' };
+  t.mock.timers.enable({ apis: ['setTimeout', 'Date'] });
+  const liveEl = fakeLive();
   try {
     const speech = new Speech();
-    speech.attach({ statusEl, alertEl: { textContent: '' } });
+    speech.attach({ liveEl });
+    await speech.announce('Allow these sources? Choice 1. Allow.', { tag: 'choice:a' });
+    const pending = track(speech.announce('How should I describe this image? Choice 1. Read it.', { tag: 'choice:b' }));
+    void speech.announce('Selected option 1: Allow.');
+    // Question b was answered while its reading still waited; question a is
+    // already in the region.
+    speech.dropPending('choice:b');
+    speech.dropPending('choice:a');
+    await settle();
+    assert.equal(pending.outcome.delivered, false);
+    assert.equal(liveEl.textContent, 'Allow these sources? Choice 1. Allow.');
+
+    t.mock.timers.tick(10_000);
+    assert.equal(liveEl.textContent, 'Selected option 1: Allow.');
+    t.mock.timers.tick(10_000);
+    assert.equal(liveEl.textContent, '');
+
+    // Untagged messages cannot be withdrawn by accident.
     await speech.announce('First.');
-    await speech.announce('Second.');
-    assert.equal(statusEl.textContent, 'Second.');
+    void speech.announce('Second.');
+    speech.dropPending(null);
+    speech.dropPending(undefined);
+    t.mock.timers.tick(10_000);
+    assert.equal(liveEl.textContent, 'Second.');
+  } finally {
+    t.mock.timers.reset();
+    clearBrowser();
+  }
+});
+
+test('urgent messages keep the order they were raised in', async (t) => {
+  fakeBrowser();
+  t.mock.timers.enable({ apis: ['setTimeout', 'Date'] });
+  const liveEl = fakeLive();
+  try {
+    const speech = new Speech();
+    speech.attach({ liveEl });
+    await speech.announce('Reading the page.');
+    void speech.announce('Superseded.');
+    // Two failures in a row: the user must hear the cause before its
+    // consequence, not the reverse.
+    void speech.announce('The microphone was disconnected.', { urgent: true });
+    void speech.announce('Listening stopped.', { urgent: true });
+    // A later ordinary message is not something either failure supersedes.
+    void speech.announce('Choose Listen to try again.');
+    assert.equal(liveEl.textContent, 'Reading the page.');
+
+    const heard = [];
+    for (let step = 0; step < 4; step += 1) {
+      t.mock.timers.tick(10_000);
+      heard.push(liveEl.textContent);
+    }
+    assert.deepEqual(heard, [
+      'The microphone was disconnected.',
+      'Listening stopped.',
+      'Choose Listen to try again.',
+      '',
+    ]);
+  } finally {
+    t.mock.timers.reset();
+    clearBrowser();
+  }
+});
+
+test('an identical message is written again as a fresh node', async (t) => {
+  fakeBrowser();
+  t.mock.timers.enable({ apis: ['setTimeout', 'Date'] });
+  const liveEl = fakeLive();
+  try {
+    const speech = new Speech();
+    speech.attach({ liveEl });
+    await speech.announce('I heard: yes');
+    assert.equal(liveEl.textContent, 'I heard: yes');
+    t.mock.timers.tick(10_000);
+    assert.equal(liveEl.textContent, '');
+
+    // An unchanged region says nothing; the clear plus a new node is what
+    // makes a repeat reach the reader.
+    await speech.announce('I heard: yes');
+    assert.equal(liveEl.textContent, 'I heard: yes');
+    assert.equal(liveEl.children.length, 1);
+  } finally {
+    t.mock.timers.reset();
+    clearBrowser();
+  }
+});
+
+test('a target without replaceChildren still shows the message', async () => {
+  fakeBrowser();
+  const liveEl = { textContent: '' };
+  try {
+    const speech = new Speech();
+    speech.attach({ liveEl });
+    await speech.announce('First.');
+    assert.equal(liveEl.textContent, 'First.');
   } finally {
     clearBrowser();
   }
 });
 
-test('repeating the same alert text clears the channel first', async () => {
+test('clearing the status drops every queued message and settles its caller', async (t) => {
   fakeBrowser();
-  let value = '';
-  let clears = 0;
-  const alertEl = {
-    get textContent() { return value; },
-    set textContent(next) {
-      if (next === '') clears += 1;
-      value = String(next);
-    },
-  };
+  t.mock.timers.enable({ apis: ['setTimeout', 'Date'] });
+  const liveEl = fakeLive();
   try {
     const speech = new Speech();
-    speech.attach({ statusEl: { textContent: '' }, alertEl });
-    await speech.announce('I heard: yes', { alert: true });
-    await speech.announce('I heard: yes', { alert: true });
-    assert.equal(clears, 2);
-    assert.equal(value, 'I heard: yes');
+    speech.attach({ liveEl });
+    await speech.announce('First.');
+    const second = track(speech.announce('Second.'));
+    speech.clearStatus();
+    await settle();
+    // No caller is left waiting on a message that will never be written.
+    assert.equal(second.outcome.delivered, false);
+    assert.equal(liveEl.textContent, '');
+    t.mock.timers.tick(10_000);
+    assert.equal(liveEl.textContent, '');
   } finally {
+    t.mock.timers.reset();
+    clearBrowser();
+  }
+});
+
+test('a cancel that keeps a tag lets that message through and does not cut it off', async (t) => {
+  fakeBrowser();
+  t.mock.timers.enable({ apis: ['setTimeout', 'Date'] });
+  const liveEl = fakeLive();
+  try {
+    const speech = new Speech();
+    speech.attach({ liveEl });
+    await speech.announce('Stale.');
+    const question = track(speech.announce('Allow upload? Choice 1. Allow.', { tag: 'choice:a' }));
+    const other = track(speech.announce('Also stale.'));
+    speech.cancelQueue({ keep: ['choice:a', null] });
+    await settle();
+    // The stale message in the region gives way; the kept question goes next.
+    assert.equal(liveEl.textContent, 'Allow upload? Choice 1. Allow.');
+    assert.equal(question.outcome.delivered, true);
+    assert.equal(other.outcome.delivered, false);
+
+    // A kept message already in the region keeps its hold.
+    void speech.announce('Queued after.');
+    speech.cancelQueue({ keep: ['choice:a'] });
+    assert.equal(liveEl.textContent, 'Allow upload? Choice 1. Allow.');
+    t.mock.timers.tick(10_000);
+    assert.equal(liveEl.textContent, '');
+  } finally {
+    t.mock.timers.reset();
     clearBrowser();
   }
 });
@@ -956,7 +1160,7 @@ test('a missing live target is not delivered and an empty announcement is a no-o
     assert.deepEqual(await speech.announce('Nowhere to write.'), {
       delivered: false,
       interrupted: false,
-      reason: null,
+      reason: 'no-region',
     });
     assert.deepEqual(await speech.announce('   '), {
       delivered: true,
@@ -1371,6 +1575,83 @@ test('the working tone repeats on one timer and stops immediately', async (t) =>
   }
 });
 
+test('the working tone stays silent while a message still holds the reader', async (t) => {
+  const control = fakeBrowser({ audio: 'running' });
+  t.mock.timers.enable({ apis: ['setTimeout', 'Date'] });
+  const flush = async () => {
+    for (let index = 0; index < 6; index += 1) await Promise.resolve();
+  };
+  const liveEl = fakeLive();
+  try {
+    const speech = new Speech();
+    speech.attach({ liveEl });
+    speech.setWorking(true);
+    // Six words: a hold well past the 400 ms the tone would otherwise wait.
+    await speech.announce('This answer holds the reader briefly.');
+    t.mock.timers.tick(400);
+    await flush();
+    // A tone here would play over the message.
+    assert.equal(control.oscillators.length, 0);
+
+    t.mock.timers.tick(3_000);
+    await flush();
+    assert.equal(control.oscillators.length, 2);
+  } finally {
+    t.mock.timers.reset();
+    clearBrowser();
+  }
+});
+
+test('a message entering the region cuts a sounding tone and the tone resumes after', async (t) => {
+  const control = fakeBrowser({ audio: 'running' });
+  t.mock.timers.enable({ apis: ['setTimeout', 'Date'] });
+  const flush = async () => {
+    for (let index = 0; index < 6; index += 1) await Promise.resolve();
+  };
+  const liveEl = fakeLive();
+  try {
+    const speech = new Speech();
+    speech.attach({ liveEl });
+    speech.setWorking(true);
+    t.mock.timers.tick(400);
+    await flush();
+    assert.equal(control.oscillators.length, 2);
+    const stopsBefore = control.immediateStops;
+
+    await speech.announce('An answer arrives mid tone.');
+    assert.equal(control.immediateStops - stopsBefore, 2);
+    // The request itself stays active.
+    assert.equal(speech.workingActive, true);
+
+    t.mock.timers.tick(10_000);
+    await flush();
+    assert.ok(control.oscillators.length > 2);
+  } finally {
+    t.mock.timers.reset();
+    clearBrowser();
+  }
+});
+
+test('a tone waiting on audio resume does not start over a message written meanwhile', async (t) => {
+  const control = fakeBrowser({ audio: 'suspended', resume: true });
+  t.mock.timers.enable({ apis: ['setTimeout', 'Date'] });
+  const liveEl = fakeLive();
+  try {
+    const speech = new Speech();
+    speech.attach({ liveEl });
+    speech.workingActive = true;
+    const token = speech.workingToken;
+    const group = speech.playWorkingGroup(token);
+    // Written while resumeAudio() is still pending.
+    await speech.announce('Written during resume.');
+    await group;
+    assert.equal(control.oscillators.length, 0);
+  } finally {
+    t.mock.timers.reset();
+    clearBrowser();
+  }
+});
+
 test('cancelling before capture resolves leaves no live input and the next request listens once', async () => {
   const control = fakeBrowser({ gum: 'pending', audio: 'running' });
   try {
@@ -1405,10 +1686,10 @@ test('cancelling before capture resolves leaves no live input and the next reque
 
 test('a newer announcement is delivered without reviving the old capture', async () => {
   const control = fakeBrowser({ gum: 'pending' });
-  const statusEl = fakeLog();
+  const liveEl = fakeLive();
   try {
     const speech = new Speech();
-    speech.attach({ statusEl, alertEl: { textContent: '' } });
+    speech.attach({ liveEl });
     speech.localAvailable = true;
     const pending = speech.startListening({});
     await tick();
@@ -1416,9 +1697,7 @@ test('a newer announcement is delivered without reviving the old capture', async
 
     const answer = await speech.announce('An answer replaces the capture.');
     assert.equal(answer.delivered, true);
-    assert.deepEqual(statusEl.entries.map((entry) => entry.textContent), [
-      'An answer replaces the capture.',
-    ]);
+    assert.equal(liveEl.textContent, 'An answer replaces the capture.');
 
     assert.equal((await pending).cancelled, true);
     control.releaseGum();
@@ -1688,11 +1967,11 @@ test('voice setup view keeps every status sentence', () => {
   const cases = [
     [{ ...base, surface: 'panel' }, 'Speech is ready. Press X to listen.'],
     [{ ...base, surface: 'panel', failed: true }, 'Voice is not ready. Choose Retry to try again.'],
-    [{ ...base, surface: 'panel', mic: 'prompt' }, 'Voice needs microphone permission. Choose Prepare voice to start.'],
+    [{ ...base, surface: 'panel', mic: 'prompt' }, 'Voice needs microphone permission. Choose Set up voice to start.'],
     [{ ...base, surface: 'panel', mic: 'denied' }, 'Microphone access is denied. Allow it in Chrome site settings and system settings, then choose Retry.'],
     [{ ...base, surface: 'panel', local: 'unavailable' }, 'This Chrome cannot recognize speech on this device. Choose Retry after enabling local speech.'],
     [{ ...base, surface: 'panel', local: 'error' }, 'Chrome could not check the English speech pack. Choose Retry.'],
-    [{ ...base, surface: 'panel', local: 'downloadable' }, 'The English speech pack is not ready. Choose Prepare voice to start.'],
+    [{ ...base, surface: 'panel', local: 'downloadable' }, 'The English speech pack is not ready. Choose Set up voice to start.'],
     [{ ...base, surface: 'panel', local: 'downloading' }, 'Chrome is downloading the English speech pack. Voice will be ready when it finishes.'],
     [{ ...base, surface: 'panel', preparing: true, mic: 'prompt' }, 'Chrome is preparing the English speech pack and will ask for the microphone.'],
     [{ ...base, surface: 'setup', ready: true }, 'Microphone access is granted. Speech is ready on this device.'],
@@ -1711,6 +1990,15 @@ test('voice setup view keeps every status sentence', () => {
   }
 });
 
+test('a failed attempt with a downloadable pack names the Retry control it shows', () => {
+  const base = { local: 'downloadable', mic: 'prompt', ready: false, preparing: false, failed: true, listen: 'Press X to listen' };
+  for (const surface of ['panel', 'setup']) {
+    const view = voiceSetupView({ ...base, surface });
+    assert.equal(view.startLabel, '1 Retry', surface);
+    assert.equal(view.status, 'Voice is not ready. Choose Retry to try again.', surface);
+  }
+});
+
 test('a downloading pack says so and hides Prepare voice', () => {
   const base = { local: 'available', mic: 'granted', ready: false, preparing: false, failed: false, listen: 'Press X to listen' };
   const downloading = 'Chrome is downloading the English speech pack. Voice will be ready when it finishes.';
@@ -1719,9 +2007,12 @@ test('a downloading pack says so and hides Prepare voice', () => {
     assert.equal(busy.status, downloading, surface);
     assert.equal(busy.startHidden, true, surface);
     const ready = voiceSetupView({ ...base, surface, local: 'downloadable' });
-    assert.match(ready.status, /Choose Prepare voice/u, surface);
     assert.equal(ready.startHidden, false, surface);
-    assert.equal(ready.startLabel, '1 Prepare voice', surface);
+    // The panel must not offer a second "1 Prepare voice": the composer's
+    // Listen button already carries that name while voice is unready.
+    const label = surface === 'setup' ? '1 Prepare voice' : '1 Set up voice';
+    assert.match(ready.status, new RegExp(`Choose ${label.slice(2)}`, 'u'), surface);
+    assert.equal(ready.startLabel, label, surface);
   }
 });
 
@@ -1735,6 +2026,7 @@ test('voice setup view hides the right controls', () => {
   assert.equal(retry.startLabel, '1 Retry');
   const busy = voiceSetupView({ ...base, surface: 'panel', preparing: true });
   assert.equal(busy.startHidden, true);
-  assert.equal(busy.startLabel, '1 Prepare voice');
+  assert.equal(busy.startLabel, '1 Set up voice');
+  assert.equal(voiceSetupView({ ...base, surface: 'setup', preparing: true }).startLabel, '1 Prepare voice');
   assert.equal(voiceSetupView({ ...base, surface: 'setup', ready: true }).returnHidden, false);
 });

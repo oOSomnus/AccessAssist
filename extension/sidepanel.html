@@ -25,7 +25,7 @@
     <div class="panel-content">
       <section id="conversation" aria-labelledby="transcript-heading">
         <h2 id="transcript-heading" class="visually-hidden">Conversation</h2>
-        <ol id="transcript" class="transcript" aria-label="Conversation"></ol>
+        <ol id="transcript" class="transcript"></ol>
         <p class="conversation-empty">Ask about this page, an image, or a task.</p>
       </section>
 
@@ -33,6 +33,9 @@
         <h2 id="ask-heading">Your choice</h2>
         <p id="ask-question"></p>
         <ol id="ask-sites" aria-label="Source sites" hidden></ol>
+        <!-- Named by the question, so focus that lands straight on an option
+             still hears what it answers once the live region has cleared.
+             Each button keeps its visible text as its own name. -->
         <div id="ask-options" role="group" aria-labelledby="ask-question"></div>
         <p id="choice-shortcut-hint" class="hint">Press Control plus Shift plus a number to choose. Press Escape to cancel.</p>
       </section>
@@ -44,6 +47,16 @@
           <input id="api-key" name="apiKey" type="password" autocomplete="off" spellcheck="false">
           <p class="hint">Billing and access are handled by OpenCode Go. The field clears after saving; the key is never read aloud.</p>
           <p class="hint"><a href="https://opencode.ai/console" target="_blank" rel="noreferrer" data-number="1">1 Get an API key</a>. Sign in, subscribe to Go if needed, copy the key, then paste it here. <a href="https://opencode.ai/docs/go/" target="_blank" rel="noreferrer" data-number="2">2 Go help</a>.</p>
+
+          <label for="screen-reader">Screen reader</label>
+          <select id="screen-reader" name="screenReader" aria-describedby="screen-reader-hint">
+            <option value="auto">Detect from this system</option>
+            <option value="narrator">Narrator</option>
+            <option value="nvda">NVDA</option>
+            <option value="jaws">JAWS</option>
+            <option value="voiceover">VoiceOver</option>
+          </select>
+          <p id="screen-reader-hint" class="hint">Used only to give the right keys when you explore an image yourself. Detecting from this system can only tell Windows from macOS, so set it if you use NVDA or JAWS.</p>
 
           <details id="advanced-api">
             <summary data-number="3">3 Advanced API settings</summary>
@@ -90,7 +103,7 @@
           <ul class="hint">
             <li>Choose options with Control + Shift + 1 to 9 on the top row. These keys stay the same when entry shortcuts change.</li>
             <li>Plain digits stay with your screen reader.</li>
-            <li>Use your screen reader to stop speech already being read.</li>
+            <li>Press Control on its own to stop speech already being read. This works in VoiceOver, Narrator, NVDA, and JAWS. AccessAssist never uses Control by itself, so it stays yours.</li>
           </ul>
           <p class="hint">View or change bindings at <code>chrome://extensions/shortcuts</code>.</p>
         </section>
@@ -112,7 +125,8 @@
       </section>
     </div>
 
-    <div id="composer">
+    <div id="composer" role="region" aria-labelledby="actions-heading">
+      <h2 id="actions-heading" class="visually-hidden">Actions</h2>
       <div class="buttons" data-number-scope="composer">
         <button id="listen" type="button" data-number="1">1 Prepare voice</button>
         <button id="pause" type="button" data-number="2">2 Stop listening</button>
@@ -123,8 +137,11 @@
     </div>
   </main>
 
-  <div id="sr-status" role="log" aria-label="Assistant announcements" aria-live="polite" aria-relevant="additions" aria-atomic="false" class="visually-hidden"></div>
-  <div id="sr-alert" role="alert" class="visually-hidden"></div>
+  <!-- One channel for every announcement, so both screen readers speak the same
+       messages in the same order. Each message is announced once and then
+       cleared: the transcript above is the durable copy, and a region that kept
+       its history would be a second, stale copy to wander into. -->
+  <div id="sr-status" role="status" aria-live="polite" aria-atomic="true" aria-relevant="additions" class="visually-hidden"></div>
 
   <script type="module" src="sidepanel.js"></script>
 </body>
