@@ -2463,16 +2463,31 @@ function focusEntryTarget({ requestWindowFocus = true } = {}) {
   // from the page; automatic replies keep deferring to the current control.
   if (requestWindowFocus) window.focus();
   state.deferChoiceFocus = false;
-  if (!$('ask').hidden) {
-    const first = $('ask-options').querySelector('button');
-    if (first) {
-      state.mode = 'idle';
-      updateModeLine();
-      if (document.activeElement !== first) first.focus();
-      return;
-    }
+  const target = entryControl();
+  if (target !== $('listen')) {
+    state.mode = 'idle';
+    updateModeLine();
+    if (document.activeElement !== target) target.focus();
+    return;
   }
   focusListen();
+}
+
+// The control an entry lands on: the first option of an open question, else Listen.
+function entryControl() {
+  if (!$('ask').hidden) {
+    const first = $('ask-options').querySelector('button');
+    if (first) return first;
+  }
+  return $('listen');
+}
+
+// Focus only. The claim may still fail, so this interrupts no output or voice
+// and leaves the mode alone; handleEntryIntent does that once the claim holds.
+function focusEntryControl() {
+  window.focus();
+  const target = entryControl();
+  if (document.activeElement !== target) target.focus();
 }
 
 // Both entry shortcuts are explicit requests for the panel, so both take focus
@@ -2980,7 +2995,7 @@ function receiveEntryIntent(intent) {
   // storage would leave keyboard focus on the page, and a reader arriving late
   // talks over "Listening.". Cold-start handling in handleEntryIntent still
   // focuses again after initialization.
-  if (focusesBeforeClaim(intent)) focusEntryTarget();
+  if (focusesBeforeClaim(intent)) focusEntryControl();
   claimEntry(intent.id);
 }
 

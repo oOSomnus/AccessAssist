@@ -9,6 +9,7 @@ import {
   endCue,
   launch,
   mockRequests,
+  notifyIntent,
   openFirstUsePanel,
   openFixture,
   openPanel,
@@ -474,6 +475,36 @@ test('a warm listen shortcut focuses Listen before its claim, asking for the win
     await expect.poll(async () => (await voiceState(panel)).starts).toBe(1);
     await expect(panel.locator('#listen')).toBeFocused();
     expect(await panel.evaluate(() => window.__aaWindowFocus)).toBe(1);
+  } finally {
+    await context.close();
+  }
+});
+
+test('an unclaimable listen notification moves focus but keeps the running listen', async () => {
+  const { context, extensionId, worker } = await launch();
+  try {
+    await resetMock();
+    await openFixture(context, '/article');
+    const panel = await openPanel(context, extensionId);
+    await sendIntent(worker, intent('running-listen'));
+    await expect(panel.locator('#mode-line')).toContainText('Listening. Speak now.');
+    await panel.locator('#close-panel').focus();
+    const before = await voiceState(panel);
+
+    // A notification with no stored intent behind it never wins the claim, so
+    // the early focus must not cancel the listen or change the mode.
+    const windowId = await worker.evaluate(async () => {
+      const tabs = await chrome.tabs.query({});
+      return tabs.find((tab) => /^https?:/u.test(tab.url ?? '')).windowId;
+    });
+    await notifyIntent(worker, { ...intent('never-stored'), windowId, at: Date.now() });
+    await expect(panel.locator('#listen')).toBeFocused();
+    await panel.waitForTimeout(300);
+    const after = await voiceState(panel);
+    expect(after.active).toBe(true);
+    expect(after.aborts).toBe(before.aborts);
+    expect(after.starts).toBe(before.starts);
+    await expect(panel.locator('#mode-line')).toContainText('Listening. Speak now.');
   } finally {
     await context.close();
   }
