@@ -376,6 +376,9 @@
   // panel. Only those keys, only then, and only real key presses; every other
   // key, and these keys at any other time, stay the page's.
   let choiceKeys = null;
+  // Bumped by every broadcast, so a reply to an older request cannot undo a
+  // newer question's keys.
+  let choiceKeysVersion = 0;
   function applyChoiceKeys(value) {
     const numbers = Array.isArray(value?.numbers) ? value.numbers.filter((n) => /^[1-9]$/u.test(n)) : [];
     choiceKeys = typeof value?.choiceId === 'string' && numbers.length
@@ -389,15 +392,19 @@
     if (!match || !choiceKeys.numbers.has(match[1])) return;
     event.preventDefault();
     event.stopImmediatePropagation();
+    const version = choiceKeysVersion;
     chrome.runtime.sendMessage({ type: 'CHOICE_KEY', choiceId: choiceKeys.choiceId, key: match[1] })
       .then((response) => {
-        if (response && 'choiceKeys' in response) applyChoiceKeys(response.choiceKeys);
+        if (response && 'choiceKeys' in response && version === choiceKeysVersion) {
+          applyChoiceKeys(response.choiceKeys);
+        }
       })
       .catch(() => {});
   }, true);
 
+  const stateVersion = choiceKeysVersion;
   chrome.runtime.sendMessage({ type: 'GET_LAUNCHER_STATE' }).then((state) => {
-    if (state && 'choiceKeys' in state) applyChoiceKeys(state.choiceKeys);
+    if (state && 'choiceKeys' in state && stateVersion === choiceKeysVersion) applyChoiceKeys(state.choiceKeys);
     if (state?.error || !validPosition(state?.position)) throw new Error(state?.error ?? 'Invalid launcher position');
     saved = { x: state.position.x, y: state.position.y };
     committed = { ...saved };
@@ -411,7 +418,10 @@
   });
 
   chrome.runtime.onMessage.addListener((message) => {
-    if (message?.type === 'CHOICE_KEYS') applyChoiceKeys(message.choiceKeys);
+    if (message?.type === 'CHOICE_KEYS') {
+      choiceKeysVersion += 1;
+      applyChoiceKeys(message.choiceKeys);
+    }
     if (message?.type === 'SET_LAUNCHER_POSITION') applyIncomingPosition(message.position);
     if (message?.type === 'FOCUS_LAUNCHER') {
       if (dragging) cancelDrag(false);

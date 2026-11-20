@@ -97,10 +97,9 @@ export const TOOLS = Object.freeze([
   },
   {
     name: 'describe_image',
-    description: 'Ask about an image. The extension first asks the user to choose AI reading or system screen reader guidance; it takes a screenshot only when the user chooses AI.',
+    description: 'Ask about an image. The extension first asks the user to choose AI reading ("Read it") or system screen reader guidance; it takes a screenshot only when the user chooses AI. Choosing "Read it" asks screenshot consent again even if the user declined screenshots earlier, so call this again only when the user asks about an image in a new message.',
     parameters: schema({
       id: { type: 'string' },
-      ask_again: { type: 'boolean', description: 'Only when the user explicitly asked in their newest message to read or look at the page after declining earlier: ask them once more' },
     }, ['id']),
   },
   {

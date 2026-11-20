@@ -87,7 +87,7 @@ const SYSTEM_PROMPT = [
 // Tool results for refusals. The "did not allow" wording is what the model and
 // the scripted test model both key on; the rest tells the model to stop asking.
 const TEXT_REFUSED = 'The user did not allow page text upload: they declined to share this page with the AI service. Do not ask for it again or try another tool to read it. Answer only from what the user said, or say you cannot see the page. Only if the user explicitly asks in a new message to read or look at this page, call the tool again with ask_again true.';
-const IMAGE_REFUSED = 'The user did not allow screenshot upload: they declined to share pixels of this page with the AI service. Do not ask again in this request. Only if the user explicitly asks in a new message to look at the page or image, call the tool again with ask_again true.';
+const IMAGE_REFUSED = 'The user did not allow screenshot upload: they declined to share pixels of this page with the AI service. Do not ask again in this request.';
 const DECLINED_EARLIER = 'Not asked: the user declined a question earlier in this request. Do not ask again or try another way; say briefly what was not done and stop.';
 
 const state = {
@@ -1216,8 +1216,10 @@ function finishChoice(choiceSetId, option, reason = 'answered') {
   speech.dropPending(choiceTag(current.set.id));
   current.set = closeChoiceSet(current.set, reason);
   // An expired, replaced, or reset question is not an answer; only an explicit
-  // cancel is a refusal.
-  const declined = current.declinable && (reason === 'cancelled' || option?.value === 'cancel');
+  // cancel is a refusal. A Cancel option counts only when the panel wrote it:
+  // a model's option valued "cancel" is an ordinary answer.
+  const panelCancel = current.panelOptions && option?.value === 'cancel';
+  const declined = current.declinable && (reason === 'cancelled' || panelCancel);
   if (declined) current.turn.declined = true;
   debugLog.add('choice.finish', { id: current.set.id, reason, option, declined });
   hideChoice();
@@ -1229,9 +1231,9 @@ function finishChoice(choiceSetId, option, reason = 'answered') {
     const ownerToken = sayToken;
     const ownerGeneration = state.voiceGeneration;
     feedback = (async () => {
-      await speech.play(option.value === 'cancel' ? 'cancel' : 'choose');
+      await speech.play(panelCancel ? 'cancel' : 'choose');
       if (sayToken !== ownerToken || state.voiceGeneration !== ownerGeneration) return;
-      await say(option.value === 'cancel'
+      await say(panelCancel
         ? 'Cancelled.'
         : `Selected option ${option.number}: ${option.label}.`);
     })();
@@ -1306,7 +1308,9 @@ function repeatChoice() {
 
 // declinable: Cancel, Escape, or a spoken "cancel" on this question is the
 // user saying no. That marks the turn, so the turn asks nothing more.
-function presentSet(set, { timeoutMs = 0, sourceSites = [], declinable = false } = {}) {
+// panelOptions false: the options came from the model, so none of them is the
+// panel's own Cancel.
+function presentSet(set, { timeoutMs = 0, sourceSites = [], declinable = false, panelOptions = true } = {}) {
   if (state.choice) finishChoice(state.choice.set.id, null, 'replaced');
   if (state.pendingInput) {
     // A newer instruction already replaced this turn; do not ask again.
@@ -1314,7 +1318,7 @@ function presentSet(set, { timeoutMs = 0, sourceSites = [], declinable = false }
   }
   return new Promise((resolve) => {
     const current = {
-      set, resolve, timer: null, sourceSites: [...sourceSites], declinable, turn: turns.current,
+      set, resolve, timer: null, sourceSites: [...sourceSites], declinable, panelOptions, turn: turns.current,
     };
     state.choice = current;
     debugLog.add('choice.show', { set, sourceSites: current.sourceSites, timeoutMs });
@@ -1810,8 +1814,14 @@ function drainTurns() {
       // panel, and this command must not start after it.
       const request = state.requestSeq;
       await initialTabBind;
-      await syncVisiblePage();
+      const verified = await syncVisiblePage();
       if (request !== state.requestSeq || state.pendingInput) continue;
+      // The binding may still name a page the user left; nothing reaches the
+      // model until the page on screen is known.
+      if (!verified) {
+        await say('I could not check which page is on screen, so that request did not run. Try again.');
+        continue;
+      }
       await runTurn(text);
     }
   })();
@@ -1861,8 +1871,12 @@ async function submitMessage(raw) {
   }
   if (/^(undo|undo last step|undo last)[.!?]?$/iu.test(text)) {
     const request = state.requestSeq;
-    await syncVisiblePage();
+    const verified = await syncVisiblePage();
     if (request !== state.requestSeq || state.pendingInput) return;
+    if (!verified) {
+      await say('I could not check which page is on screen, so nothing was undone. Try again.');
+      return;
+    }
     const turn = turns.next();
     state.runningTurn = turn;
     state.busy = true;
@@ -2216,7 +2230,7 @@ async function toolAskUser(call, ok, fail, turn) {
     return fail(`Invalid choices: ${error.message}`);
   }
   if (turn.declined) return fail(DECLINED_EARLIER);
-  const choice = await presentSet(set, { declinable: true });
+  const choice = await presentSet(set, { declinable: true, panelOptions: false });
   if (turn.stale) return fail('The turn was replaced before the question was answered.');
   if (!choice) {
     return fail(turn.declined
@@ -2426,7 +2440,7 @@ async function handleRemoved(tabId) {
   }
   if (state.tab?.tabId !== tabId) return;
   state.tab = null;
-  resetConversation();
+  resetConversation({ keepQueued: true });
   await refreshTab({ windowId: state.windowId });
 }
 
@@ -2436,7 +2450,9 @@ async function restoreOriginalPage(opened) {
   const deferred = context.deferredTabId;
   if (!Number.isInteger(deferred) || !opened.some((tab) => tab.tabId === deferred)) return;
   if (!Number.isInteger(context.sourceTabId)) return;
-  await send('ACTIVATE_TAB', { tabId: context.sourceTabId, windowId: context.windowId }).catch(() => {});
+  await send('ACTIVATE_TAB', {
+    tabId: context.sourceTabId, windowId: context.windowId, expectedActiveTabId: deferred,
+  }).catch(() => {});
 }
 
 // Only pages opened by this action, and only after the user chooses one, are
@@ -2605,7 +2621,10 @@ async function toolProposeAction(call, ok, fail, turn) {
       // back in front so the screen and the panel agree again.
       if (context.openedTabIds?.includes(deferred) && Number.isInteger(context.sourceTabId)
         && context.sourceTabId === state.tab?.tabId) {
-        await send('ACTIVATE_TAB', { tabId: context.sourceTabId, windowId: context.windowId }).catch(() => {});
+        // Only while that page is still in front: a tab the user picked since stays.
+        await send('ACTIVATE_TAB', {
+          tabId: context.sourceTabId, windowId: context.windowId, expectedActiveTabId: deferred,
+        }).catch(() => {});
       }
       await refreshTab({ announce: true });
     }
@@ -2708,7 +2727,11 @@ async function runGuide() {
   await say(text);
 }
 
-async function refreshTab({ announce = false, reason = '', windowId = null } = {}) {
+// Resolves 'bound' (a web page), 'unbound' (a verified tab that is not a web
+// page), 'failed' (the lookup itself failed; the old binding is unverified) or
+// 'stale' (a newer refresh owns the binding). entry, when given, is a Listen
+// entry's ownership token: this refresh's own voice cancel carries it forward.
+async function refreshTab({ announce = false, reason = '', windowId = null, entry = null } = {}) {
   const seq = ++state.refreshSeq;
   let info;
   try {
@@ -2716,17 +2739,17 @@ async function refreshTab({ announce = false, reason = '', windowId = null } = {
       windowId: windowId ?? state.windowId ?? undefined,
     });
   } catch (error) {
-    if (seq !== state.refreshSeq) return false;
+    if (seq !== state.refreshSeq) return 'stale';
     if (!error?.response) {
       $('page-line').textContent = 'Page unavailable';
       if (announce) await say(`Page unavailable: ${error.message}`, { urgent: true });
-      return false;
+      return 'failed';
     }
     info = error.response;
   }
   // A slower query must not overwrite a newer page binding.
-  if (seq !== state.refreshSeq) return false;
-  if (info.error || !info.tabId) return unbindPage(info, { announce, seq });
+  if (seq !== state.refreshSeq) return 'stale';
+  if (info.error || !info.tabId) return unbindPage(info, { announce, seq, entry });
   const previous = state.tab;
   const changed = previous?.tabId !== info.tabId || previous?.url !== info.url
     || Boolean(previous?.documentId && previous.documentId !== info.documentId);
@@ -2740,21 +2763,29 @@ async function refreshTab({ announce = false, reason = '', windowId = null } = {
   $('page-line').textContent = `Current page: ${pageName}${info.readable ? '' : ' (unreadable)'}`;
   if (changed) {
     state.pageEpoch += 1;
-    cancelVoice();
-    resetConversation();
+    cancelVoiceFor(entry);
+    resetConversation({ keepQueued: true });
     if (previous?.tabId) await send('RESET_SESSION', { tabId: previous.tabId }).catch(() => {});
-    if (seq !== state.refreshSeq) return false;
+    if (seq !== state.refreshSeq) return 'stale';
     if (announce) {
       await say(`${reason ? `${reason}. ` : ''}Current page: ${pageName}.`);
     }
   }
-  return true;
+  return 'bound';
+}
+
+// A rebind ends any voice session, but the Listen entry that asked for the
+// rebind keeps its ownership.
+function cancelVoiceFor(entry) {
+  const owned = entry && entry.seq === state.entrySeq;
+  cancelVoice();
+  if (owned) entry.seq = state.entrySeq;
 }
 
 // The tab on screen is not a web page (a new tab page, browser settings, a
 // file). The page the user left is out of sight, so it is released rather than
 // kept as a hidden target, and the user hears which page cannot be used.
-async function unbindPage(info, { announce, seq }) {
+async function unbindPage(info, { announce, seq, entry = null }) {
   const previous = state.tab;
   const shown = info.title ? spokenSites([info.title])[0] : '';
   const changed = Boolean(previous) || state.unreadablePage !== shown;
@@ -2763,33 +2794,42 @@ async function unbindPage(info, { announce, seq }) {
   $('page-line').textContent = shown ? `Current page: ${shown} (unreadable)` : 'No readable page';
   if (previous) {
     state.pageEpoch += 1;
-    cancelVoice();
-    resetConversation();
+    cancelVoiceFor(entry);
+    resetConversation({ keepQueued: true });
     await send('RESET_SESSION', { tabId: previous.tabId }).catch(() => {});
-    if (seq !== state.refreshSeq) return false;
+    if (seq !== state.refreshSeq) return 'stale';
   }
   if (announce && changed) {
     await say(shown
       ? `Current page: ${shown}. This tab is not a regular web page, so I cannot read or operate it.`
       : (info.error ?? 'No readable page.'));
   }
-  return false;
+  return 'unbound';
 }
 
 // Every request the user makes belongs to the page on screen when they make
 // it. Tab events normally keep the binding current; this re-checks at the
 // moment of the request, so a missed event can never aim a command at a page
-// the user has left.
-async function syncVisiblePage() {
-  await refreshTab({ announce: true });
+// the user has left. Resolves true once the tab on screen is known (a verified
+// non-web tab included), false when the lookup failed and the binding may be
+// stale. A refresh overtaken by a newer one is retried.
+async function syncVisiblePage({ entry = null } = {}) {
+  for (let attempt = 0; attempt < 3; attempt += 1) {
+    const outcome = await refreshTab({ announce: true, entry });
+    if (outcome !== 'stale') return outcome !== 'failed';
+  }
+  return false;
 }
 
-function resetConversation() {
-  debugLog.add('conversation.reset');
+// keepQueued: a page-binding change resets what belongs to the old page, but a
+// newer command waiting in the queue is the user's and runs on the page now on
+// screen. Explicit cancel and close clear the queue themselves.
+function resetConversation({ keepQueued = false } = {}) {
+  debugLog.add('conversation.reset', { keepQueued });
   interruptOutput();
   state.deferChoiceFocus = false;
   turns.next();
-  state.pendingInput = null;
+  if (!keepQueued) state.pendingInput = null;
   state.actionContext = null;
   if (state.choice) finishChoice(state.choice.set.id, null, 'reset');
   state.history = [];
@@ -2876,11 +2916,14 @@ async function handleEntryIntent(intent, { cold = false } = {}) {
   state.audioPaused = false;
   state.voiceRetry = false;
   // The shortcut was pressed on the page in front of the user; bind to it
-  // before anything is heard or done.
-  if (intent.mode === 'open' || intent.mode === 'voice') await syncVisiblePage();
+  // before anything is heard or done. A cancel, the Listen button or another
+  // entry during that check bumps entrySeq and takes this entry's place.
+  const entry = { seq: state.entrySeq };
+  if (intent.mode === 'open' || intent.mode === 'voice') await syncVisiblePage({ entry });
   if (intent.mode === 'open') {
     return;
   }
+  if (entry.seq !== state.entrySeq) return;
   if (intent.mode === 'intro') {
     updateModeLine();
     await speech.play('choose');
@@ -3254,8 +3297,12 @@ async function undoFromButton() {
   if (state.busy) preemptTurn();
   else interruptOutput();
   const request = state.requestSeq;
-  await syncVisiblePage();
+  const verified = await syncVisiblePage();
   if (request !== state.requestSeq || state.pendingInput) return;
+  if (!verified) {
+    await say('I could not check which page is on screen, so nothing was undone. Try again.');
+    return;
+  }
   const turn = turns.next();
   await state.turnTask;
   if (!turn.isCurrent()) return;

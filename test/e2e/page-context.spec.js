@@ -459,9 +459,25 @@ test('an open shortcut during a page text question keeps the question answerable
     await expect(panel.locator('#ask-question')).toContainText('page text');
 
     // The shortcut re-checks the page on screen; finding the same page must not
-    // invalidate the open question.
+    // invalidate the open question. Count the page lookups the panel finishes,
+    // so the answer waits for that re-check, not the notification's earlier
+    // focus change.
+    await panel.evaluate(() => {
+      const original = chrome.runtime.sendMessage.bind(chrome.runtime);
+      window.__tabInfoDone = 0;
+      chrome.runtime.sendMessage = (message, ...rest) => {
+        const reply = original(message, ...rest);
+        if (message?.type === 'GET_TAB_INFO') {
+          const done = () => { window.__tabInfoDone += 1; };
+          reply.then(done, done);
+        }
+        return reply;
+      };
+    });
     await sendIntent(worker, { id: 'open-during-consent', mode: 'open', source: 'command', tabId: 0 });
     await expect(panel.locator('#ask-options button').first()).toBeFocused();
+    await expect.poll(() => panel.evaluate(() => window.__tabInfoDone)).toBeGreaterThan(0);
+    await expect(panel.locator('#ask-question')).toContainText('page text');
     await answer(panel, 0);
     await expect(panel.locator('#transcript')).toContainText('I read Event schedule.');
   } finally {

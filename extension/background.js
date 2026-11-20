@@ -510,11 +510,14 @@ async function route(message) {
       return claim;
     }
     case 'GET_TAB_INFO': {
-      const tab = await targetTab(message.tabId, message.windowId);
+      // An explicit id inspects that tab (a candidate before activation); a
+      // window alone reads its tab on screen once, so tab and active agree.
+      const byWindow = !Number.isInteger(message.tabId) && Number.isInteger(message.windowId);
+      const visible = byWindow ? await visibleTab(message.windowId) : null;
+      const tab = byWindow ? visible.tab : await targetTab(message.tabId, message.windowId);
       if (!tab) {
         // Name the tab on screen so the panel can say which page it cannot use.
-        const shown = Number.isInteger(message.tabId) ? null
-          : Number.isInteger(message.windowId) ? (await visibleTab(message.windowId)).active : null;
+        const shown = visible?.active ?? null;
         if (shown) {
           return {
             error: 'This tab is not a regular web page, so it cannot be read or operated.',
@@ -1173,6 +1176,8 @@ async function executeProposal(tab, proposal) {
   let verified = true;
   let changed = false;
   let stepNumber = 0;
+  // Every page opened by any step of this action, in the order seen.
+  const openedTabIds = new Set();
   try {
     cdp = await debuggerSession(tab.id);
     await setLauncherHidden(cdp, true);
@@ -1215,11 +1220,12 @@ async function executeProposal(tab, proposal) {
         }
       }
       const openable = OPENABLE_STEPS.has(step.type);
+      const openedBefore = openedTabIds.size;
       if (openable) {
         activeExecutions.set(tab.id, {
           proposalId: proposal.id,
           frameId: entry.frameId,
-          openedTabIds: new Set(),
+          openedTabIds,
         });
       }
       let outcome;
@@ -1250,9 +1256,11 @@ async function executeProposal(tab, proposal) {
           failedStep = 'The user left or reset the page; remaining steps were not executed';
           break;
         }
-        if (execution && execution.openedTabIds.size) {
-          const opened = await describeOpenedTabs(tab, execution);
-          record.openedTabIds = [...execution.openedTabIds];
+        if (execution && openedTabIds.size) record.openedTabIds = [...openedTabIds];
+        // Describe only this step's pages; earlier ones were already attributed.
+        const stepTabIds = [...openedTabIds].slice(openedBefore);
+        if (execution && stepTabIds.length) {
+          const opened = await describeOpenedTabs(tab, stepTabIds);
           record.openedTabs = opened.openedTabs;
           record.openedTabsOverflow = opened.openedTabsOverflow;
           if (opened.openedTabs.length || opened.openedTabsOverflow) {
@@ -1831,8 +1839,7 @@ async function waitForCandidateHttp(tabId, timeoutMs) {
   });
 }
 
-async function describeOpenedTabs(sourceTab, execution) {
-  const ids = [...execution.openedTabIds];
+async function describeOpenedTabs(sourceTab, ids) {
   const openedTabs = [];
   for (const tabId of ids.slice(0, MAX_OPENED_TABS)) {
     const tab = await waitForCandidateHttp(tabId, OPENED_TAB_TIMEOUT_MS);
@@ -1861,6 +1868,12 @@ async function activateTab(message) {
   }
   if (tab.windowId !== message.windowId) return { error: 'The opened page moved to another window; choose the page again.' };
   if (!httpUrl(tab.url)) return { error: 'The opened page is not a regular web page' };
+  // Putting the source page back is only right while the page the action opened
+  // is still in front; a tab the user has picked since stays selected.
+  if (Number.isInteger(message.expectedActiveTabId)) {
+    const [active] = await chrome.tabs.query({ active: true, windowId: message.windowId }).catch(() => []);
+    if (active?.id !== message.expectedActiveTabId) return { ok: false, skipped: true };
+  }
   await chrome.tabs.update(tab.id, { active: true });
   await chrome.windows.update(tab.windowId, { focused: true }).catch(() => {});
   const fresh = await chrome.tabs.get(tab.id).catch(() => null);

@@ -658,12 +658,16 @@ test('a cancel confirmation still reaches a page that is out of sight', async ()
   reset();
   fakePage(51);
   const proposalId = await observeAndPropose(51);
+  assert.deepEqual(await panelMessage({ type: 'ARM_CONSENT', proposalId, choiceSetId: 'set-x' }), { ok: true });
   behavior.tab = { ...behavior.tab, active: false };
   behavior.activeTabs = [{ id: 52, windowId: 3, active: true, url: 'https://other.test/' }];
-  const response = await panelMessage({
+  const confirm = () => panelMessage({
     type: 'CONFIRM_PROPOSAL', tabId: 51, proposalId, choiceSetId: 'set-x', optionValue: 'cancel',
   });
-  assert.doesNotMatch(response.error ?? '', /no longer on screen/u);
+  assert.deepEqual(await confirm(), { ok: true, action: 'cancel' });
+  // The cancel dropped the proposal.
+  assert.match((await confirm()).error ?? '', /expired/u);
+  assert.match((await panelMessage({ type: 'ARM_CONSENT', proposalId, choiceSetId: 'set-y' })).error ?? '', /expired/u);
 });
 
 test('a keep-alive from the panel answers without side effects', async () => {
