@@ -26,7 +26,7 @@ test('an execute answer arms, presents and confirms', async () => {
     ['CONFIRM_PROPOSAL', { tabId: 7, proposalId: 'p', choiceSetId: 'set-1', optionValue: 'execute' }],
   ]);
   assert.deepEqual(result, { choice: { value: 'execute', label: 'Run' }, response: { report: { completed: 1 } } });
-  assert.deepEqual(presented.options, { timeoutMs: 120_000 });
+  assert.deepEqual(presented.options, { timeoutMs: 120_000, declinable: true });
   assert.equal(presented.set.question, 'Run this?');
 });
 

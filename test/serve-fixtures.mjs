@@ -870,10 +870,37 @@ function lastCall(context, name) {
 // newer observation than any earlier observe_page result.
 function pageOf(result) {
   try {
-    return JSON.parse(result.content).page ?? null;
+    const page = JSON.parse(result.content).page;
+    return page && typeof page === 'object' ? expandPage(page) : null;
   } catch {
     return null;
   }
+}
+
+// The panel sends targets in a compact form (see pageForModel); the scripted
+// model reads them in the full form, so it is restored here once.
+function expandPage(page) {
+  if (!page || !Array.isArray(page.targets)) return page;
+  const styles = page.styles ?? {};
+  const targets = page.targets.map((target) => {
+    const { style, near, ...rest } = target;
+    const full = {
+      ...rest,
+      name: rest.name ?? '',
+      tag: rest.tag ?? rest.role,
+      visible: rest.visible ?? true,
+      inViewport: rest.inViewport ?? true,
+    };
+    if (style) full.styleState = styles[style] ?? null;
+    if (near) {
+      full.near = {
+        above: near.above === undefined ? null : { text: near.above },
+        left: near.left === undefined ? null : { text: near.left },
+      };
+    }
+    return full;
+  });
+  return { ...page, targets };
 }
 
 function observationOf(context) {
@@ -887,7 +914,7 @@ function observationOf(context) {
     }
     if (call.name !== 'observe_page') continue;
     try {
-      return JSON.parse(result.content);
+      return expandPage(JSON.parse(result.content));
     } catch {
       return null;
     }
@@ -1040,6 +1067,23 @@ function imageScenario(context) {
   if (/screen.?reader|guide/i.test(result)) return { text: 'Okay. I gave the screen-reader guide.' };
   if (/cancel|did not allow|not allowed/i.test(result)) return { text: 'Okay. I did not read the image.' };
   return { text: 'I did not receive an image.' };
+}
+
+// Refusal check: observes, and after a refusal tries once more, as a model
+// that ignored the refusal would. The panel must answer that retry itself.
+// "read this page again" is an explicit new request, so it sends ask_again.
+function refusalScenario(context) {
+  const observes = context.calls.filter((call) => call.name === 'observe_page');
+  const results = observes.map((call) => context.results.get(call.id)?.content ?? '');
+  const observation = observationOf(context);
+  if (observation) return { text: `I read ${observation.title}.` };
+  if (!observes.length) {
+    return toolReply(context, 'observe_page', /read this page again/iu.test(context.lastUser) ? { ask_again: true } : {});
+  }
+  if (observes.length === 1 && results.every((result) => /did not allow/u.test(result))) {
+    return toolReply(context, 'observe_page', {});
+  }
+  return { text: 'I could not read this page.' };
 }
 
 function submitScenario(context) {
@@ -1666,6 +1710,7 @@ function decide(context) {
   if (/interaction (fill name|clear name|autocomplete|long note|huge archive note|readonly code|focus stealing|rich note|keys|meta enter|control a|tab|date|clipboard)/iu.test(current)) {
     return inputsScenario(context);
   }
+  if (/refusal check/iu.test(current)) return refusalScenario(context);
   if (/intermediate message/iu.test(current)) return intermediateScenario(context);
   if (/observe twice/iu.test(current)) return observeTwiceScenario(context);
   const late = /late name change at (\d+)/iu.exec(current);

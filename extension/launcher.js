@@ -1,5 +1,6 @@
 // Always-available entrance. This script never reads the page, records audio
-// or calls the model; it only reports a real click back to the worker.
+// or calls the model; it only reports a real click back to the worker, and,
+// while the assistant asks a question, the real number keys that answer it.
 (() => {
   if (globalThis.__accessAssistLauncher?.version === 1
     && globalThis.__accessAssistLauncher.host?.isConnected) return;
@@ -370,7 +371,40 @@
   new ResizeObserver(scheduleRender).observe(bar);
 
   render();
+  // While the assistant asks a question, Control+Shift and one of its numbers
+  // answers it from this page too: keyboard focus is often here, not in the
+  // panel. Only those keys, only then, and only real key presses; every other
+  // key, and these keys at any other time, stay the page's.
+  let choiceKeys = null;
+  // Bumped by every broadcast, so a reply to an older request cannot undo a
+  // newer question's keys.
+  let choiceKeysVersion = 0;
+  function applyChoiceKeys(value) {
+    const numbers = Array.isArray(value?.numbers) ? value.numbers.filter((n) => /^[1-9]$/u.test(n)) : [];
+    choiceKeys = typeof value?.choiceId === 'string' && numbers.length
+      ? { choiceId: value.choiceId, numbers: new Set(numbers) }
+      : null;
+  }
+  window.addEventListener('keydown', (event) => {
+    if (!choiceKeys || !event.isTrusted || event.repeat || event.isComposing) return;
+    if (!event.ctrlKey || !event.shiftKey || event.altKey || event.metaKey) return;
+    const match = /^Digit([1-9])$/u.exec(event.code ?? '');
+    if (!match || !choiceKeys.numbers.has(match[1])) return;
+    event.preventDefault();
+    event.stopImmediatePropagation();
+    const version = choiceKeysVersion;
+    chrome.runtime.sendMessage({ type: 'CHOICE_KEY', choiceId: choiceKeys.choiceId, key: match[1] })
+      .then((response) => {
+        if (response && 'choiceKeys' in response && version === choiceKeysVersion) {
+          applyChoiceKeys(response.choiceKeys);
+        }
+      })
+      .catch(() => {});
+  }, true);
+
+  const stateVersion = choiceKeysVersion;
   chrome.runtime.sendMessage({ type: 'GET_LAUNCHER_STATE' }).then((state) => {
+    if (state && 'choiceKeys' in state && stateVersion === choiceKeysVersion) applyChoiceKeys(state.choiceKeys);
     if (state?.error || !validPosition(state?.position)) throw new Error(state?.error ?? 'Invalid launcher position');
     saved = { x: state.position.x, y: state.position.y };
     committed = { ...saved };
@@ -384,6 +418,10 @@
   });
 
   chrome.runtime.onMessage.addListener((message) => {
+    if (message?.type === 'CHOICE_KEYS') {
+      choiceKeysVersion += 1;
+      applyChoiceKeys(message.choiceKeys);
+    }
     if (message?.type === 'SET_LAUNCHER_POSITION') applyIncomingPosition(message.position);
     if (message?.type === 'FOCUS_LAUNCHER') {
       if (dragging) cancelDrag(false);

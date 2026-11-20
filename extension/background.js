@@ -177,25 +177,48 @@ async function targetTab(tabId, windowId) {
     }
   }
   if (!Number.isInteger(windowId)) return null;
-  const [active] = await chrome.tabs.query({ active: true, windowId });
-  if (active && httpUrl(active.url)) return active;
-  const remembered = lastHttpTab.get(windowId);
-  if (remembered) {
-    try {
-      const tab = await chrome.tabs.get(remembered.tabId);
-      if (httpUrl(tab.url) && tab.windowId === windowId) return tab;
-    } catch {}
-    lastHttpTab.delete(windowId);
+  return (await visibleTab(windowId)).tab;
+}
+
+// The page the user sees in a window is its active tab. Only when that tab is
+// this panel's own document (the panel shown as a tab rather than docked) is
+// the last web page of that window the one it serves. A web page out of sight
+// is never substituted: acting there would act where the user cannot look.
+async function visibleTab(windowId) {
+  const [active] = await chrome.tabs.query({ active: true, windowId }).catch(() => []);
+  if (!active) return { tab: null, active: null };
+  if (httpUrl(active.url)) return { tab: active, active };
+  if (typeof active.url === 'string' && active.url.startsWith(PANEL_URL)) {
+    const remembered = lastHttpTab.get(windowId);
+    if (remembered) {
+      try {
+        const tab = await chrome.tabs.get(remembered.tabId);
+        if (httpUrl(tab.url) && tab.windowId === windowId) return { tab, active };
+      } catch {}
+      lastHttpTab.delete(windowId);
+    }
+    // A restarted worker forgets the last page; the window's most recently
+    // used web page is the one this panel tab was opened beside.
+    const tabs = await chrome.tabs.query({ windowId }).catch(() => []);
+    const newest = tabs
+      .filter((tab) => httpUrl(tab.url))
+      .sort((left, right) => (right.lastAccessed ?? 0) - (left.lastAccessed ?? 0))[0];
+    if (newest) {
+      trackTab(newest);
+      return { tab: newest, active };
+    }
   }
-  // A restarted worker or a panel opened before any page event forgets the
-  // last page; bind the window's most recently used web page instead.
-  const tabs = await chrome.tabs.query({ windowId });
-  const newest = tabs
-    .filter((tab) => httpUrl(tab.url))
-    .sort((left, right) => (right.lastAccessed ?? 0) - (left.lastAccessed ?? 0))[0];
-  if (!newest) return null;
-  trackTab(newest);
-  return newest;
+  return { tab: null, active };
+}
+
+const NOT_ON_SCREEN = 'That page is no longer on screen; the user switched to another tab. Nothing was done there.';
+
+// Every request that reads or changes a page must name the page on screen.
+async function visiblePageTab(tabId) {
+  const tab = requireTab(await targetTab(tabId));
+  const { tab: visible } = await visibleTab(tab.windowId);
+  if (visible?.id !== tab.id) throw new Error(NOT_ON_SCREEN);
+  return tab;
 }
 
 function requireTab(tab) {
@@ -302,6 +325,7 @@ chrome.commands.onCommand.addListener(async (command, tab) => {
     // Cleanup must not gate the native close: intent storage and the panel
     // message can hang or have no receiver.
     void claimIntent(windowId).catch(() => null);
+    void storeChoiceKeys(windowId, null).catch(() => {});
     void chrome.runtime.sendMessage({ type: 'CLOSE_PANEL', windowId }).catch(() => {});
     try {
       await chrome.sidePanel.close({ windowId });
@@ -425,9 +449,21 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
       sendResponse({ error: 'Unauthorized launcher message' });
       return false;
     }
+    // A page that loads while a question is open learns its keys too.
+    const keys = choiceKeysFor(sender.tab.windowId).catch(() => null);
     queueLauncher(migrateLauncherPosition)
-      .then((position) => sendResponse({ position }))
+      .then(async (position) => sendResponse({ position, choiceKeys: await keys }))
       .catch(() => sendResponse({ error: 'Could not load the Assistant button position.' }));
+    return true;
+  }
+  if (message?.type === 'CHOICE_KEY') {
+    if (!launcherSender(sender)) {
+      sendResponse({ error: 'Unauthorized launcher message' });
+      return false;
+    }
+    forwardChoiceKey(message, sender.tab)
+      .then(sendResponse)
+      .catch(() => sendResponse({ ok: false, choiceKeys: null }));
     return true;
   }
   if (message?.type === 'SET_LAUNCHER_POSITION') {
@@ -474,8 +510,22 @@ async function route(message) {
       return claim;
     }
     case 'GET_TAB_INFO': {
-      const tab = await targetTab(message.tabId, message.windowId);
-      if (!tab) return { error: 'No web page tab is available' };
+      // An explicit id inspects that tab (a candidate before activation); a
+      // window alone reads its tab on screen once, so tab and active agree.
+      const byWindow = !Number.isInteger(message.tabId) && Number.isInteger(message.windowId);
+      const visible = byWindow ? await visibleTab(message.windowId) : null;
+      const tab = byWindow ? visible.tab : await targetTab(message.tabId, message.windowId);
+      if (!tab) {
+        // Name the tab on screen so the panel can say which page it cannot use.
+        const shown = visible?.active ?? null;
+        if (shown) {
+          return {
+            error: 'This tab is not a regular web page, so it cannot be read or operated.',
+            title: shown.title || shown.url || '',
+          };
+        }
+        return { error: 'No web page tab is available' };
+      }
       trackTab(tab);
       const documentId = await topDocument(tab.id).then((top) => top.documentId).catch(() => null);
       return {
@@ -489,29 +539,40 @@ async function route(message) {
       };
     }
     case 'GET_PAGE_ORIGINS': {
-      const tab = requireTab(await targetTab(message.tabId));
+      const tab = await visiblePageTab(message.tabId);
       return pageOrigins(tab, message.expectedDocumentId);
     }
     case 'OBSERVE_PAGE': {
-      const tab = requireTab(await targetTab(message.tabId));
+      const tab = await visiblePageTab(message.tabId);
       return observePage(
         tab,
         Array.isArray(message.allowedFrameOrigins) ? message.allowedFrameOrigins : [],
         { visual: message.visual === true, expectedDocumentId: message.expectedDocumentId, cursor: message.cursor },
       );
     }
-    case 'READ_TARGET': return readTarget(requireTab(await targetTab(message.tabId)), message);
-    case 'FOCUS_TARGET': return focusTarget(requireTab(await targetTab(message.tabId)), message);
-    case 'SCROLL_PAGE': return scrollPage(requireTab(await targetTab(message.tabId)), message);
-    case 'PROPOSE_ACTION': return proposeAction(requireTab(await targetTab(message.tabId)), message);
+    case 'READ_TARGET': return readTarget(await visiblePageTab(message.tabId), message);
+    case 'FOCUS_TARGET': return focusTarget(await visiblePageTab(message.tabId), message);
+    case 'SCROLL_PAGE': return scrollPage(await visiblePageTab(message.tabId), message);
+    case 'PROPOSE_ACTION': return proposeAction(await visiblePageTab(message.tabId), message);
     case 'ARM_CONSENT': return armProposalConsent(message);
-    case 'CONFIRM_PROPOSAL': return confirmProposal(requireTab(await targetTab(message.tabId)), message);
-    case 'RUN_PROPOSAL': return runProposal(requireTab(await targetTab(message.tabId)), message);
-    case 'UNDO_REQUEST': return requestUndo(requireTab(await targetTab(message.tabId)));
-    case 'CAPTURE_TARGET': return captureTarget(requireTab(await targetTab(message.tabId)), message);
+    case 'CONFIRM_PROPOSAL': {
+      // A cancel must always reach the worker so the proposal is dropped, even
+      // when the user has already moved to another tab.
+      const tab = message.optionValue === 'execute'
+        ? await visiblePageTab(message.tabId)
+        : requireTab(await targetTab(message.tabId));
+      return confirmProposal(tab, message);
+    }
+    case 'RUN_PROPOSAL': return runProposal(await visiblePageTab(message.tabId), message);
+    case 'UNDO_REQUEST': return requestUndo(await visiblePageTab(message.tabId));
+    case 'CAPTURE_TARGET': return captureTarget(await visiblePageTab(message.tabId), message);
     case 'ACTIVATE_TAB': return activateTab(message);
     case 'RESET_SESSION': return resetSession(message.tabId, { clearSnapshots: message.clearSnapshots === true });
     case 'GET_COMMANDS': return { commands: await chrome.commands.getAll() };
+    case 'SET_CHOICE_KEYS': return setChoiceKeys(message);
+    // Sent during a turn only so Chrome does not stop this worker, and its
+    // in-memory snapshots, while the model thinks or the user decides.
+    case 'KEEP_ALIVE': return { ok: true };
     default: return { error: 'Unknown message type' };
   }
 }
@@ -1063,6 +1124,9 @@ async function executeAccepted(tab, proposalId, session) {
       undoKind: report.record?.undoKind ?? 'unavailable',
       details: report.details ?? [],
       openedTabs: report.record?.openedTabs ?? [],
+      // Every page the action opened, loaded or not, so the panel can tell
+      // them from a tab the user switched to.
+      openedTabIds: report.record?.openedTabIds ?? [],
       openedTabsOverflow: report.record?.openedTabsOverflow === true,
     },
     phase: finished.phase,
@@ -1112,6 +1176,8 @@ async function executeProposal(tab, proposal) {
   let verified = true;
   let changed = false;
   let stepNumber = 0;
+  // Every page opened by any step of this action, in the order seen.
+  const openedTabIds = new Set();
   try {
     cdp = await debuggerSession(tab.id);
     await setLauncherHidden(cdp, true);
@@ -1154,11 +1220,12 @@ async function executeProposal(tab, proposal) {
         }
       }
       const openable = OPENABLE_STEPS.has(step.type);
+      const openedBefore = openedTabIds.size;
       if (openable) {
         activeExecutions.set(tab.id, {
           proposalId: proposal.id,
           frameId: entry.frameId,
-          openedTabIds: new Set(),
+          openedTabIds,
         });
       }
       let outcome;
@@ -1189,8 +1256,11 @@ async function executeProposal(tab, proposal) {
           failedStep = 'The user left or reset the page; remaining steps were not executed';
           break;
         }
-        if (execution && execution.openedTabIds.size) {
-          const opened = await describeOpenedTabs(tab, execution);
+        if (execution && openedTabIds.size) record.openedTabIds = [...openedTabIds];
+        // Describe only this step's pages; earlier ones were already attributed.
+        const stepTabIds = [...openedTabIds].slice(openedBefore);
+        if (execution && stepTabIds.length) {
+          const opened = await describeOpenedTabs(tab, stepTabIds);
           record.openedTabs = opened.openedTabs;
           record.openedTabsOverflow = opened.openedTabsOverflow;
           if (opened.openedTabs.length || opened.openedTabsOverflow) {
@@ -1769,8 +1839,7 @@ async function waitForCandidateHttp(tabId, timeoutMs) {
   });
 }
 
-async function describeOpenedTabs(sourceTab, execution) {
-  const ids = [...execution.openedTabIds];
+async function describeOpenedTabs(sourceTab, ids) {
   const openedTabs = [];
   for (const tabId of ids.slice(0, MAX_OPENED_TABS)) {
     const tab = await waitForCandidateHttp(tabId, OPENED_TAB_TIMEOUT_MS);
@@ -1799,6 +1868,12 @@ async function activateTab(message) {
   }
   if (tab.windowId !== message.windowId) return { error: 'The opened page moved to another window; choose the page again.' };
   if (!httpUrl(tab.url)) return { error: 'The opened page is not a regular web page' };
+  // Putting the source page back is only right while the page the action opened
+  // is still in front; a tab the user has picked since stays selected.
+  if (Number.isInteger(message.expectedActiveTabId)) {
+    const [active] = await chrome.tabs.query({ active: true, windowId: message.windowId }).catch(() => []);
+    if (active?.id !== message.expectedActiveTabId) return { ok: false, skipped: true };
+  }
   await chrome.tabs.update(tab.id, { active: true });
   await chrome.windows.update(tab.windowId, { focused: true }).catch(() => {});
   const fresh = await chrome.tabs.get(tab.id).catch(() => null);
@@ -1812,6 +1887,75 @@ async function activateTab(message) {
     url: modelUrl(fresh.url),
     origin: originOf(fresh.url),
   };
+}
+
+// While the panel asks a question, the launcher in each page of that window
+// catches Control+Shift and the question's numbers, so the user can answer
+// even when keyboard focus is in the page (a page the assistant just brought
+// forward takes focus, for one). Kept in session storage: a question can
+// outlast the worker's idle shutdown.
+const CHOICE_KEYS_PREFIX = 'choiceKeys:';
+
+async function choiceKeysFor(windowId) {
+  if (!Number.isInteger(windowId)) return null;
+  const key = `${CHOICE_KEYS_PREFIX}${windowId}`;
+  const stored = await chrome.storage.session.get(key);
+  return stored[key] ?? null;
+}
+
+async function broadcastChoiceKeys(windowId, choiceKeys) {
+  const tabs = await chrome.tabs.query({ windowId }).catch(() => []);
+  await Promise.all(tabs
+    .filter((tab) => Number.isInteger(tab.id) && httpUrl(tab.url))
+    .map((tab) => chrome.tabs.sendMessage(tab.id, { type: 'CHOICE_KEYS', choiceKeys }, { frameId: 0 })
+      .catch(() => {})));
+}
+
+// Serialized: replacing a question withdraws the old keys and publishes the
+// new ones back to back, and the pages must end on the newest.
+let choiceKeysQueue = Promise.resolve();
+
+function storeChoiceKeys(windowId, choiceKeys) {
+  const run = async () => {
+    const key = `${CHOICE_KEYS_PREFIX}${windowId}`;
+    if (choiceKeys) await chrome.storage.session.set({ [key]: choiceKeys });
+    else await chrome.storage.session.remove(key);
+    await broadcastChoiceKeys(windowId, choiceKeys);
+  };
+  const next = choiceKeysQueue.then(run, run);
+  choiceKeysQueue = next.catch(() => {});
+  return next;
+}
+
+async function setChoiceKeys(message) {
+  if (!Number.isInteger(message.windowId)) return { error: 'Invalid window' };
+  const numbers = Array.isArray(message.numbers)
+    ? [...new Set(message.numbers.filter((number) => typeof number === 'string' && /^[1-9]$/u.test(number)))]
+    : [];
+  const choiceId = typeof message.choiceId === 'string' && message.choiceId ? message.choiceId : null;
+  await storeChoiceKeys(message.windowId, choiceId && numbers.length ? { choiceId, numbers } : null);
+  return { ok: true };
+}
+
+async function forwardChoiceKey(message, tab) {
+  const choiceKeys = await choiceKeysFor(tab.windowId);
+  if (!choiceKeys) return { ok: false, choiceKeys: null };
+  // Only the page in front of the user answers, never while the assistant's
+  // own input is running in it, and only the question it was told about.
+  if (!tab.active || activeExecutions.has(tab.id)
+    || message.choiceId !== choiceKeys.choiceId || !choiceKeys.numbers.includes(message.key)) {
+    return { ok: false, choiceKeys };
+  }
+  try {
+    await chrome.runtime.sendMessage({
+      type: 'CHOICE_KEY', windowId: tab.windowId, choiceId: choiceKeys.choiceId, key: message.key,
+    });
+  } catch {
+    // No panel received it: the question closed with the panel.
+    await storeChoiceKeys(tab.windowId, null).catch(() => {});
+    return { ok: false, choiceKeys: null };
+  }
+  return { ok: true, choiceKeys };
 }
 
 async function setLauncherPosition(position, sourceTabId) {

@@ -52,3 +52,25 @@ export function grantUpload(existing, pageOrigin, fingerprint, part) {
 export function needsUpload(consent, part) {
   return !consent || consent[part] !== true;
 }
+
+// Refusals are a collection keyed by page origin, receiver configuration, and
+// part (text, image), so declining one site never erases a decline recorded
+// for another. The marker records which turn refused, so a later turn can tell
+// it apart. The collection lives until the conversation resets.
+function refusalKey(pageOrigin, fingerprint, part) {
+  return JSON.stringify([pageOrigin, fingerprint, part]);
+}
+
+export function refusalFor(refusals, pageOrigin, fingerprint, part) {
+  return refusals?.[refusalKey(pageOrigin, fingerprint, part)] ?? null;
+}
+
+export function refuseUpload(refusals, pageOrigin, fingerprint, part, marker) {
+  return { ...(refusals ?? {}), [refusalKey(pageOrigin, fingerprint, part)]: marker };
+}
+
+export function liftRefusal(refusals, pageOrigin, fingerprint, part) {
+  if (!refusalFor(refusals, pageOrigin, fingerprint, part)) return refusals;
+  const { [refusalKey(pageOrigin, fingerprint, part)]: _lifted, ...rest } = refusals;
+  return rest;
+}

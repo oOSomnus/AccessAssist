@@ -161,22 +161,49 @@ test('debug log export records the session without the API key', async () => {
   }
 });
 
-test('a cold panel focuses Listen before it finishes loading', async () => {
+test('a cold panel loads hidden from screen readers, then names Listen first', async () => {
   const { context, extensionId } = await launch();
   try {
     await resetMock();
     await openFixture(context, '/article');
-    // A reader auto-reads a loaded document that has nothing focused, so focus
-    // must already be on a named control when the load event fires.
+    // A reader auto-reads a freshly loaded document and keeps reading whatever
+    // is exposed while it reads, so at load only the live region is exposed and
+    // nothing in the panel holds focus.
     await context.addInitScript(() => {
       if (location.protocol !== 'chrome-extension:') return;
+      const hidden = (id) => Boolean(document.getElementById(id).closest('[aria-hidden="true"]'));
+      const snapshot = () => ({
+        stage: document.body.dataset.quiet ?? null,
+        active: document.activeElement?.id || document.activeElement?.tagName || null,
+        listenHidden: hidden('listen'),
+        restHidden: hidden('settings-toggle') && hidden('transcript') && hidden('pause'),
+        statusHidden: hidden('sr-status'),
+      });
       addEventListener('load', () => {
-        window.__aaFocusAtLoad = document.activeElement?.id || document.activeElement?.tagName || null;
+        window.__aaAtLoad = {
+          ...snapshot(),
+          quiet: document.querySelectorAll('[data-quiet-load][aria-hidden="true"]').length,
+        };
+      });
+      addEventListener('DOMContentLoaded', () => {
+        window.__aaStages = [];
+        new MutationObserver(() => window.__aaStages.push(snapshot()))
+          .observe(document.body, { attributes: true, attributeFilter: ['data-quiet'] });
       });
     });
     const panel = await openPanel(context, extensionId);
-    await expect.poll(() => panel.evaluate(() => window.__aaFocusAtLoad ?? null)).toBe('listen');
-    await panel.locator('body[data-ready="true"]').waitFor({ state: 'attached' });
+    await expect.poll(() => panel.evaluate(() => window.__aaAtLoad ?? null)).toEqual({
+      stage: 'all', active: 'BODY', listenHidden: true, restHidden: true, statusHidden: false, quiet: 8,
+    });
+    // With no entry, Listen alone is exposed and focused; with no input at all,
+    // the rest appears shortly after.
+    await panel.locator('body[data-revealed="true"]').waitFor({ state: 'attached' });
+    expect(await panel.evaluate(() => window.__aaStages)).toEqual([
+      { stage: 'listen', active: 'listen', listenHidden: false, restHidden: true, statusHidden: false },
+      { stage: 'none', active: 'listen', listenHidden: false, restHidden: false, statusHidden: false },
+    ]);
+    expect(await panel.locator('[data-quiet-load], [aria-hidden="true"]:is(header, .panel-content, #composer button, #actions-heading)').count())
+      .toBe(0);
     await expect(panel.locator('#listen')).toBeFocused();
   } finally {
     await context.close();
@@ -344,8 +371,15 @@ test('bare digits stay native while the master combination chooses', async () =>
     await expect(panel.locator('#ask')).toBeVisible();
     await expect(panel.locator('#ask-question')).toHaveText(question);
 
-    // An unavailable number is not consumed and changes nothing.
+    // A number nothing uses changes nothing and says so.
     await panel.keyboard.press('Control+Shift+9');
+    await expect.poll(async () => await announcements(panel))
+      .toContain('Nothing uses Control plus Shift plus 9 right now.');
+    await expect(panel.locator('#ask')).toBeVisible();
+    await expect(panel.locator('#ask-question')).toHaveText(question);
+
+    // The open shortcut's Space never presses the focused choice.
+    await panel.keyboard.press('Control+Shift+Space');
     await panel.waitForTimeout(150);
     await expect(panel.locator('#ask')).toBeVisible();
     await expect(panel.locator('#ask-question')).toHaveText(question);
@@ -364,6 +398,99 @@ test('bare digits stay native while the master combination chooses', async () =>
     // and the undoable selection runs without a confirmation question.
     await panel.keyboard.press('Control+Shift+2');
     await expect(page.locator('input[aria-label="Monday 14:00"]')).toBeChecked();
+  } finally {
+    await context.close();
+  }
+});
+
+test('the model gets compact targets and only the newest page reading in full', async () => {
+  const { context, extensionId } = await launch();
+  try {
+    await resetMock();
+    const page = await openFixture(context, '/grid-native');
+    const panel = await openPanel(context, extensionId);
+    await sendText(panel, 'Select Monday two to three.');
+    await answerWhen(panel, 'page text', 0);
+    await answerWhen(panel, 'AM or PM', 1);
+    await expect(page.locator('input[aria-label="Monday 14:00"]')).toBeChecked();
+
+    // The request after the action carries the observe result and the page
+    // after the action: the older reading is reduced to a note.
+    const toolContents = (request) => (request.body.messages ?? [])
+      .filter((message) => message.role === 'tool')
+      .map((message) => String(message.content));
+    let contents = [];
+    await expect.poll(async () => {
+      const requests = await mockRequests();
+      const last = requests.findLast((request) => toolContents(request).some((text) => text.includes('"page":{')));
+      contents = last ? toolContents(last) : [];
+      return contents.some((text) => text.includes('Superseded by a newer page reading'));
+    }).toBe(true);
+    const newest = JSON.parse(contents.findLast((text) => text.includes('"page":{'))).page;
+    expect(newest.targets.length).toBeGreaterThan(0);
+    for (const target of newest.targets) {
+      expect(target).not.toHaveProperty('styleState');
+      expect(target.visible).not.toBe(true);
+      expect(target.inViewport).not.toBe(true);
+      expect(target.name).not.toBe('');
+      if (target.style) expect(newest.styles[target.style]).toBeTruthy();
+    }
+  } finally {
+    await context.close();
+  }
+});
+
+test('an open question answers Control+Shift numbers from the page in front', async () => {
+  const { context, extensionId } = await launch();
+  try {
+    await resetMock();
+    const page = await openFixture(context, '/grid-native');
+    await waitForLauncher(page);
+    await page.evaluate(() => {
+      window.__pageKeys = [];
+      window.addEventListener('keydown', (event) => {
+        if (event.ctrlKey && event.shiftKey && event.code.startsWith('Digit')) window.__pageKeys.push(event.code);
+      }, true);
+    });
+    const panel = await openPanel(context, extensionId);
+    await sendText(panel, 'Select Monday two to three.');
+    await answerWhen(panel, 'page text', 0);
+    await expect(panel.locator('#ask-question')).toContainText('AM or PM');
+
+    // Keyboard focus back in the page: the question's number still answers it,
+    // and the page never sees that key.
+    await page.bringToFront();
+    await page.locator('body').focus();
+    await page.keyboard.press('Control+Shift+2');
+    await expect(page.locator('input[aria-label="Monday 14:00"]')).toBeChecked();
+    expect(await page.evaluate(() => window.__pageKeys)).toEqual([]);
+
+    // With no question open, the same keys belong to the page again.
+    await expect(panel.locator('#ask')).toBeHidden();
+    await expect.poll(async () => {
+      await page.keyboard.press('Control+Shift+2');
+      return page.evaluate(() => window.__pageKeys.length);
+    }).toBeGreaterThan(0);
+  } finally {
+    await context.close();
+  }
+});
+
+test('a number the focused group lacks reaches the visible control that shows it', async () => {
+  const { context, extensionId } = await launch();
+  try {
+    await resetMock();
+    await openFixture(context, '/grid-native');
+    const panel = await openPanel(context, extensionId);
+    await sendText(panel, 'Select Monday two to three.');
+    await answerWhen(panel, 'page text', 0);
+    await expect(panel.locator('#ask-question')).toContainText('AM or PM');
+    await expect(panel.locator('#cancel')).toBeVisible();
+
+    // Focus on a choice, which has no 4: 4 Cancel still works.
+    await panel.locator('#ask-options button').first().focus();
+    await panel.keyboard.press('Control+Shift+4');
+    await expect(panel.locator('#ask')).toBeHidden();
   } finally {
     await context.close();
   }
@@ -1580,6 +1707,10 @@ test('Close panel uses native close, keeps settings, and reports a failure in pl
     expect(await panel.locator('#close-panel').getAttribute('data-number')).toBeNull();
     await panel.locator('#close-panel').focus();
     await panel.keyboard.press('Control+Shift+7');
+    await panel.waitForTimeout(150);
+    expect(await panel.evaluate(() => window.__closeCalls.length)).toBe(0);
+    // The open shortcut's Space never presses the focused Close button.
+    await panel.keyboard.press('Control+Shift+Space');
     await panel.waitForTimeout(150);
     expect(await panel.evaluate(() => window.__closeCalls.length)).toBe(0);
 
