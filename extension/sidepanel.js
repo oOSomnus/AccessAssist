@@ -129,6 +129,7 @@ const state = {
   actionContext: null,
   confirming: false,
   refreshSeq: 0,
+  pageUnannounced: false,
 };
 
 // Session-scoped: cleared when the panel closes or reloads, kept across
@@ -147,6 +148,7 @@ const speech = new Speech({ lang: 'en-US' });
 speech.attach({
   liveEl: $('sr-status'),
   onWrite: (text, urgent) => debugLog.add(urgent ? 'speech.urgent' : 'speech.status', { text }),
+  onEvent: (kind, data) => debugLog.add(kind, data),
 });
 
 const turns = createTurns();
@@ -288,6 +290,9 @@ async function send(type, payload = {}) {
 // Cancels the current listening session, playback cue, and the single-use
 // listen authorization. Any older async continuation becomes stale.
 function cancelVoice() {
+  // A cancelled session ends without a voice.end event; record it so an
+  // exported log shows why listening stopped.
+  if (state.listening || speech.listening) debugLog.add('voice.cancel', { recognizing: speech.listening });
   state.voiceGeneration += 1;
   state.listenRequest = null;
   state.entrySeq += 1;
@@ -519,10 +524,11 @@ async function onVoiceError(error) {
   }
   cancelVoice();
   if (error === 'audio-capture') {
-    state.voiceReady = false;
-    state.voiceRetry = true;
-    updateVoiceSetup({ local: speech.localStatus, mic: state.micState, ready: false });
-    await say(`No microphone is available. Connect one. ${listenAction()} to try again.`, { urgent: true });
+    // Errors arrive here only after the ready tones, so a microphone was
+    // capturing and then stopped. As with a device failure before the tones
+    // (see listenOnce), the prepared pack stays usable: the next listen can
+    // start at once instead of preparing voice again.
+    await say(`The microphone stopped while listening. ${listenAction()} to try again.`, { urgent: true });
   } else if (error === 'language-not-supported') {
     state.voiceReady = false;
     state.voiceRetry = true;
@@ -1139,6 +1145,9 @@ function finishChoice(choiceSetId, option, reason = 'answered') {
   // A question answered or replaced before its reading left the queue must
   // not be read out after it is gone.
   speech.dropPending(choiceTag(current.set.id));
+  // The question is settled, so its reading time no longer holds back what
+  // follows; the selection feedback is written as soon as it is queued.
+  speech.releaseShown(choiceTag(current.set.id));
   current.set = closeChoiceSet(current.set, reason);
   debugLog.add('choice.finish', { id: current.set.id, reason, option });
   hideChoice();
@@ -2427,11 +2436,15 @@ async function refreshTab({ announce = false, reason = '', windowId = null } = {
   if (changed) {
     cancelVoice();
     resetConversation();
+    // A newer refresh may find this binding already in place and see no
+    // change; it then owes the announcement this one gives up below.
+    state.pageUnannounced = true;
     if (previous?.tabId) await send('RESET_SESSION', { tabId: previous.tabId }).catch(() => {});
     if (seq !== state.refreshSeq) return false;
-    if (announce) {
-      await say(`${reason ? `${reason}. ` : ''}Current page: ${pageName}.`);
-    }
+  }
+  if (state.pageUnannounced) {
+    state.pageUnannounced = false;
+    if (announce) await say(`${reason ? `${reason}. ` : ''}Current page: ${pageName}.`);
   }
   return true;
 }
@@ -2519,6 +2532,14 @@ async function handleEntryIntent(intent) {
   focusEntryTarget({ requestWindowFocus: !notified });
   state.audioPaused = false;
   state.voiceRetry = false;
+  // A shortcut names the page it was pressed on. Between tasks, follow that
+  // page first: a switch made during an action, or a tab whose activation the
+  // panel skipped, must not leave the command running on a page the user
+  // cannot see. A turn or an open question keeps its own page.
+  if (intent.source === 'command' && Number.isInteger(intent.tabId)
+    && intent.tabId !== state.tab?.tabId && !state.busy && !state.choice) {
+    await handleActivated(intent.tabId, intent.windowId);
+  }
   if (intent.mode === 'open') {
     return;
   }
@@ -2802,10 +2823,15 @@ function bindEvents() {
   });
   chrome.tabs.onActivated.addListener(({ tabId, windowId }) => { void handleActivated(tabId, windowId); });
   chrome.tabs.onRemoved.addListener((tabId) => { void handleRemoved(tabId); });
-  chrome.tabs.onUpdated.addListener((tabId, info) => {
-    if (info.status === 'complete' && tabId === state.tab?.tabId) {
+  chrome.tabs.onUpdated.addListener((tabId, info, tab) => {
+    if (info.status !== 'complete') return;
+    if (tabId === state.tab?.tabId) {
       void refreshTab({ announce: Boolean(state.tab), reason: 'Page updated' });
+      return;
     }
+    // A new tab activates while it is still chrome://newtab, which activation
+    // skips; when the address typed there loads, treat it as the activation.
+    if (tab?.active) void handleActivated(tabId, tab.windowId);
   });
   chrome.webNavigation.onHistoryStateUpdated.addListener((details) => {
     if (details.frameId === 0 && details.tabId === state.tab?.tabId) {
@@ -2813,6 +2839,7 @@ function bindEvents() {
     }
   });
   document.addEventListener('visibilitychange', () => {
+    debugLog.add('panel.visibility', { state: document.visibilityState });
     if (document.visibilityState !== 'visible') {
       interruptOutput();
       cancelVoice();

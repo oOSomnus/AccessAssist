@@ -10,6 +10,7 @@ import {
   MOCK_BASE,
   openFixture,
   openPanel,
+  PAGE_BASE,
   resetMock,
   sendText,
   undoLastChange,
@@ -997,6 +998,25 @@ test('HTTPS www receiver and source are spoken as domains without changing origi
     const switched = (await announcementEntries(panel)).slice(beforeSwitch).join(' ');
     expect(switched).toContain('Current page: opencode.ai');
     expect(switched).not.toContain('https://');
+  } finally {
+    await context.close();
+  }
+});
+
+test('an address typed into a new tab takes over the panel', async () => {
+  const { context, extensionId } = await launch();
+  try {
+    await openFixture(context, '/article');
+    const panel = await openPanel(context, extensionId);
+    await expect(panel.locator('#page-line')).toContainText('Event schedule');
+    const before = (await announcementEntries(panel)).length;
+    // A new tab activates while still blank, which the panel skips; the typed
+    // address then loads with no further activation.
+    const typed = await context.newPage();
+    await typed.goto(`${PAGE_BASE}/grid-native`);
+    await expect(panel.locator('#page-line')).toContainText('Native time grid');
+    await expect.poll(async () => (await announcementEntries(panel)).slice(before).join(' '))
+      .toContain('Current page: Native time grid');
   } finally {
     await context.close();
   }

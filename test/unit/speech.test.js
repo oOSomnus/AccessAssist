@@ -1032,6 +1032,41 @@ test('a withdrawn message is never written, but the one being read is not cut of
   }
 });
 
+test('an answered question ends its hold so the confirmation is read at once', async (t) => {
+  fakeBrowser();
+  t.mock.timers.enable({ apis: ['setTimeout', 'Date'] });
+  const liveEl = fakeLive();
+  try {
+    const speech = new Speech();
+    speech.attach({ liveEl });
+    await speech.announce('Allow these sources? Choice 1. Allow. Choice 2. Cancel.', { tag: 'choice:a' });
+    const confirmation = track(speech.announce('Selected option 1: Allow.'));
+    await settle();
+    assert.equal(confirmation.outcome, undefined);
+
+    // Another question's tag leaves the current hold alone.
+    speech.releaseShown('choice:b');
+    speech.releaseShown(null);
+    await settle();
+    assert.equal(liveEl.textContent, 'Allow these sources? Choice 1. Allow. Choice 2. Cancel.');
+
+    // Answering question a writes the queued confirmation without waiting.
+    speech.releaseShown('choice:a');
+    await settle();
+    assert.equal(liveEl.textContent, 'Selected option 1: Allow.');
+    assert.equal(confirmation.outcome.delivered, true);
+
+    // The confirmation keeps its own hold; releasing a tag it lacks does nothing.
+    speech.releaseShown('choice:a');
+    assert.equal(liveEl.textContent, 'Selected option 1: Allow.');
+    t.mock.timers.tick(10_000);
+    assert.equal(liveEl.textContent, '');
+  } finally {
+    t.mock.timers.reset();
+    clearBrowser();
+  }
+});
+
 test('urgent messages keep the order they were raised in', async (t) => {
   fakeBrowser();
   t.mock.timers.enable({ apis: ['setTimeout', 'Date'] });

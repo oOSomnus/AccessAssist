@@ -36,6 +36,18 @@ const SPEECH_HOLD_MAX_MS = 6_000;
 
 const clamp = (value, low, high) => Math.min(high, Math.max(low, value));
 
+// The results a native result event changed, for the debug log.
+function resultSummary(event) {
+  const results = event?.results;
+  if (!results) return [];
+  const out = [];
+  for (let index = event.resultIndex ?? 0; index < results.length; index += 1) {
+    const result = results[index];
+    out.push({ index, final: Boolean(result?.isFinal), text: result?.[0]?.transcript ?? '' });
+  }
+  return out;
+}
+
 // Tests shorten the hold so a queued sequence fits inside their poll budget.
 function speechHoldMs(text) {
   const override = globalThis.__aaSpeechHoldMs;
@@ -157,11 +169,21 @@ export class Speech {
     this.workingNodes = null;
     this.workingFailures = 0;
     this.onWrite = null;
+    this.onEvent = null;
   }
 
-  attach({ liveEl, onWrite = null }) {
+  attach({ liveEl, onWrite = null, onEvent = null }) {
     this.liveEl = liveEl;
     this.onWrite = onWrite;
+    this.onEvent = onEvent;
+  }
+
+  // Native recognizer and microphone events, for the exported debug log only.
+  // They show where a command was lost between the ready tones and a result.
+  trace(session, kind, data = {}) {
+    try {
+      this.onEvent?.(kind, { session: session?.id ?? null, ...data });
+    } catch {}
   }
 
   async resumeAudio() {
@@ -421,6 +443,22 @@ export class Speech {
       entry.settle(false);
       return false;
     });
+  }
+
+  // Ends the hold of the message in the region when it carries this tag. A
+  // question that was just answered has nothing left to say, and its remaining
+  // hold only delays the confirmation queued behind it: the Control chord that
+  // answered it already stopped the reader, so the user would hear up to six
+  // seconds of silence. Clearing the region is silent; a reading still in
+  // progress stays the reader's to finish.
+  releaseShown(tag) {
+    if (tag == null || this.shown?.tag !== tag) return;
+    clearTimeout(this.queueTimer);
+    this.queueTimer = null;
+    this.shown = null;
+    this.quietUntil = 0;
+    this.clearLive();
+    this.pumpQueue();
   }
 
   // Writes one message, then holds the region for an estimate of how long a
@@ -891,15 +929,21 @@ export class Speech {
     };
     session.recognition = recognition;
     session.attempt = attempt;
+    attempt.number = (session.attempts = (session.attempts ?? 0) + 1);
+    const trace = (kind, data = {}) => this.trace(session, kind, { attempt: attempt.number, ...data });
+    trace('recognizer.request');
     // Set before the native call: a throwing start() can still leave the
     // recognizer active, so the session must also release through onend.
     session.startRequested = true;
-    recognition.onstart = () => { void this.handleStart(session, attempt); };
-    recognition.onresult = (event) => { this.handleResult(session, attempt, event); };
-    recognition.onerror = (event) => { this.handleError(session, attempt, event); };
-    recognition.onspeechstart = () => { this.handleSpeech(session, attempt, true); };
-    recognition.onspeechend = () => { this.handleSpeech(session, attempt, false); };
-    recognition.onend = () => { this.handleEnd(session, attempt); };
+    recognition.onstart = () => { trace('recognizer.start'); void this.handleStart(session, attempt); };
+    recognition.onresult = (event) => {
+      trace('recognizer.result', { ready: Boolean(session.readyDelivered), results: resultSummary(event) });
+      this.handleResult(session, attempt, event);
+    };
+    recognition.onerror = (event) => { trace('recognizer.error', { error: event?.error ?? null }); this.handleError(session, attempt, event); };
+    recognition.onspeechstart = () => { trace('recognizer.speechstart'); this.handleSpeech(session, attempt, true); };
+    recognition.onspeechend = () => { trace('recognizer.speechend'); this.handleSpeech(session, attempt, false); };
+    recognition.onend = () => { trace('recognizer.end'); this.handleEnd(session, attempt); };
     attempt.startTimer = setTimeout(() => {
       if (!this.current(session) || session.attempt !== attempt || attempt.started || attempt.retired) return;
       this.failSession(session, speechError('start-timeout', 'Chrome did not start listening. Choose Listen to try again.'));
@@ -1158,6 +1202,7 @@ export class Speech {
 
   scheduleRestart(session) {
     if (!this.current(session) || session.finishing || session.restartTimer) return;
+    this.trace(session, 'recognizer.restart');
     session.restartPending = false;
     session.restartTimer = setTimeout(() => {
       session.restartTimer = null;
@@ -1211,6 +1256,7 @@ export class Speech {
 
   endWith(session, reason) {
     if (!this.current(session) || session.finishing) return;
+    this.trace(session, 'session.end', { reason, hasSpeech: Boolean(session.hasSpeech) });
     session.terminal = true;
     session.reason = reason;
     this.clearTimers(session);
@@ -1229,6 +1275,7 @@ export class Speech {
 
   failSession(session, error) {
     if (session.failure || session.ended) return;
+    this.trace(session, 'session.fail', { code: error?.code ?? null, message: error?.message ?? null });
     session.failure = error;
     session.reason = 'error';
     this.listening = false;
