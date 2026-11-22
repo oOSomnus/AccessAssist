@@ -66,9 +66,11 @@ test('listening announces only Listening, then one isolated track and a double c
     await expect.poll(async () => (await voiceState(panel)).starts).toBe(1);
 
     const started = await voiceState(panel);
-    expect(started.gumOptions).toEqual([{ audio: { echoCancellation: { exact: 'all' } } }]);
+    // macOS asks for Chrome's echo cancellation; other systems require system-wide.
+    const macOS = process.platform === 'darwin';
+    expect(started.gumOptions).toEqual([{ audio: { echoCancellation: macOS ? true : { exact: 'all' } } }]);
     expect(started.startTrackKinds).toEqual(['audio']);
-    expect(started.lastEcho).toBe('all');
+    expect(started.lastEcho).toBe(macOS ? true : 'all');
     expect((await announcementEntries(panel)).at(-1)).toBe('Listening.');
     expect((await announcements(panel))).not.toContain('Wait for the tone');
 
@@ -136,6 +138,7 @@ test('unavailable audio stops before the microphone instead of listening silentl
 });
 
 test('without system echo cancellation the captured track is refused before recognition', async () => {
+  test.skip(process.platform === 'darwin', 'macOS uses Chrome echo cancellation instead of system-wide');
   const { context, extensionId, worker } = await launch({
     voice: { available: 'available', permission: 'granted', gum: 'grant', echo: true },
   });

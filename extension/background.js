@@ -2193,6 +2193,25 @@ function keyDef(name) {
   return null;
 }
 
+// CDP key events skip macOS key bindings, so a Control or Command chord edits
+// nothing there; name the editing command instead. Other systems already run
+// these chords, and naming the command too would apply it twice.
+let macPlatform = null;
+function isMac() {
+  macPlatform ??= chrome.runtime.getPlatformInfo()
+    .then((info) => info?.os === 'mac')
+    .catch(() => false);
+  return macPlatform;
+}
+
+export function macEditCommand(key, { command = false, shift = false } = {}) {
+  if (!command) return null;
+  if (key === 'a') return shift ? null : 'selectAll';
+  if (key === 'z') return shift ? 'redo' : 'undo';
+  if (key === 'y') return shift ? null : 'redo';
+  return null;
+}
+
 async function pressKey(cdp, name, modifiers = []) {
   const def = keyDef(name);
   if (!def) throw new Error('Unsupported key');
@@ -2206,6 +2225,7 @@ async function pressKey(cdp, name, modifiers = []) {
   // Shortcut chords must not also type a character.
   if (command || alt) text = undefined;
   else if (shift && text) text = key;
+  const editing = !alt && await isMac() ? macEditCommand(def.key, { command, shift }) : null;
   const base = {
     key,
     code: def.code,
@@ -2214,7 +2234,11 @@ async function pressKey(cdp, name, modifiers = []) {
     modifiers: mask,
     ...(text ? { text, unmodifiedText: def.text ?? text } : {}),
   };
-  await cdp.send('Input.dispatchKeyEvent', { type: text ? 'keyDown' : 'rawKeyDown', ...base });
+  await cdp.send('Input.dispatchKeyEvent', {
+    type: text ? 'keyDown' : 'rawKeyDown',
+    ...base,
+    ...(editing ? { commands: [editing] } : {}),
+  });
   await cdp.send('Input.dispatchKeyEvent', {
     type: 'keyUp',
     key,

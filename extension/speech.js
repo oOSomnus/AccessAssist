@@ -60,6 +60,59 @@ function speechHoldMs(text) {
 const ISOLATED_INPUT_OS = new Set(['win', 'mac', 'linux']);
 const ISOLATION_UNAVAILABLE = 'System audio cancellation is unavailable for this recording. Speech did not start.';
 
+// The echo cancellation a command track asks for, per platform. System-wide
+// cancellation also removes a screen reader's voice, but on macOS it routes the
+// track through Voice Processing I/O, which ducks every other app (VoiceOver
+// goes nearly silent just as it says "Listening") and gives Chrome's
+// on-device recognizer a track it often hears nothing from or stalls on, while
+// the analyser on the same track shows the user speaking. Chrome's own
+// canceller on that Mac was heard at once. It removes the panel's own cues;
+// a screen reader is not Chrome audio, so on macOS the ready gate (speech
+// before the tones is ignored) is what keeps the reader out of a command.
+export function captureConstraints(platform, deviceId = null) {
+  if (platform !== 'mac') return { audio: { echoCancellation: { exact: 'all' } } };
+  return { audio: { echoCancellation: true, ...(deviceId ? { deviceId: { exact: deviceId } } : {}) } };
+}
+
+// macOS can hand the default input to a nearby iPhone or iPad (Continuity).
+// That microphone hears the room from wherever the phone is and drops out when
+// the phone moves, and a track on "default" then ends mid-command. Pin the
+// command to a concrete device: the current default unless it is a phone, else
+// the built-in microphone, else any other input that is not a phone. Labels
+// exist only once microphone access was granted; without them, use the default.
+const PHONE_INPUT = /iphone|ipad/iu;
+const BUILT_IN_INPUT = /built-?in|macbook/iu;
+export function pickInputDevice(devices = []) {
+  const inputs = devices.filter((device) => device?.kind === 'audioinput' && device.label);
+  const concrete = inputs.filter((device) => device.deviceId
+    && device.deviceId !== 'default' && device.deviceId !== 'communications');
+  if (!concrete.length) return null;
+  const fallback = concrete.find((device) => BUILT_IN_INPUT.test(device.label))
+    ?? concrete.find((device) => !PHONE_INPUT.test(device.label))
+    ?? null;
+  const preset = inputs.find((device) => device.deviceId === 'default');
+  const current = preset?.groupId
+    ? concrete.find((device) => device.groupId === preset.groupId) ?? null
+    : null;
+  if (current && !PHONE_INPUT.test(current.label)) return current.deviceId;
+  return fallback?.deviceId ?? null;
+}
+
+// Without system-wide cancellation (macOS) the screen reader's own speech
+// reaches the recognizer, and the entry that opened the microphone just made
+// the reader talk: the focused control, its region, "Listening.". Hold the
+// ready tones until the input has been quiet for a moment; speech before the
+// tones is never part of the command.
+const QUIET_LEVEL = 0.012;
+const QUIET_HOLD_MS = 700;
+const QUIET_GATE_MAX_MS = 8_000;
+const QUIET_POLL_MS = 50;
+
+export function captureCancelsEcho(settings, platform) {
+  const echo = settings?.echoCancellation;
+  return platform === 'mac' ? echo === true || echo === 'all' : echo === 'all';
+}
+
 const wait = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
 function speechError(code, message) {
@@ -864,9 +917,14 @@ export class Speech {
     }
     let stream;
     try {
-      stream = await navigator.mediaDevices.getUserMedia({
-        audio: { echoCancellation: { exact: 'all' } },
-      });
+      const deviceId = platform === 'mac' ? await this.preferredInput() : null;
+      try {
+        stream = await navigator.mediaDevices.getUserMedia(captureConstraints(platform, deviceId));
+      } catch (error) {
+        // A device that vanished since it was listed falls back to the default.
+        if (!deviceId || !['OverconstrainedError', 'NotFoundError', 'NotReadableError'].includes(error?.name)) throw error;
+        stream = await navigator.mediaDevices.getUserMedia(captureConstraints(platform));
+      }
     } catch (error) {
       if (!this.current(session)) {
         this.finishSession(session, 'cancelled');
@@ -882,6 +940,7 @@ export class Speech {
       return;
     }
     session.stream = stream;
+    session.quietGate = platform === 'mac';
     session.track = stream?.getAudioTracks?.()[0] ?? null;
     const track = session.track;
     if (!track || track.kind !== 'audio' || track.readyState !== 'live') {
@@ -889,12 +948,14 @@ export class Speech {
       this.failSession(session, speechError('audio-capture', ISOLATION_UNAVAILABLE));
       return;
     }
-    if (track.getSettings?.().echoCancellation !== 'all') {
+    if (!captureCancelsEcho(track.getSettings?.(), platform)) {
       this.releaseInput(session);
       this.failSession(session, speechError('audio-capture', ISOLATION_UNAVAILABLE));
       return;
     }
+    this.trace(session, 'mic.open', { settings: track.getSettings?.() ?? null });
     track.onended = () => {
+      this.trace(session, 'mic.ended', { current: this.current(session) });
       if (!this.current(session)) return;
       this.failSession(session, speechError('audio-capture', 'The microphone stopped. Choose Listen to try again.'));
     };
@@ -955,6 +1016,53 @@ export class Speech {
     }
   }
 
+  async preferredInput() {
+    try {
+      const devices = await navigator.mediaDevices.enumerateDevices?.();
+      return pickInputDevice(devices ?? []);
+    } catch {
+      return null;
+    }
+  }
+
+  async waitForQuietInput(session) {
+    if (!session.quietGate || !session.stream) return;
+    const audio = this.audio;
+    if (typeof audio?.createMediaStreamSource !== 'function' || typeof audio.createAnalyser !== 'function') return;
+    let source;
+    let analyser;
+    try {
+      source = audio.createMediaStreamSource(session.stream);
+      analyser = audio.createAnalyser();
+      analyser.fftSize = 1024;
+      source.connect(analyser);
+    } catch {
+      return;
+    }
+    const samples = new Float32Array(analyser.fftSize);
+    const started = Date.now();
+    let quietSince = started;
+    let quiet = false;
+    try {
+      while (this.current(session) && Date.now() - started < QUIET_GATE_MAX_MS) {
+        analyser.getFloatTimeDomainData(samples);
+        let sum = 0;
+        for (const value of samples) sum += value * value;
+        const level = Math.sqrt(sum / samples.length);
+        const now = Date.now();
+        if (level > QUIET_LEVEL) quietSince = now;
+        else if (now - quietSince >= QUIET_HOLD_MS) {
+          quiet = true;
+          break;
+        }
+        await wait(QUIET_POLL_MS);
+      }
+    } finally {
+      try { source.disconnect(); } catch {}
+    }
+    this.trace(session, 'quiet.gate', { waitedMs: Date.now() - started, quiet });
+  }
+
   async handleStart(session, attempt) {
     if (!this.current(session) || session.attempt !== attempt || attempt.retired) {
       // An abort issued while start was in flight may not have taken effect;
@@ -973,6 +1081,8 @@ export class Speech {
       session.restartPending = false;
       return;
     }
+    await this.waitForQuietInput(session);
+    if (!this.current(session) || session.attempt !== attempt || attempt.retired) return;
     // The earcon is the real microphone-ready signal, not the prompt. Wait for
     // the complete double tone, without turning unavailable audio into a
     // failed microphone.

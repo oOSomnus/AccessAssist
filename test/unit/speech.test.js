@@ -1,12 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import {
-  SOUND_CUES,
-  Speech,
-  localRecognitionSupported,
-  spokenSites,
-  voiceSetupView,
-} from '../../extension/speech.js';
+import { SOUND_CUES, Speech, localRecognitionSupported, spokenSites, voiceSetupView, captureConstraints, captureCancelsEcho, pickInputDevice } from '../../extension/speech.js';
 
 const tick = (ms = 0) => new Promise((resolve) => setTimeout(resolve, ms));
 
@@ -651,6 +645,122 @@ test('refusing echo cancellation all or an ended track stops before native start
     } finally {
       clearBrowser();
     }
+  }
+});
+
+test('macOS asks for Chrome echo cancellation; other systems require system-wide cancellation', async () => {
+  assert.deepEqual(captureConstraints('mac'), { audio: { echoCancellation: true } });
+  assert.deepEqual(captureConstraints('win'), { audio: { echoCancellation: { exact: 'all' } } });
+  assert.deepEqual(captureConstraints('linux'), { audio: { echoCancellation: { exact: 'all' } } });
+  assert.equal(captureCancelsEcho({ echoCancellation: true }, 'mac'), true);
+  assert.equal(captureCancelsEcho({ echoCancellation: 'all' }, 'mac'), true);
+  assert.equal(captureCancelsEcho({ echoCancellation: false }, 'mac'), false);
+  assert.equal(captureCancelsEcho({}, 'mac'), false);
+  assert.equal(captureCancelsEcho({ echoCancellation: true }, 'win'), false);
+  assert.equal(captureCancelsEcho({ echoCancellation: 'all' }, 'win'), true);
+
+  const control = fakeBrowser({ platform: 'mac', echo: true });
+  try {
+    const speech = new Speech();
+    speech.localAvailable = true;
+    const pending = speech.startListening({});
+    await tick();
+    assert.deepEqual(control.gumOptions, [{ audio: { echoCancellation: true } }]);
+    assert.equal(control.starts, 1);
+    control.finishCue();
+    assert.deepEqual(await pending, { ready: true, sessionId: 1 });
+    speech.stopListening();
+  } finally {
+    clearBrowser();
+  }
+
+  const refused = fakeBrowser({ platform: 'mac', echo: false });
+  try {
+    const speech = new Speech();
+    speech.localAvailable = true;
+    await assert.rejects(speech.startListening({}), (error) => error.code === 'audio-capture');
+    assert.equal(refused.starts, 0);
+    assert.equal(refused.tracksStopped, 1);
+  } finally {
+    clearBrowser();
+  }
+});
+
+test('macOS pins the default microphone unless it is a phone', () => {
+  const mac = { kind: 'audioinput', deviceId: 'mac', groupId: 'g-mac', label: 'MacBook Pro Microphone (Built-in)' };
+  const phone = { kind: 'audioinput', deviceId: 'phone', groupId: 'g-phone', label: 'Richard_iPhone Microphone' };
+  const usb = { kind: 'audioinput', deviceId: 'usb', groupId: 'g-usb', label: 'USB Headset' };
+  const teams = { kind: 'audioinput', deviceId: 'teams', groupId: 'g-teams', label: 'Microsoft Teams Audio' };
+  const preset = (device) => ({ kind: 'audioinput', deviceId: 'default', groupId: device.groupId, label: `Default - ${device.label}` });
+
+  // A phone that took the default yields to the built-in microphone.
+  assert.equal(pickInputDevice([preset(phone), phone, mac, teams]), 'mac');
+  // Any other default is pinned, so a later switch cannot end the track.
+  assert.equal(pickInputDevice([preset(usb), mac, phone, usb]), 'usb');
+  assert.equal(pickInputDevice([preset(mac), mac, phone]), 'mac');
+  // With no built-in microphone, any input that is not a phone.
+  assert.equal(pickInputDevice([preset(phone), phone, usb]), 'usb');
+  assert.equal(pickInputDevice([preset(phone), phone]), null);
+  // No labels means no permission yet: leave the choice to the default.
+  assert.equal(pickInputDevice([{ kind: 'audioinput', deviceId: 'x', groupId: 'g', label: '' }]), null);
+  assert.equal(pickInputDevice([]), null);
+  assert.equal(pickInputDevice([{ kind: 'videoinput', deviceId: 'cam', label: 'FaceTime HD Camera' }]), null);
+});
+
+test('macOS holds the ready tones until the microphone input is quiet', async (t) => {
+  t.mock.timers.enable({ apis: ['setTimeout', 'Date'] });
+  try {
+    const levels = [0.2, 0.2, 0.2, 0.001];
+    let reads = 0;
+    let disconnected = false;
+    const speech = new Speech();
+    speech.audio = {
+      createMediaStreamSource: () => ({ connect() {}, disconnect() { disconnected = true; } }),
+      createAnalyser: () => ({
+        fftSize: 0,
+        getFloatTimeDomainData(buffer) {
+          const level = levels[Math.min(reads, levels.length - 1)];
+          reads += 1;
+          buffer.fill(level);
+        },
+      }),
+    };
+    const traced = [];
+    speech.onEvent = (kind, data) => traced.push([kind, data]);
+    const session = { id: 7, stream: {}, quietGate: true };
+    speech.session = session;
+    let done = false;
+    const gate = speech.waitForQuietInput(session).then(() => { done = true; });
+    // Loud input (the reader talking) keeps the gate shut.
+    for (let step = 0; step < 3; step += 1) {
+      await settle();
+      t.mock.timers.tick(50);
+    }
+    assert.equal(done, false);
+    // Quiet input opens it after the hold.
+    for (let step = 0; step < 20 && !done; step += 1) {
+      await settle();
+      t.mock.timers.tick(50);
+    }
+    await gate;
+    assert.equal(done, true);
+    assert.equal(disconnected, true);
+    const [kind, data] = traced.at(-1);
+    assert.equal(kind, 'quiet.gate');
+    assert.equal(data.quiet, true);
+    assert.ok(data.waitedMs >= 700, String(data.waitedMs));
+
+    // Other platforms, and audio without an analyser, never wait.
+    const other = { id: 8, stream: {}, quietGate: false };
+    speech.session = other;
+    await speech.waitForQuietInput(other);
+    const bare = new Speech();
+    bare.audio = {};
+    const plain = { id: 9, stream: {}, quietGate: true };
+    bare.session = plain;
+    await bare.waitForQuietInput(plain);
+  } finally {
+    t.mock.timers.reset();
   }
 });
 

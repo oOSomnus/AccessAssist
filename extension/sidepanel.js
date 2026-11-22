@@ -11,6 +11,7 @@ const $ = (id) => document.getElementById(id);
 const uid = () => crypto.randomUUID();
 const SETUP_PAGE = location.search.includes('setup=1');
 const START_ACTIVATION_TIMEOUT_MS = 10_000;
+const COLD_PROMPT_SETTLE_MS = 1_000;
 
 function openSentence() {
   const shortcut = shortcutFor('open-assistant');
@@ -387,6 +388,14 @@ async function listenOnce(requestId, seq) {
       // Keep the activation-gated resume request ahead of every await; the
       // spoken prompt must still finish before the microphone opens.
       const audioReady = speech.resumeAudio();
+      // VoiceOver skips a live region written while the panel document is
+      // still settling, so on macOS a panel the shortcut just opened waits a
+      // moment before it says "Listening.". Other systems keep their timing.
+      const settle = detectPlatform() === 'voiceover' ? COLD_PROMPT_SETTLE_MS - performance.now() : 0;
+      if (settle > 0) {
+        await new Promise((resolve) => { setTimeout(resolve, settle); });
+        if (!owned()) return;
+      }
       const prompt = await say('Listening.');
       if (!owned()) return;
       if (!usableNow() || prompt.interrupted) {

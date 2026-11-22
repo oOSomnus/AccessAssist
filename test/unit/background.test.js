@@ -157,7 +157,7 @@ globalThis.chrome = {
   },
 };
 
-await import('../../extension/background.js');
+const { macEditCommand } = await import('../../extension/background.js');
 
 function reset() {
   calls.close.length = 0;
@@ -601,4 +601,16 @@ test('a failure before any step reports nothing done and stores no undo record',
   assert.equal(response.report.undoKind, 'unavailable');
   assert.equal(response.phase, 'guide');
   assert.equal('undo:12' in behavior.sessionState, false);
+});
+
+test('Mac chords name the editing command CDP key events cannot trigger', () => {
+  assert.equal(macEditCommand('a', { command: true }), 'selectAll');
+  assert.equal(macEditCommand('z', { command: true }), 'undo');
+  assert.equal(macEditCommand('z', { command: true, shift: true }), 'redo');
+  assert.equal(macEditCommand('y', { command: true }), 'redo');
+  // Plain keys and chords without a fixed editing meaning stay raw key events.
+  assert.equal(macEditCommand('a'), null);
+  assert.equal(macEditCommand('a', { command: true, shift: true }), null);
+  assert.equal(macEditCommand('ArrowLeft', { command: true }), null);
+  assert.equal(macEditCommand('Enter', { command: true }), null);
 });

@@ -269,7 +269,10 @@ function voiceStubs(options) {
     if (control.gum === 'deny') throw Object.assign(new Error('Permission dismissed'), { name: 'NotAllowedError' });
     if (control.gum === 'missing') throw Object.assign(new Error('No microphone'), { name: 'NotFoundError' });
     control.permission = 'granted';
-    const settings = { echoCancellation: control.echo };
+    // control.echo is what system-wide cancellation yields; a request for
+    // Chrome's own canceller (macOS) gets exactly that.
+    const requested = constraints?.audio?.echoCancellation;
+    const settings = { echoCancellation: requested === true ? true : control.echo };
     const track = {
       kind: 'audio',
       readyState: 'live',
@@ -284,6 +287,8 @@ function voiceStubs(options) {
   if (navigator.mediaDevices) {
     try {
       Object.defineProperty(navigator.mediaDevices, 'getUserMedia', { configurable: true, value: getUserMedia });
+      // The host's real devices must not steer the scripted microphone.
+      Object.defineProperty(navigator.mediaDevices, 'enumerateDevices', { configurable: true, value: async () => [] });
     } catch {}
   }
   if (navigator.permissions) {
