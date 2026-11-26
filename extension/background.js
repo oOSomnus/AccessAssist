@@ -2271,12 +2271,15 @@ async function debuggerSession(tabId) {
   }
   // docFrames and frameTree are caches of what the browser reported; every
   // target or context change drops both, so they never outlive the layout.
+  // frameEpoch counts those drops: a collection that awaited across one must
+  // not store what it saw.
   const cdp = {
-    tabId, sessions: new Set(['']), contexts: [], docFrames: new Map(), frameTree: null,
+    tabId, sessions: new Set(['']), contexts: [], docFrames: new Map(), frameTree: null, frameEpoch: 0,
   };
   const forgetFrames = () => {
     cdp.docFrames.clear();
     cdp.frameTree = null;
+    cdp.frameEpoch += 1;
   };
   const onEvent = (source, method, params) => {
     if (source?.tabId !== tabId) return;
@@ -2304,6 +2307,7 @@ async function debuggerSession(tabId) {
       });
       // A new context can mean a new frame in the tree.
       cdp.frameTree = null;
+      cdp.frameEpoch += 1;
     } else if (method === 'Runtime.executionContextDestroyed') {
       cdp.contexts = cdp.contexts.filter((context) => !(context.sessionId === sessionId
         && context.contextId === params?.executionContextId));
@@ -2331,6 +2335,7 @@ async function documentFrameMap(cdp, tokens) {
   const wanted = new Set(tokens.filter(Boolean));
   const found = new Map();
   if (!wanted.size) return found;
+  const epoch = cdp.frameEpoch;
   // Contexts already matched to a document, so each is evaluated at most once.
   const matched = new Set();
   for (const token of wanted) {
@@ -2359,18 +2364,25 @@ async function documentFrameMap(cdp, tokens) {
     // Bounded discovery of browser-provided contexts; no page action runs yet.
     await sleep(20);
   }
-  for (const [token, info] of found) cdp.docFrames.set(token, info);
+  if (cdp.frameEpoch === epoch) {
+    for (const [token, info] of found) cdp.docFrames.set(token, info);
+  }
   return found;
 }
 
 async function frameTreeSessions(cdp) {
   if (cdp.frameTree) return cdp.frameTree;
+  const epoch = cdp.frameEpoch;
   const roots = new Map();
   const parents = new Map();
+  let complete = true;
   const collect = async (sessionId) => {
     const response = await cdp.send('Page.getFrameTree', {}, sessionId).catch(() => null);
     const tree = response?.frameTree;
-    if (!tree) return;
+    if (!tree) {
+      complete = false;
+      return;
+    }
     roots.set(tree.frame.id, sessionId);
     const walk = (node, parentId) => {
       if (parentId && !parents.has(node.frame.id)) parents.set(node.frame.id, parentId);
@@ -2382,8 +2394,11 @@ async function frameTreeSessions(cdp) {
   for (const sessionId of [...cdp.sessions]) {
     if (sessionId) await collect(sessionId);
   }
-  cdp.frameTree = { roots, parents };
-  return cdp.frameTree;
+  const frameTree = { roots, parents };
+  // A failed or interrupted collection still answers this caller but is not
+  // kept, so the next call reads the tree again.
+  if (complete && cdp.frameEpoch === epoch) cdp.frameTree = frameTree;
+  return frameTree;
 }
 
 async function frameOffset(cdp, frameId) {
