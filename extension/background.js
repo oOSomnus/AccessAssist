@@ -718,7 +718,8 @@ async function route(message) {
 }
 
 const STALE_PAGE = 'The page changed; observe it again';
-const REFUSE_CAPTURE = 'Screenshot unavailable: this page has embedded or sensitive areas that cannot be safely frozen.';
+const NOT_WEB_PAGE = 'Screenshot unavailable: this tab is not showing a web page.';
+const FRAME_IMAGE = 'This image is inside an embedded frame, which cannot be captured on its own.';
 
 async function ensureAgent(tabId, frame) {
   if (!frame?.documentId) throw new Error(STALE_PAGE);
@@ -863,6 +864,8 @@ async function observePage(tab, allowedOrigins, { visual = false, expectedDocume
   const allowed = new Set(allowedOrigins);
   const sections = [];
   const targets = [];
+  const grids = [];
+  let omittedTargets = 0;
   const blockedFrames = [];
   const blockedIds = [];
   let merged = null;
@@ -925,11 +928,33 @@ async function observePage(tab, allowedOrigins, { visual = false, expectedDocume
         items: section.items.map(({ role, name, text }) => ({ role, name, text })),
       });
     }
+    // Grid cells are registered like any target, so steps name them by id,
+    // but the model reads them inside their grid rather than one by one.
+    const gridNodes = new Set((observation.grids ?? []).flatMap((grid) => grid.cells.flat()).filter((id) => id !== null));
+    const cellTargets = new Map();
     for (const target of observation.targets ?? []) {
       const meta = { ...target, tabId: tab.id, frameId: frame.frameId, snapshotId: observation.snapshotId };
       entry.targets.set(target.nodeId, meta);
-      targets.push(modelTarget(entry, target));
+      const model = modelTarget(entry, target);
+      if (gridNodes.has(target.nodeId)) cellTargets.set(target.nodeId, model);
+      else targets.push(model);
     }
+    for (const grid of observation.grids ?? []) {
+      grids.push(Object.fromEntries(Object.entries({
+        region: label,
+        caption: grid.caption || null,
+        columnLabels: grid.columnLabels,
+        rowLabels: grid.rowLabels,
+        rowLabelsAt: grid.rowLabelsAt,
+        rowsPerLabel: grid.rowsPerLabel,
+        partial: grid.partial || null,
+        cells: grid.cells.map((row) => row.map((nodeId) => {
+          const cell = nodeId === null ? null : cellTargets.get(nodeId);
+          return cell ? { id: cell.id, styleState: cell.styleState ?? null } : null;
+        })),
+      }).filter(([, value]) => value !== null && value !== undefined)));
+    }
+    omittedTargets += Number(observation.omittedTargets) || 0;
     if (frame.frameId === 0 && observation.visual) {
       mergedVisual = observation.visual;
       visualNodeId = observation.visual.nodeId;
@@ -955,6 +980,8 @@ async function observePage(tab, allowedOrigins, { visual = false, expectedDocume
     viewport: merged?.viewport ?? null,
     sections,
     targets,
+    ...(grids.length ? { grids } : {}),
+    ...(omittedTargets ? { omittedTargets } : {}),
     nextCursor: merged?.nextCursor ?? null,
     blockedFrames,
     visual: null,
@@ -984,6 +1011,7 @@ async function observePage(tab, allowedOrigins, { visual = false, expectedDocume
     scale: capture.scale,
     pixels: capture.pixels,
     fingerprint: capture.fingerprint,
+    masks: capture.masks ?? [],
     createdAt: Date.now(),
   };
   record.visual = metadata;
@@ -993,6 +1021,8 @@ async function observePage(tab, allowedOrigins, { visual = false, expectedDocume
   if (visualTarget) {
     visualTarget.kind = 'visual-region';
     visualTarget.visual = metadata;
+    // Point actions inside a painted-over area are refused by policy.
+    visualTarget.masks = metadata.masks;
   }
   const { fingerprint, pixels, nodeId, snapshotId, frameId, ...visible } = metadata;
   return { ...result, visual: { ...visible, id: targetId(merged.snapshotId, visualNodeId), dataUrl: capture.dataUrl } };
@@ -1154,7 +1184,7 @@ function internalSteps(tabId, steps) {
 
 async function proposeAction(tab, message) {
   const observation = observations.get(tab.id);
-  if (!observation) return { ok: false, errors: ['Observe the page first'] };
+  if (!observation) return { ok: false, errors: ['No current page reading: earlier target ids expired (the page changed or the extension restarted). Call observe_page and plan from the new ids'] };
   const session = createSession();
   const documentIds = new Map();
   for (const entry of registry.values()) {
@@ -1232,7 +1262,6 @@ async function confirmProposal(tab, message) {
     proposals.delete(message.proposalId);
     return { ok: true, action: 'cancel' };
   }
-  if (outcome.action === 'risk') return { ok: true, action: 'risk' };
   return executeAccepted(tab, message.proposalId, outcome.session);
 }
 
@@ -2540,7 +2569,7 @@ const PASSWORD_AUTOCOMPLETE = new Set(['current-password', 'new-password']);
 
 function captureError(error) {
   const message = String(error?.message ?? '');
-  if (message === REFUSE_CAPTURE || message === STALE_PAGE) return message;
+  if (message === NOT_WEB_PAGE || message === STALE_PAGE || message === TOO_LARGE_TO_MASK) return message;
   return `Could not capture the screen: ${message || 'the page did not respond'}`;
 }
 
@@ -2551,11 +2580,12 @@ async function captureCensus(tab, expectedDocumentId) {
   } catch {
     throw new Error(STALE_PAGE);
   }
-  if (!fresh || fresh.status !== 'complete') throw new Error(REFUSE_CAPTURE);
+  if (!fresh) throw new Error(STALE_PAGE);
+  // Embedded frames and a page still loading (ads often never finish) no
+  // longer stop a screenshot: frames are painted over instead.
   const frames = await framesFor(tab.id);
   const top = pinnedTop(frames, expectedDocumentId);
-  if (frames.length !== 1) throw new Error(REFUSE_CAPTURE);
-  if (!httpUrl(top.url)) throw new Error(REFUSE_CAPTURE);
+  if (!httpUrl(top.url)) throw new Error(NOT_WEB_PAGE);
   return { top, frames };
 }
 
@@ -2568,29 +2598,52 @@ function attributesOf(node) {
   return map;
 }
 
-// Any embedded document or password field makes the pixels unprovable, even
-// when the field is hidden or lives in a shadow root.
-function unsafeDomTree(root) {
+const TOO_LARGE_TO_MASK = 'The page is too large to check for private areas; screenshot not taken.';
+const EMBEDDED_TAGS = new Set(['IFRAME', 'FRAME', 'OBJECT', 'EMBED']);
+
+// Areas a screenshot must not show: embedded documents (content from another
+// site the user was not asked about) and password fields, wherever they live,
+// shadow roots included. They are painted black rather than refusing the whole
+// screenshot. Fields that are not rendered have no box and show nothing.
+async function sensitiveAreas(cdp, root, viewport) {
+  const found = [];
   const stack = [root];
   let visited = 0;
   while (stack.length) {
-    if (visited > 200_000) return true;
+    if (visited > 200_000) throw new Error(TOO_LARGE_TO_MASK);
     visited += 1;
     const node = stack.pop();
     if (!node) continue;
     const name = String(node.nodeName ?? '').toUpperCase();
-    if (['IFRAME', 'FRAME', 'OBJECT', 'EMBED'].includes(name)) return true;
-    if (node.contentDocument) return true;
+    if (EMBEDDED_TAGS.has(name) || node.contentDocument) {
+      found.push({ node, reason: 'embedded' });
+      continue;
+    }
     if (name === 'INPUT' || name === 'TEXTAREA') {
       const attrs = attributesOf(node);
-      if (name === 'INPUT' && (attrs.get('type') ?? '').toLowerCase() === 'password') return true;
-      if (PASSWORD_AUTOCOMPLETE.has((attrs.get('autocomplete') ?? '').toLowerCase())) return true;
+      if ((name === 'INPUT' && (attrs.get('type') ?? '').toLowerCase() === 'password')
+        || PASSWORD_AUTOCOMPLETE.has((attrs.get('autocomplete') ?? '').toLowerCase())) {
+        found.push({ node, reason: 'password' });
+      }
     }
     for (const child of node.children ?? []) stack.push(child);
     for (const shadow of node.shadowRoots ?? []) stack.push(shadow);
-    if (node.templateContent) stack.push(node.templateContent);
   }
-  return false;
+  const areas = [];
+  for (const { node, reason } of found) {
+    const box = await cdp.send('DOM.getBoxModel', { backendNodeId: node.backendNodeId }).catch(() => null);
+    const quad = box?.model?.border;
+    if (!Array.isArray(quad) || quad.length < 8) continue;
+    const xs = [quad[0], quad[2], quad[4], quad[6]];
+    const ys = [quad[1], quad[3], quad[5], quad[7]];
+    const left = Math.max(0, Math.floor(Math.min(...xs)) - 1);
+    const top = Math.max(0, Math.floor(Math.min(...ys)) - 1);
+    const right = Math.min(viewport.width, Math.ceil(Math.max(...xs)) + 1);
+    const bottom = Math.min(viewport.height, Math.ceil(Math.max(...ys)) + 1);
+    if (right <= left || bottom <= top) continue;
+    areas.push({ x: left, y: top, width: right - left, height: bottom - top, reason });
+  }
+  return areas;
 }
 
 function debuggerEventBarrier(tabId, method, timeoutMs) {
@@ -2643,8 +2696,7 @@ async function withPausedRenderer(tab, expectedDocumentId, { prepare = null, res
     await cdp.send('DOM.enable').catch(() => {});
     const document = await cdp.send('DOM.getDocument', { depth: -1, pierce: true });
     if (!document?.root) throw new Error('Could not inspect the page safely; screenshot not taken');
-    if (unsafeDomTree(document.root)) throw new Error(REFUSE_CAPTURE);
-    value = await run(cdp, prepared);
+    value = await run(cdp, prepared, document.root);
   } catch (error) {
     failure = error;
   } finally {
@@ -2717,7 +2769,9 @@ async function blobToDataUrl(blob) {
   return `data:${blob.type || 'image/png'};base64,${btoa(binary)}`;
 }
 
-async function viewportShot(cdp, viewport, scroll) {
+// masks are CSS viewport rects painted black before anything reads the
+// pixels, so the image, its fingerprint and later comparisons all agree.
+async function viewportShot(cdp, viewport, scroll, masks = []) {
   const captured = await cdp.send('Page.captureScreenshot', {
     format: 'png',
     fromSurface: true,
@@ -2732,7 +2786,19 @@ async function viewportShot(cdp, viewport, scroll) {
   if (bitmap.width !== Math.round(viewport.width * scale) || bitmap.height !== Math.round(viewport.height * scale)) {
     throw new Error('The browser cropped the screenshot; screenshot not taken');
   }
-  return { dataUrl: `data:image/png;base64,${captured.data}`, bitmap, scale };
+  if (!masks.length) return { dataUrl: `data:image/png;base64,${captured.data}`, bitmap, scale };
+  const canvas = new OffscreenCanvas(bitmap.width, bitmap.height);
+  const context = canvas.getContext('2d');
+  context.drawImage(bitmap, 0, 0);
+  bitmap.close();
+  context.fillStyle = '#000';
+  for (const area of masks) {
+    const x = Math.floor(area.x * scale);
+    const y = Math.floor(area.y * scale);
+    context.fillRect(x, y, Math.ceil((area.x + area.width) * scale) - x, Math.ceil((area.y + area.height) * scale) - y);
+  }
+  const blob = await canvas.convertToBlob({ type: 'image/png' });
+  return { dataUrl: await blobToDataUrl(blob), bitmap: canvas.transferToImageBitmap(), scale };
 }
 
 async function captureViewport(tab, visual, { expectedDocumentId }) {
@@ -2747,8 +2813,9 @@ async function captureViewport(tab, visual, { expectedDocumentId }) {
       return measureViewport(cdp);
     },
     restore: (cdp) => setLauncherHidden(cdp, false),
-    run: async (cdp, viewport) => {
-      const captured = await viewportShot(cdp, viewport, { x: viewport.scrollX, y: viewport.scrollY });
+    run: async (cdp, viewport, root) => {
+      const masks = await sensitiveAreas(cdp, root, viewport);
+      const captured = await viewportShot(cdp, viewport, { x: viewport.scrollX, y: viewport.scrollY }, masks);
       const digest = await pixelDigest(captured.bitmap);
       const width = captured.bitmap.width;
       const height = captured.bitmap.height;
@@ -2762,6 +2829,7 @@ async function captureViewport(tab, visual, { expectedDocumentId }) {
         scroll: { x: viewport.scrollX, y: viewport.scrollY },
         pixels: digest.pixels,
         fingerprint: digest.fingerprint,
+        masks,
       };
     },
   });
@@ -2777,7 +2845,7 @@ async function grabPixels(cdp, visual, beforeState, { validate = true } = {}) {
   const width = Math.min(current.width, visual.viewport.width);
   const height = Math.min(current.height, visual.viewport.height);
   if (width < 1 || height < 1) return { error: 'The page shrank; observe it again' };
-  const captured = await viewportShot(cdp, { width, height }, visual.scroll)
+  const captured = await viewportShot(cdp, { width, height }, visual.scroll, visual.masks ?? [])
     .catch((error) => ({ error: error?.message ?? 'Could not capture the screen' }));
   if (captured.error) return { error: captured.error };
   const digest = await pixelDigest(captured.bitmap);
@@ -2812,7 +2880,7 @@ async function captureTarget(tab, message) {
   const found = registryTarget(tab.id, message.id);
   if (!found) return { error: 'Observe the image again first' };
   if (!['img', 'canvas', 'svg'].includes(found.target.tag)) return { error: 'Target is not an image' };
-  if (found.entry.frameId !== 0) return { error: REFUSE_CAPTURE };
+  if (found.entry.frameId !== 0) return { error: FRAME_IMAGE };
   const fresh = await chrome.tabs.get(tab.id).catch(() => null);
   if (!fresh?.active) return { error: 'Switch back to the page to capture first' };
   const capture = await withPausedRenderer(tab, message.expectedDocumentId, {
@@ -2828,10 +2896,11 @@ async function captureTarget(tab, message) {
       return state;
     },
     restore: (cdp) => setLauncherHidden(cdp, false),
-    run: async (cdp, state) => {
+    run: async (cdp, state, root) => {
       const viewport = state.viewport;
       if (!viewport) throw new Error('Could not measure the page');
-      const captured = await viewportShot(cdp, viewport, { x: viewport.scrollX, y: viewport.scrollY });
+      const masks = await sensitiveAreas(cdp, root, viewport);
+      const captured = await viewportShot(cdp, viewport, { x: viewport.scrollX, y: viewport.scrollY }, masks);
       const x = Math.max(0, state.rect.x);
       const y = Math.max(0, state.rect.y);
       const right = Math.min(state.rect.x + state.rect.width, viewport.width);

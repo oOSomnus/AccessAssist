@@ -15,7 +15,6 @@ import {
 
 async function run(panel) {
   await answerWhen(panel, 'Run this?', 0);
-  await answerWhen(panel, 'Run anyway?', 0);
 }
 
 function children(context) {

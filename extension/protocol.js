@@ -3,6 +3,9 @@
 export const MAX_OPTIONS = 9;
 export const MAX_LABEL_WORDS = 4;
 export const MAX_LABEL_LATIN = 24;
+// One proposal may carry a whole task (for example every cell of a schedule
+// grid) so the user confirms it once, not once per batch.
+export const MAX_STEPS = 200;
 export const STEP_TYPES = Object.freeze([
   'set_value', 'set_checked', 'select_option', 'click', 'hover', 'drag', 'press_key', 'navigate', 'set_alt', 'blur',
 ]);
@@ -63,7 +66,7 @@ const stepSchema = {
 export const TOOLS = Object.freeze([
   {
     name: 'observe_page',
-    description: 'Re-read the visible content, sections and target list of the current page. Targets are visible and on screen unless they say visible false or inViewport false; tag is given only when it differs from role; near holds the text of a label above or left of an unnamed control. A target\'s style names an entry in styles (its colors and class); targets with the same style look alike, which often means the same state. Set visual true only when page structure is not enough: the user must separately allow a screenshot, and the result explains CSS viewport coordinates for a single point action. Observe again after the page changes.',
+    description: 'Re-read the visible content, sections and target list of the current page. Targets are visible and on screen unless they say visible false or inViewport false; tag is given only when it differs from role; near holds the text of a label above or left of an unnamed control. Unnamed cells laid out in rows and columns are listed in grids instead of targets, with column and row labels, the id of every cell and each cell\'s style; omittedTargets counts targets left out to keep the result short, so scroll and observe again to reach them. A target\'s style names an entry in styles (its colors and class); targets with the same style look alike, which often means the same state. Set visual true only when page structure is not enough: the user must separately allow a screenshot, and the result explains CSS viewport coordinates for a single point action. Observe again after the page changes.',
     parameters: schema({
       cursor: { type: 'string', description: 'Cursor to continue reading' },
       visual: { type: 'boolean', description: 'Request a masked viewport screenshot and visual-region target after separate consent' },
@@ -104,10 +107,10 @@ export const TOOLS = Object.freeze([
   },
   {
     name: 'propose_action',
-    description: 'Change the page. Low-risk steps (typing in ordinary fields, checking boxes, choosing options, toggling checkable cells or options, hovering) run immediately and can be undone; anything else waits for the user to confirm. Use ask_user first when required information is unclear; do not guess. Prefer set_value for ordinary form fields; set blur false only when the field must stay focused, for example to pick an autocomplete suggestion afterwards. A hover, blur, drag, screenshot point, double click, right click, held or modified click must be proposed alone. The result is {outcome, page}, where page is the page after the action.',
+    description: 'Change the page. Low-risk steps (typing in ordinary fields, checking boxes, choosing options, toggling checkable cells or options, hovering) run immediately and can be undone; anything else waits for the user to confirm. Use ask_user first when required information is unclear; do not guess. Prefer set_value for ordinary form fields; set blur false only when the field must stay focused, for example to pick an autocomplete suggestion afterwards. Put every step of the user\'s request in one proposal (up to ' + MAX_STEPS + ' steps) so the user confirms once; the summary must say everything the steps change, for example the days and time ranges of grid cells. Drags between two observed targets may share a proposal; a hover, blur, screenshot point or screenshot drag, double click, right click, held or modified click must be proposed alone. The result is {outcome, page}, where page is the page after the action.',
     parameters: schema({
       summary: { type: 'string', description: 'One sentence describing what will be done' },
-      steps: { type: 'array', minItems: 1, maxItems: 20, items: stepSchema },
+      steps: { type: 'array', minItems: 1, maxItems: MAX_STEPS, items: stepSchema },
     }, ['summary', 'steps']),
   },
   {

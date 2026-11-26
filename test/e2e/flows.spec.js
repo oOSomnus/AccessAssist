@@ -503,16 +503,15 @@ test('a stale choice button does not answer the new question', async () => {
     const page = await openFixture(context, '/frame-overlay');
     const panel = await openPanel(context, extensionId);
     await sendText(panel, 'Click the same-origin button.');
-    await answerWhen(panel, 'page text', 0);
-    await expect(panel.locator('#ask-question')).toContainText('Run this?');
+    await expect(panel.locator('#ask-question')).toContainText('page text');
     await panel.evaluate(() => {
       window.__staleChoice = document.querySelector('#ask-options button');
     });
     await answer(panel, 0);
-    await expect(panel.locator('#ask-question')).toContainText('Run anyway?');
+    await expect(panel.locator('#ask-question')).toContainText('Run this?');
     await panel.evaluate(() => window.__staleChoice.click());
     await panel.waitForTimeout(200);
-    await expect(panel.locator('#ask-question')).toContainText('Run anyway?');
+    await expect(panel.locator('#ask-question')).toContainText('Run this?');
     await expect(page.locator('#frame-clicks')).toHaveText('0');
   } finally {
     await context.close();
@@ -615,7 +614,6 @@ test('a parent overlay over an iframe blocks the click', async () => {
     await sendText(panel, 'Click the same-origin button.');
     await answerWhen(panel, 'page text', 0);
     await answerWhen(panel, 'Run this?', 0);
-    await answerWhen(panel, 'Run anyway?', 0);
 
     await expect.poll(async () => announcements(panel), { timeout: 30_000 }).toContain('covered');
     await expect(page.locator('#frame-clicks')).toHaveText('0');
@@ -701,7 +699,6 @@ test('submit needs two confirmations and reports that undo is unavailable', asyn
     await sendText(panel, 'Submit the form.');
     await answerWhen(panel, 'page text', 0);
     await answerWhen(panel, 'Run this?', 0);
-    await answerWhen(panel, 'Run anyway?', 0);
     await expect(page.locator('#submits')).toHaveText('1');
     await expect.poll(async () => (await announcements(panel)).includes('cannot be undone')).toBe(true);
     await expect(page.locator('#submits')).toHaveText('1');
@@ -792,7 +789,7 @@ test('image choice cancels without upload and AI choice sends a cropped screensh
   }
 });
 
-test('regression: a framed page is refused for AI image reading without pixels', async () => {
+test('regression: a framed page still allows AI image reading', async () => {
   const { context, extensionId } = await launch();
   try {
     await resetMock();
@@ -804,10 +801,8 @@ test('regression: a framed page is refused for AI image reading without pixels',
     await answerWhen(panel, 'How should I describe this image?', 0);
     await page.bringToFront();
     await answerWhen(panel, 'screenshot', 0);
-    const refusal = 'Screenshot unavailable: this page has embedded or sensitive areas that cannot be safely frozen.';
-    await expect.poll(async () => JSON.stringify(await mockRequests()), { timeout: 30_000 }).toContain(refusal);
-    const requests = JSON.stringify(await mockRequests());
-    expect(requests).not.toContain('image_url');
+    await expect(panel.locator('#transcript')).toContainText('red circle', { timeout: 30_000 });
+    expect(JSON.stringify(await mockRequests())).toContain('image_url');
     expect(await page.locator('#noalt').getAttribute('alt')).toBeNull();
   } finally {
     await context.close();
@@ -823,7 +818,6 @@ test('same-origin iframe clicks use mapped coordinates', async () => {
     await sendText(panel, 'Click the same-origin button.');
     await answerWhen(panel, 'Allow these sources', 1);
     await answerWhen(panel, 'Run this?', 0);
-    await answerWhen(panel, 'Run anyway?', 0);
     await expect(page.locator('#frame-clicks')).toHaveText('1');
   } finally {
     await context.close();
@@ -839,7 +833,6 @@ test('duplicate same-origin frames keep their own document identity', async () =
     await sendText(panel, 'Click the second frame button.');
     await answerWhen(panel, 'page text', 0);
     await answerWhen(panel, 'Run this?', 0);
-    await answerWhen(panel, 'Run anyway?', 0);
 
     await expect(page.locator('#clicks-two')).toHaveText('1');
     await expect(page.locator('#clicks-one')).toHaveText('0');
@@ -857,7 +850,6 @@ test('cross-origin iframe only loads after consent and clicks correctly', async 
     await sendText(panel, 'Click the cross-origin button.');
     await answerWhen(panel, 'Allow these sources', 0);
     await answerWhen(panel, 'Run this?', 0);
-    await answerWhen(panel, 'Run anyway?', 0);
     await expect(page.locator('#frame-clicks')).toHaveText('1');
   } finally {
     await context.close();
@@ -1900,7 +1892,6 @@ test('pointer-only day cells are clicked by center coordinates', async () => {
     await answerWhen(panel, 'page text', 0);
     await answerWhen(panel, 'Run this?', 0);
     await page.bringToFront();
-    await answerWhen(panel, 'Run anyway?', 0);
 
     await expect(panel.locator('#transcript')).toContainText('Selected Monday and Wednesday at 2 PM.', { timeout: 30_000 });
     await expect(page.locator('#Day-1-2')).toHaveClass(/selected/u);
@@ -1926,7 +1917,6 @@ test('weekday cells in a layout table are selected and verified', async () => {
 
     await answerWhen(panel, 'Run this?', 0);
     await page.bringToFront();
-    await answerWhen(panel, 'Run anyway?', 0);
 
     await expect(panel.locator('#transcript')).toContainText('Selected Monday and Wednesday.', { timeout: 30_000 });
     const oracle = await page.evaluate(() => ({
@@ -1968,7 +1958,6 @@ test('a constrained key press toggles a custom control', async () => {
     await sendText(panel, 'Use the keyboard: press Enter on the Toggle.');
     await answerWhen(panel, 'page text', 0);
     await answerWhen(panel, 'Run this?', 0);
-    await answerWhen(panel, 'Run anyway?', 0);
 
     await expect(panel.locator('#transcript')).toContainText('Pressed Enter on the toggle.', { timeout: 30_000 });
     await expect(page.locator('#toggle')).toHaveAttribute('aria-pressed', 'true');
@@ -2013,7 +2002,6 @@ test('a screenshot click needs image consent and hits the canvas control', async
     await answerWhen(panel, 'screenshot', 0);
     await answerWhen(panel, 'Run this?', 0);
     await page.bringToFront();
-    await answerWhen(panel, 'Run anyway?', 0);
 
     await expect(panel.locator('#transcript')).toContainText('Clicked the visible control.', { timeout: 30_000 });
     const state = await page.evaluate(() => ({ ...document.body.dataset }));
@@ -2035,7 +2023,6 @@ test('a visual drag uses the latest screenshot coordinates', async () => {
     await answerWhen(panel, 'screenshot', 0);
     await answerWhen(panel, 'Run this?', 0);
     await page.bringToFront();
-    await answerWhen(panel, 'Run anyway?', 0);
 
     await expect(panel.locator('#transcript')).toContainText('Dragged across the canvas.', { timeout: 30_000 });
     const state = await page.evaluate(() => ({ ...document.body.dataset }));
@@ -2057,7 +2044,6 @@ test('a target that moves during confirmation is not clicked', async () => {
     await page.evaluate(() => {
       document.getElementById('Day-1-2').style.marginLeft = '60px';
     });
-    await answerWhen(panel, 'Run anyway?', 0);
 
     await expect.poll(async () => await announcements(panel)).toContain('Page state changed');
     await expect(page.locator('#commits')).toHaveText('0');
@@ -2082,7 +2068,6 @@ test('an overlay added during confirmation blocks the click', async () => {
       overlay.id = 'blocking-overlay';
       document.body.append(overlay);
     });
-    await answerWhen(panel, 'Run anyway?', 0);
 
     await expect.poll(async () => await announcements(panel)).toContain('covered');
     await expect(page.locator('#commits')).toHaveText('0');
@@ -2104,7 +2089,6 @@ test('scrolling during visual confirmation invalidates the screenshot point', as
     await answerWhen(panel, 'screenshot', 0);
     await answerWhen(panel, 'Run this?', 0);
     await page.evaluate(() => window.scrollBy(0, -40));
-    await answerWhen(panel, 'Run anyway?', 0);
 
     await expect.poll(async () => await announcements(panel)).toContain('scrolled');
     const state = await page.evaluate(() => ({ ...document.body.dataset }));
@@ -2128,7 +2112,6 @@ test('an image rejection falls back to text and keeps working', async () => {
     await expect.poll(async () => await announcements(panel)).toContain('did not accept the screenshot');
     await answerWhen(panel, 'Run this?', 0);
     await page.bringToFront();
-    await answerWhen(panel, 'Run anyway?', 0);
     await expect(panel.locator('#transcript')).toContainText('Clicked the visible control.', { timeout: 30_000 });
 
     const requests = await mockRequests();
@@ -2178,7 +2161,6 @@ test('a scrolled high-DPI page maps screenshot points to the real control', asyn
     await answerWhen(panel, 'screenshot', 0);
     await answerWhen(panel, 'Run this?', 0);
     await page.bringToFront();
-    await answerWhen(panel, 'Run anyway?', 0);
 
     await expect(panel.locator('#transcript')).toContainText('Clicked the visible control.', { timeout: 30_000 });
     const state = await page.evaluate(() => ({ ...document.body.dataset }));
@@ -2198,9 +2180,50 @@ test('a scrolled high-DPI page maps screenshot points to the real control', asyn
 });
 
 
-test('regression: a visual observation refuses embedded and password pages', async () => {
+// The screenshot reaches the model with embedded frames and password fields
+// painted solid black, and the areas are listed for the model.
+async function sentScreenshot() {
+  const requests = await mockRequests();
+  for (const request of [...requests].reverse()) {
+    for (const message of [...(request.body?.messages ?? [])].reverse()) {
+      if (!Array.isArray(message.content)) continue;
+      const part = message.content.find((entry) => entry.type === 'image_url');
+      if (part) return part.image_url?.url ?? part.image_url;
+    }
+  }
+  return null;
+}
+
+async function maskedAreas() {
+  const requests = await mockRequests();
+  for (const request of [...requests].reverse()) {
+    for (const message of [...(request.body?.messages ?? [])].reverse()) {
+      if (message.role !== 'tool' || typeof message.content !== 'string') continue;
+      try {
+        const masks = JSON.parse(message.content)?.visual?.masks;
+        if (Array.isArray(masks)) return masks;
+      } catch {}
+    }
+  }
+  return null;
+}
+
+async function pixelAt(page, dataUrl, x, y) {
+  return page.evaluate(async ({ url, px, py }) => {
+    const image = new Image();
+    image.src = url;
+    await image.decode();
+    const canvas = document.createElement('canvas');
+    canvas.width = image.width;
+    canvas.height = image.height;
+    const context = canvas.getContext('2d');
+    context.drawImage(image, 0, 0);
+    return [...context.getImageData(Math.round(px), Math.round(py), 1, 1).data.slice(0, 3)];
+  }, { url: dataUrl, px: x, py: y });
+}
+
+test('regression: a visual observation paints embedded frames and password fields black', async () => {
   const { context, extensionId } = await launch();
-  const refusal = 'Screenshot unavailable: this page has embedded or sensitive areas that cannot be safely frozen.';
   try {
     await resetMock();
     const page = await openFixture(context, '/masked');
@@ -2211,23 +2234,36 @@ test('regression: a visual observation refuses embedded and password pages', asy
     await sendText(panel, 'Run the mask check.');
     await answerWhen(panel, 'Allow these sources', 1);
     await answerWhen(panel, 'screenshot', 0);
-    await expect(panel.locator('#transcript')).toContainText('Saw the masked screen', { timeout: 30_000 });
+    await expect(panel.locator('#transcript')).toContainText('Saw the masked screen: true', { timeout: 30_000 });
 
-    let requests = JSON.stringify(await mockRequests());
-    expect(requests).toContain(refusal);
-    expect(requests).not.toContain('image_url');
+    const image = await sentScreenshot();
+    expect(image).toMatch(/^data:image\/png;base64,/u);
+    const masks = await maskedAreas();
+    expect(masks?.map((area) => area.reason).sort()).toEqual(['embedded', 'password']);
+    const frame = await page.locator('iframe').boundingBox();
+    const secret = await page.locator('#secret').boundingBox();
+    expect(await pixelAt(page, image, frame.x + frame.width / 2, frame.y + frame.height / 2)).toEqual([0, 0, 0]);
+    expect(await pixelAt(page, image, secret.x + secret.width / 2, secret.y + secret.height / 2)).toEqual([0, 0, 0]);
+    // The page around them is still shown (white background).
+    expect(await pixelAt(page, image, 5, 5)).not.toEqual([0, 0, 0]);
 
-    // A frame-free page with a hidden shadow-root password is refused too.
+    // A frame-free page with only hidden or shadow-root password fields is
+    // captured too: the visible field is black, hidden ones have no area.
     await resetMock();
     await page.goto('http://127.0.0.1:4173/password');
     await page.bringToFront();
     await expect(panel.locator('#page-line')).toContainText('Password check');
+    // Same tab, same site: the conversation and its per-site consent carry over,
+    // so neither page text nor the screenshot is asked about again.
     await sendText(panel, 'Run the mask check.');
-    await answerWhen(panel, 'page text', 0);
-    await answerWhen(panel, 'screenshot', 0);
-    await expect.poll(async () => JSON.stringify(await mockRequests()), { timeout: 30_000 }).toContain(refusal);
-    requests = JSON.stringify(await mockRequests());
-    expect(requests).not.toContain('image_url');
+    await expect.poll(async () => {
+      const shot = await sentScreenshot();
+      return Boolean(shot) && shot !== image;
+    }, { timeout: 30_000 }).toBe(true);
+    await expect(panel.locator('#ask-question')).toHaveText('');
+    const second = await sentScreenshot();
+    const visible = await page.locator('#visible-secret').boundingBox();
+    expect(await pixelAt(page, second, visible.x + visible.width / 2, visible.y + visible.height / 2)).toEqual([0, 0, 0]);
     expect(await page.locator('#visible-secret').inputValue()).toBe('hunter2');
   } finally {
     await context.close();

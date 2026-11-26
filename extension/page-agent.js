@@ -250,32 +250,328 @@
     };
   }
 
-  function geometryLabels(element) {
-    const rect = element.getBoundingClientRect();
-    let node = element;
-    let guard = 0;
-    while (node && guard < 6) {
-      guard += 1;
-      for (let sibling = node.previousElementSibling; sibling; sibling = sibling.previousElementSibling) {
-        if (!visible(sibling)) continue;
-        const text = clean(sibling.innerText).slice(0, MAX_NEAR_CHARS);
-        if (!text) continue;
-        const other = sibling.getBoundingClientRect();
-        const box = { x: Math.round(other.x), y: Math.round(other.y), width: Math.round(other.width), height: Math.round(other.height) };
-        if (Math.abs(other.bottom - rect.top) <= 160 && other.right > rect.left && other.left < rect.right) {
-          return { above: { text, rect: box }, left: null };
-        }
-        if (Math.abs(other.right - rect.left) <= 200 && other.bottom > rect.top && other.top < rect.bottom) {
-          return { above: null, left: { text, rect: box } };
-        }
-      }
-      node = node.parentElement;
-    }
-    return null;
+  // Rendered text lines inside a box, one entry per visual line. Labels are
+  // matched to controls by where their text is drawn, not by which element
+  // holds it: one element often holds a whole column of labels.
+  function lineBox(rect, text) {
+    return {
+      text,
+      left: rect.left,
+      top: rect.top,
+      right: rect.right,
+      bottom: rect.bottom,
+      cx: rect.left + rect.width / 2,
+      cy: rect.top + rect.height / 2,
+      height: rect.height,
+      width: rect.width,
+    };
   }
 
-  function nearLabels(element) {
-    return tableLabels(element) ?? geometryLabels(element);
+  function boxesMeet(a, b) {
+    return a.left < b.right && a.right > b.left && a.top < b.bottom && a.bottom > b.top;
+  }
+
+  function textLines(box, excluded = new Set()) {
+    const lines = [];
+    if (!document.body) return lines;
+    const roots = [document.body];
+    for (const element of deepElements()) {
+      if (element.shadowRoot && !isLauncher(element)) roots.push(element.shadowRoot);
+    }
+    const shown = new Map();
+    const parentShown = (parent) => {
+      if (!shown.has(parent)) {
+        let ok = !SKIP_TAGS.has(parent.tagName) && visible(parent);
+        for (let node = parent, depth = 0; ok && node && depth < 12; depth += 1) {
+          if (excluded.has(node)) ok = false;
+          node = node.parentElement;
+        }
+        shown.set(parent, ok);
+      }
+      return shown.get(parent);
+    };
+    const range = document.createRange();
+    let budget = 20_000;
+    for (const root of roots) {
+      const walker = document.createTreeWalker(root, NodeFilter.SHOW_TEXT);
+      for (let node = walker.nextNode(); node && budget > 0; node = walker.nextNode()) {
+        budget -= 1;
+        const text = clean(node.data);
+        if (!text) continue;
+        const parent = node.parentElement;
+        if (!parent) continue;
+        const outer = parent.getBoundingClientRect();
+        if (!boxesMeet(outer, box)) continue;
+        if (!parentShown(parent)) continue;
+        range.selectNodeContents(node);
+        const rects = [...range.getClientRects()].filter((rect) => rect.width > 0 && rect.height > 0);
+        if (!rects.length) continue;
+        if (rects.length === 1) {
+          const line = lineBox(rects[0], text.slice(0, MAX_NEAR_CHARS));
+          if (boxesMeet(line, box)) lines.push(line);
+          continue;
+        }
+        // One text node drawn on several lines: rebuild each line from words.
+        let current = null;
+        const flush = () => {
+          if (!current) return;
+          const line = lineBox(current.rect, clean(current.words.join(' ')).slice(0, MAX_NEAR_CHARS));
+          if (line.text && boxesMeet(line, box)) lines.push(line);
+        };
+        for (const match of node.data.matchAll(/\S+/gu)) {
+          range.setStart(node, match.index);
+          range.setEnd(node, match.index + match[0].length);
+          const rect = range.getBoundingClientRect();
+          if (rect.width <= 0 || rect.height <= 0) continue;
+          if (current && Math.abs(rect.top - current.rect.top) <= Math.max(2, rect.height / 2)) {
+            current.words.push(match[0]);
+            const left = Math.min(current.rect.left, rect.left);
+            const right = Math.max(current.rect.right, rect.right);
+            const top = Math.min(current.rect.top, rect.top);
+            const bottom = Math.max(current.rect.bottom, rect.bottom);
+            current.rect = { left, right, top, bottom, width: right - left, height: bottom - top };
+          } else {
+            flush();
+            current = { words: [match[0]], rect: { left: rect.left, right: rect.right, top: rect.top, bottom: rect.bottom, width: rect.width, height: rect.height } };
+          }
+        }
+        flush();
+      }
+    }
+    return lines;
+  }
+
+  function roundBox(line) {
+    return { x: Math.round(line.left), y: Math.round(line.top), width: Math.round(line.width), height: Math.round(line.height) };
+  }
+
+  // The nearest drawn text line above and the nearest to the left of a control.
+  function lineLabels(rect, lines) {
+    let above = null;
+    let left = null;
+    let aboveGap = Infinity;
+    let leftGap = Infinity;
+    for (const line of lines) {
+      const overGap = rect.top - line.bottom;
+      if (overGap >= -2 && overGap <= 100 && line.right > rect.left && line.left < rect.right && overGap < aboveGap) {
+        above = line;
+        aboveGap = overGap;
+      }
+      const sideGap = rect.left - line.right;
+      if (sideGap >= -2 && sideGap <= 200 && line.cy >= rect.top - 2 && line.cy <= rect.bottom + 2 && sideGap < leftGap) {
+        left = line;
+        leftGap = sideGap;
+      }
+    }
+    if (!above && !left) return null;
+    return {
+      above: above ? { text: above.text, rect: roundBox(above) } : null,
+      left: left ? { text: left.text, rect: roundBox(left) } : null,
+    };
+  }
+
+  const GRID_SIZE_TOLERANCE = 2;
+  const GRID_AXIS_TOLERANCE = 3;
+  const GRID_MIN_FILL = 0.8;
+  const MAX_GRID_CELLS = 2000;
+  const MAX_TARGETS = 200;
+
+  function clusterAxis(values) {
+    const sorted = [...values].sort((a, b) => a - b);
+    const centers = [];
+    let group = [];
+    const close = () => {
+      if (group.length) centers.push(group.reduce((sum, value) => sum + value, 0) / group.length);
+      group = [];
+    };
+    for (const value of sorted) {
+      if (group.length && value - group[group.length - 1] > GRID_AXIS_TOLERANCE) close();
+      group.push(value);
+    }
+    close();
+    return centers;
+  }
+
+  function nearestIndex(centers, value) {
+    let best = 0;
+    for (let index = 1; index < centers.length; index += 1) {
+      if (Math.abs(centers[index] - value) < Math.abs(centers[best] - value)) best = index;
+    }
+    return best;
+  }
+
+  // Runs of evenly spaced centers; a gap much wider than a cell starts a new run.
+  function splitRuns(centers, size) {
+    const runs = [];
+    let run = [];
+    for (const center of centers) {
+      if (run.length && center - run[run.length - 1] > Math.max(size * 1.8, size + 8)) {
+        runs.push(run);
+        run = [];
+      }
+      run.push(center);
+    }
+    if (run.length) runs.push(run);
+    return runs;
+  }
+
+  // Unnamed controls of one size laid out in rows and columns (a schedule,
+  // a seat map, a calendar of bare cells). Each grid is reported once with the
+  // text drawn along its top and left edge, so every cell has a row and a column.
+  function detectGrids(targets) {
+    const groups = [];
+    for (const target of targets) {
+      if (target.kind !== 'custom-control' || target.name || target.role === 'region') continue;
+      const { width, height } = target.rect;
+      if (width < 4 || height < 4) continue;
+      let group = groups.find((candidate) => Math.abs(candidate.width - width) <= GRID_SIZE_TOLERANCE
+        && Math.abs(candidate.height - height) <= GRID_SIZE_TOLERANCE);
+      if (!group) {
+        group = { width, height, members: [] };
+        groups.push(group);
+      }
+      group.members.push(target);
+    }
+    const grids = [];
+    for (const group of groups) {
+      if (group.members.length < 4) continue;
+      const center = (target) => ({
+        x: target.rect.x + target.rect.width / 2,
+        y: target.rect.y + target.rect.height / 2,
+      });
+      const xs = clusterAxis(group.members.map((target) => center(target).x));
+      const ys = clusterAxis(group.members.map((target) => center(target).y));
+      for (const columnRun of splitRuns(xs, group.width)) {
+        for (const rowRun of splitRuns(ys, group.height)) {
+          const cells = rowRun.map(() => columnRun.map(() => null));
+          let count = 0;
+          for (const target of group.members) {
+            const point = center(target);
+            const column = nearestIndex(columnRun, point.x);
+            const row = nearestIndex(rowRun, point.y);
+            if (Math.abs(columnRun[column] - point.x) > GRID_AXIS_TOLERANCE * 2) continue;
+            if (Math.abs(rowRun[row] - point.y) > GRID_AXIS_TOLERANCE * 2) continue;
+            if (cells[row][column] !== null) continue;
+            cells[row][column] = target;
+            count += 1;
+          }
+          const size = rowRun.length * columnRun.length;
+          if (count < 4 || count / size < GRID_MIN_FILL) continue;
+          // A short single row or column (seven weekday boxes) reads fine with
+          // per-control labels; a long one is one day's list of time slots.
+          const lattice = rowRun.length >= 2 && columnRun.length >= 2;
+          if (!lattice && Math.max(rowRun.length, columnRun.length) < 8) continue;
+          grids.push({
+            cells,
+            columns: columnRun,
+            rows: rowRun,
+            cellWidth: group.width,
+            cellHeight: group.height,
+          });
+        }
+      }
+    }
+    grids.sort((a, b) => (a.rows[0] - b.rows[0]) || (a.columns[0] - b.columns[0]));
+    return grids;
+  }
+
+  function gridBounds(grid) {
+    return {
+      left: grid.columns[0] - grid.cellWidth / 2,
+      right: grid.columns[grid.columns.length - 1] + grid.cellWidth / 2,
+      top: grid.rows[0] - grid.cellHeight / 2,
+      bottom: grid.rows[grid.rows.length - 1] + grid.cellHeight / 2,
+    };
+  }
+
+  function pitchOf(centers, size) {
+    return centers.length > 1 ? (centers[centers.length - 1] - centers[0]) / (centers.length - 1) : size;
+  }
+
+  // Column labels: text drawn just above a column and no wider than about one
+  // column, stacked lines joined top to bottom ("Nov 26" over "Thu").
+  function columnLabelsOf(grid, bounds, lines) {
+    const pitch = pitchOf(grid.columns, grid.cellWidth);
+    let labelTop = bounds.top;
+    const labels = grid.columns.map((center) => {
+      const left = center - pitch / 2;
+      const right = center + pitch / 2;
+      const candidates = lines
+        .filter((line) => line.bottom <= bounds.top + 2 && line.bottom >= bounds.top - 100
+          && line.cx >= left && line.cx <= right
+          && line.left >= left - pitch / 2 && line.right <= right + pitch / 2)
+        .sort((a, b) => b.bottom - a.bottom);
+      const stack = [];
+      for (const line of candidates) {
+        const nearest = stack.length ? stack[stack.length - 1] : null;
+        if (!nearest) {
+          if (bounds.top - line.bottom > 40) break;
+        } else if (nearest.top - line.bottom > Math.max(4, nearest.height * 0.6)) break;
+        stack.push(line);
+      }
+      if (stack.length) labelTop = Math.min(labelTop, stack[stack.length - 1].top);
+      return stack.reverse().map((line) => line.text).join(' ');
+    });
+    return { labels, labelTop };
+  }
+
+  // Row labels: text drawn left of the grid. A label either sits inside its
+  // row or on the line where its row starts; whichever the labels do as a
+  // group decides how each one is assigned.
+  function rowLabelsOf(grid, bounds, lines) {
+    const pitch = pitchOf(grid.rows, grid.cellHeight);
+    const candidates = lines.filter((line) => line.right <= bounds.left + 2
+      && line.right >= bounds.left - 220
+      && line.cy >= bounds.top - pitch && line.cy <= bounds.bottom + pitch
+      && line.height <= pitch * 4 + 16);
+    if (!candidates.length) return { labels: [], at: null, perLabel: null };
+    const offsets = candidates.map((line) => (line.cy - bounds.top) / pitch);
+    const drift = offsets.map((offset) => Math.abs(offset - Math.round(offset))).sort((a, b) => a - b);
+    const onEdges = drift[Math.floor(drift.length / 2)] < 0.25;
+    const byRow = new Map();
+    candidates.forEach((line, index) => {
+      const row = onEdges ? Math.round(offsets[index]) : Math.floor(offsets[index]);
+      if (row < 0 || row > grid.rows.length) return;
+      const previous = byRow.get(row);
+      if (!previous || line.right > previous.right) byRow.set(row, line);
+    });
+    const labels = [...byRow.entries()].sort((a, b) => a[0] - b[0]).map(([row, line]) => ({ row, text: line.text }));
+    let perLabel = null;
+    if (labels.length >= 3) {
+      const steps = new Set();
+      for (let index = 1; index < labels.length; index += 1) steps.add(labels[index].row - labels[index - 1].row);
+      if (steps.size === 1) perLabel = [...steps][0];
+    }
+    return { labels, at: onEdges ? 'row-top-edge' : 'row', perLabel };
+  }
+
+  function captionOf(bounds, labelTop, lines) {
+    let best = null;
+    for (const line of lines) {
+      const gap = labelTop - line.bottom;
+      if (gap < 0 || gap > 60) continue;
+      if (line.right <= bounds.left || line.left >= bounds.right) continue;
+      if (!best || gap < labelTop - best.bottom) best = line;
+    }
+    return best?.text ?? '';
+  }
+
+  function labelGrid(grid, lines) {
+    const bounds = gridBounds(grid);
+    const columns = columnLabelsOf(grid, bounds, lines);
+    const rows = rowLabelsOf(grid, bounds, lines);
+    return {
+      bounds,
+      columnLabels: columns.labels,
+      rowLabels: rows.labels,
+      rowLabelsAt: rows.at,
+      rowsPerLabel: rows.perLabel,
+      caption: captionOf(bounds, columns.labelTop, lines),
+    };
+  }
+
+  function nearLabels(element, lines) {
+    return tableLabels(element) ?? (lines ? lineLabels(element.getBoundingClientRect(), lines) : null);
   }
 
   function sensitiveRects() {
@@ -532,7 +828,6 @@
   function describeTarget(element, extra = {}) {
     const target = { ...stateOf(element), ...extra };
     target.capabilities = capabilitiesOf(element);
-    if (!target.name && target.kind === 'custom-control') target.near = nearLabels(element);
     return target;
   }
 
@@ -613,9 +908,57 @@
       used += size;
     }
     const sliceIds = new Set(slice.map((item) => item.nodeId));
-    const targets = allTargets
-      .filter((target) => target.inViewport || sliceIds.has(target.nodeId))
-      .slice(0, 200);
+    // A grid on screen is reported whole, cells below the fold included: the
+    // click path scrolls each cell into view, and a half grid would hide rows.
+    const grids = [];
+    const gridCellIds = new Set();
+    let gridBudget = MAX_GRID_CELLS;
+    for (const grid of detectGrids(allTargets)) {
+      const members = grid.cells.flat().filter(Boolean);
+      if (!members.some((target) => target.inViewport)) continue;
+      let rows = grid.cells;
+      let partial = false;
+      if (members.length > gridBudget) {
+        const keep = Math.floor(gridBudget / grid.columns.length);
+        if (keep < 1) break;
+        rows = rows.slice(0, keep);
+        partial = true;
+      }
+      for (const row of rows) for (const cell of row) if (cell) gridCellIds.add(cell.nodeId);
+      gridBudget -= rows.flat().filter(Boolean).length;
+      grids.push({ ...grid, cells: rows, rows: grid.rows.slice(0, rows.length), partial });
+    }
+    const others = allTargets
+      .filter((target) => !gridCellIds.has(target.nodeId) && (target.inViewport || sliceIds.has(target.nodeId)));
+    const targets = others.slice(0, MAX_TARGETS);
+    const omittedTargets = others.length - targets.length;
+    const unnamed = targets.filter((target) => !target.name && target.kind === 'custom-control');
+    if (grids.length || unnamed.length) {
+      const excluded = new Set([...gridCellIds].map((id) => nodes.get(id)).filter(Boolean));
+      const around = { left: -220, top: -120, right: window.innerWidth + 20, bottom: window.innerHeight + 20 };
+      for (const grid of grids) {
+        const bounds = gridBounds(grid);
+        around.top = Math.min(around.top, bounds.top - 120);
+        around.bottom = Math.max(around.bottom, bounds.bottom + 20);
+      }
+      const lines = textLines(around, excluded);
+      for (const target of unnamed) {
+        const element = nodes.get(target.nodeId);
+        if (element) target.near = nearLabels(element, lines);
+      }
+      for (const grid of grids) Object.assign(grid, labelGrid(grid, lines));
+      // A grid split off by a visual gap (dates that are not consecutive)
+      // shares its rows with the grid to its left and takes those row labels.
+      for (const grid of grids) {
+        if (grid.rowLabels.length) continue;
+        const twin = grids.find((other) => other !== grid && other.rowLabels.length
+          && other.bounds.right <= grid.bounds.left
+          && other.rows.length === grid.rows.length
+          && other.rows.every((center, index) => Math.abs(center - grid.rows[index]) <= GRID_AXIS_TOLERANCE));
+        if (twin) Object.assign(grid, { rowLabels: twin.rowLabels, rowLabelsAt: twin.rowLabelsAt, rowsPerLabel: twin.rowsPerLabel });
+      }
+    }
+    for (const target of allTargets) if (gridCellIds.has(target.nodeId)) targets.push(target);
     const snapshotId = crypto.randomUUID();
     if (visual) {
       visualNodeId = idFor(document.documentElement);
@@ -687,6 +1030,16 @@
       sections: groupSections(slice),
       targets: targets.map((target) => ({ ...target, docToken, snapshotId })),
       nextCursor: index < allItems.length ? String(index) : null,
+      grids: grids.map((grid) => ({
+        caption: grid.caption,
+        columnLabels: grid.columnLabels,
+        rowLabels: grid.rowLabels,
+        rowLabelsAt: grid.rowLabelsAt,
+        rowsPerLabel: grid.rowsPerLabel,
+        partial: grid.partial,
+        cells: grid.cells.map((row) => row.map((cell) => cell?.nodeId ?? null)),
+      })),
+      omittedTargets,
       blockedFrames: [],
       visual: visual ? {
         nodeId: visualNodeId,
