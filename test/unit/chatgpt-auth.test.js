@@ -14,6 +14,7 @@ import {
   createChatgptAuth,
   createPkce,
   idTokenClaims,
+  idTokenValid,
   isCallbackUrl,
   parseCallback,
   redirectUri,
@@ -37,11 +38,16 @@ const b64url = (value) => Buffer.from(JSON.stringify(value)).toString('base64url
 const idToken = (claims) => `${b64url({ alg: 'none' })}.${b64url(claims)}.sig`;
 const json = (body, status = 200) => new Response(JSON.stringify(body), { status, headers: { 'content-type': 'application/json' } });
 
-function tokenReply({ nonce, scope = SCOPES, refresh = 'rt-1', access = 'at-1', email = 'person@example.test', extra = {} } = {}) {
+// Clock in setup() starts at 1_000_000 ms; exp is in seconds.
+const claimsFor = ({ nonce, aud = 'oaiapp_1', email = 'person@example.test', ...rest }) => ({
+  iss: 'https://auth.openai.com', aud, exp: 1_000 + 3_600, nonce, email, sub: 'user-1', ...rest,
+});
+
+function tokenReply({ nonce, scope = SCOPES, refresh = 'rt-1', access = 'at-1', email = 'person@example.test', aud = 'oaiapp_1', claims = {}, extra = {} } = {}) {
   return {
     access_token: access,
     refresh_token: refresh,
-    id_token: idToken({ nonce, email, sub: 'user-1' }),
+    id_token: idToken(claimsFor({ nonce, aud, email, ...claims })),
     token_type: 'Bearer',
     expires_in: 3600,
     scope,
@@ -49,12 +55,13 @@ function tokenReply({ nonce, scope = SCOPES, refresh = 'rt-1', access = 'at-1', 
   };
 }
 
-function setup({ fetchImpl, local = area(), session = area(), clock = { now: 1_000_000 } } = {}) {
+function setup({ fetchImpl, local = area(), session = area(), clock = { now: 1_000_000 }, requestTimeoutMs } = {}) {
   const calls = [];
   const auth = createChatgptAuth({
     local,
     session,
     now: () => clock.now,
+    ...(requestTimeoutMs ? { requestTimeoutMs } : {}),
     fetchImpl: async (url, init = {}) => {
       calls.push({ url, init, form: init.body ? Object.fromEntries(new URLSearchParams(init.body)) : null });
       return fetchImpl(url, init, calls);
@@ -128,7 +135,7 @@ test('ID token claims decode for display, and garbage is null', () => {
 test('a completed sign-in exchanges the code and stores a remembered grant', async () => {
   // The nonce is only known once the attempt starts.
   let nonce;
-  const flow = await startedFlow({ fetchImpl: async () => json(tokenReply({ nonce })) });
+  const flow = await startedFlow({ fetchImpl: async () => json(tokenReply({ nonce, aud: ['oaiapp_9'] })) });
   nonce = flow.nonce;
   const hostId = flow.local.data[KEYS.hostId];
   assert.match(hostId, /^urn:uuid:/u);
@@ -165,6 +172,9 @@ test('a sign-in without plan scope, nonce match, or refresh token saves nothing'
   for (const [reply, pattern] of [
     [(nonce) => tokenReply({ nonce, scope: 'openid profile email offline_access' }), /use your plan/u],
     [() => tokenReply({ nonce: 'wrong' }), /verified/u],
+    [(nonce) => tokenReply({ nonce, aud: 'oaiapp_other' }), /verified/u],
+    [(nonce) => tokenReply({ nonce, claims: { iss: 'https://evil.example' } }), /verified/u],
+    [(nonce) => tokenReply({ nonce, claims: { exp: 999 } }), /verified/u],
     [(nonce) => tokenReply({ nonce, refresh: null }), /stay signed in/u],
   ]) {
     let nonce;
@@ -197,11 +207,27 @@ test('a declined or mismatched callback never reaches the token endpoint', async
   assert.equal(again.calls.length, 0);
 });
 
-test('an abandoned attempt times out and a closed tab cancels it', async () => {
+test('ID token checks cover issuer, audience, expiry and nonce', () => {
+  const good = claimsFor({ nonce: 'n' });
+  const check = (claims) => idTokenValid(claims, { clientId: 'oaiapp_1', nonce: 'n', now: 1_000_000 });
+  assert.equal(check(good), true);
+  assert.equal(check({ ...good, iss: 'https://auth.openai.com/' }), true);
+  assert.equal(check({ ...good, aud: ['other', 'oaiapp_1'] }), true);
+  assert.equal(check({ ...good, aud: undefined }), false);
+  assert.equal(check({ ...good, exp: undefined }), false);
+  assert.equal(check(null), false);
+});
+
+test('an abandoned attempt times out but its open tab stays private until it closes', async () => {
   const flow = await startedFlow({ fetchImpl: async () => json({}) });
   flow.clock.now += SIGN_IN_TIMEOUT_MS + 1;
-  assert.equal(await flow.auth.signInTabId(), null);
+  assert.equal(await flow.auth.pending(), null);
   assert.equal(flow.session.data[KEYS.outcome].status, 'failed');
+  assert.equal(await flow.auth.signInTabId(), 42);
+  await flow.auth.releaseTab(99);
+  assert.equal(await flow.auth.signInTabId(), 42);
+  await flow.auth.releaseTab(42);
+  assert.equal(await flow.auth.signInTabId(), null);
 
   const other = await startedFlow({ fetchImpl: async () => json({}) });
   // A cancel aimed at another tab leaves this attempt alone.
@@ -300,4 +326,48 @@ test('sign-out forgets the account and revokes only at the issuer', async () => 
   assert.deepEqual(await elsewhere.auth.signOut(), { revoked: false });
   assert.equal(elsewhere.calls.some((call) => call.url.includes('evil')), false);
   assert.equal(elsewhere.local.data[KEYS.auth], undefined);
+});
+
+test('a stalled token endpoint fails the sign-in instead of hanging', async () => {
+  const flow = await startedFlow({ requestTimeoutMs: 20, fetchImpl: () => new Promise(() => {}) });
+  const result = await flow.auth.completeSignIn(`${redirectUri()}?code=c&state=${flow.state}&client_id=oaiapp_1`);
+  assert.match(result.error, /Could not reach ChatGPT/u);
+  assert.equal(flow.session.data[KEYS.outcome].status, 'failed');
+  assert.equal(flow.local.data[KEYS.auth], undefined);
+  // The token queue is not held up either.
+  const stalled = setup({
+    requestTimeoutMs: 20,
+    fetchImpl: () => new Promise(() => {}),
+    local: area({ [KEYS.auth]: { clientId: 'oaiapp_1', refreshToken: 'rt-old' } }),
+  });
+  await assert.rejects(stalled.auth.accessToken(), (error) => error.code === 'network');
+  assert.deepEqual(await stalled.auth.signOut(), { revoked: false });
+});
+
+test('a sign-out that finishes during the exchange wins over the sign-in', async () => {
+  let release;
+  const gate = new Promise((resolve) => { release = resolve; });
+  let nonce;
+  const flow = await startedFlow({
+    fetchImpl: async (url) => {
+      if (url === DISCOVERY_URL) return json({ revocation_endpoint: 'https://auth.openai.com/oauth/revoke' });
+      if (url === TOKEN_URL) {
+        await gate;
+        return json(tokenReply({ nonce }));
+      }
+      return json({});
+    },
+  });
+  nonce = flow.nonce;
+  const completing = flow.auth.completeSignIn(`${redirectUri()}?code=c&state=${flow.state}&client_id=oaiapp_1`);
+  await new Promise((resolve) => setTimeout(resolve, 0));
+  await flow.auth.signOut();
+  release();
+  const result = await completing;
+  assert.match(result.error, /signed out/u);
+  assert.equal(flow.local.data[KEYS.auth], undefined);
+  assert.equal(flow.session.data[KEYS.access], undefined);
+  assert.equal(flow.session.data[KEYS.outcome].status, 'failed');
+  const revoke = flow.calls.find((call) => call.url.endsWith('/revoke'));
+  assert.equal(revoke.form.token, 'rt-1');
 });

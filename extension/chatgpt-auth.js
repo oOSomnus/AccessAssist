@@ -31,6 +31,9 @@ export const SIGN_IN_TIMEOUT_MS = 10 * 60_000;
 // Refresh a little before expiry so a long model request never starts with a
 // token that dies halfway through.
 const REFRESH_MARGIN_MS = 5 * 60_000;
+// Every call to the sign-in service has a deadline, so a stalled reply can
+// neither strand a sign-in nor hold up the token queue and sign-out.
+export const AUTH_REQUEST_TIMEOUT_MS = 30_000;
 
 // Storage keys. Local survives restarts (the user chose to stay signed in);
 // session holds the short-lived access token and the in-flight attempt.
@@ -40,6 +43,9 @@ export const KEYS = Object.freeze({
   access: 'chatgptAccess',
   pending: 'chatgptPending',
   outcome: 'chatgptSignIn',
+  // The sign-in tab, kept apart from the attempt: the tab stays private for
+  // as long as it is open, even after its attempt has expired.
+  tab: 'chatgptSignInTab',
 });
 
 // Refresh errors after which the grant is gone and only a new sign-in helps.
@@ -152,23 +158,57 @@ function epochMs(value) {
   return number < 1e12 ? number * 1000 : number;
 }
 
-async function postForm(fetchImpl, url, fields) {
-  let response;
+// Runs work(signal) with a deadline covering the whole exchange, body read
+// included. Expiry aborts the request and fails like an unreachable service.
+async function withDeadline(timeoutMs, work) {
+  const controller = new AbortController();
+  let timer;
+  const expired = new Promise((_, reject) => {
+    timer = setTimeout(() => {
+      controller.abort();
+      reject(new ApiError('network', 'ChatGPT sign-in did not answer in time', { timeoutMs }));
+    }, timeoutMs);
+  });
   try {
-    response = await fetchImpl(url, {
-      method: 'POST',
-      headers: { 'content-type': 'application/x-www-form-urlencoded', accept: 'application/json' },
-      body: new URLSearchParams(fields).toString(),
-    });
-  } catch (error) {
-    throw new ApiError('network', 'Could not reach ChatGPT sign-in', { cause: String(error?.message ?? error) });
+    return await Promise.race([work(controller.signal), expired]);
+  } finally {
+    clearTimeout(timer);
   }
-  const text = await response.text();
-  let json = null;
-  try {
-    json = text ? JSON.parse(text) : null;
-  } catch {}
-  return { status: response.status, ok: response.ok, json };
+}
+
+async function postForm(fetchImpl, url, fields, timeoutMs = AUTH_REQUEST_TIMEOUT_MS) {
+  return withDeadline(timeoutMs, async (signal) => {
+    let response;
+    let text;
+    try {
+      response = await fetchImpl(url, {
+        method: 'POST',
+        headers: { 'content-type': 'application/x-www-form-urlencoded', accept: 'application/json' },
+        body: new URLSearchParams(fields).toString(),
+        signal,
+      });
+      text = await response.text();
+    } catch (error) {
+      throw new ApiError('network', 'Could not reach ChatGPT sign-in', { cause: String(error?.message ?? error) });
+    }
+    let json = null;
+    try {
+      json = text ? JSON.parse(text) : null;
+    } catch {}
+    return { status: response.status, ok: response.ok, json };
+  });
+}
+
+// The ID token comes straight from the token endpoint over TLS, which stands
+// in for its signature (OIDC Core 3.1.3.7); issuer, audience, expiry and
+// nonce are still checked.
+export function idTokenValid(claims, { clientId, nonce, now }) {
+  if (!claims || claims.nonce !== nonce) return false;
+  if (claims.iss !== AUTH_ISSUER && claims.iss !== `${AUTH_ISSUER}/`) return false;
+  const audience = Array.isArray(claims.aud) ? claims.aud : [claims.aud];
+  if (!clientId || !audience.includes(clientId)) return false;
+  const expiresAt = epochMs(claims.exp);
+  return expiresAt !== null && expiresAt > now;
 }
 
 function oauthError(json) {
@@ -201,8 +241,21 @@ export function createChatgptAuth({
   cryptoImpl = globalThis.crypto,
   now = () => Date.now(),
   port = CALLBACK_PORT,
+  requestTimeoutMs = AUTH_REQUEST_TIMEOUT_MS,
 }) {
   let queue = Promise.resolve();
+  // Bumped by every sign-out, so a sign-in exchange that started before one
+  // cannot store its account afterwards.
+  let signOuts = 0;
+
+  // Token refreshes, sign-in commits and sign-outs run one at a time.
+  function serialized(work) {
+    const run = queue.then(work);
+    queue = run.catch(() => {});
+    return run;
+  }
+
+  const post = (url, fields) => postForm(fetchImpl, url, fields, requestTimeoutMs);
 
   async function read(area, key) {
     const stored = await area.get(key);
@@ -276,11 +329,18 @@ export function createChatgptAuth({
   async function attachTab(tabId) {
     const entry = await read(session, KEYS.pending);
     if (!entry) return;
-    await session.set({ [KEYS.pending]: { ...entry, tabId } });
+    await session.set({ [KEYS.pending]: { ...entry, tabId }, [KEYS.tab]: tabId });
   }
 
+  // The private sign-in tab, while it is open. Its attempt may have expired.
   async function signInTabId() {
-    return (await pending())?.tabId ?? null;
+    const tabId = await read(session, KEYS.tab);
+    return Number.isInteger(tabId) ? tabId : null;
+  }
+
+  // Called once the sign-in tab has closed.
+  async function releaseTab(tabId) {
+    if ((await read(session, KEYS.tab)) === tabId) await session.remove(KEYS.tab);
   }
 
   // With tabId, cancels only the attempt in that tab, whether or not it has
@@ -300,6 +360,7 @@ export function createChatgptAuth({
   async function completeSignIn(callbackUrl, { beforeOutcome = async () => {} } = {}) {
     const entry = await pending();
     if (!entry) return { error: 'No sign-in is in progress.' };
+    const signOutsAtStart = signOuts;
     await session.remove(KEYS.pending);
     const publish = async (status, message, extra = {}) => {
       await beforeOutcome(entry);
@@ -319,7 +380,7 @@ export function createChatgptAuth({
     }
     let tokens;
     try {
-      const reply = await postForm(fetchImpl, TOKEN_URL, {
+      const reply = await post(TOKEN_URL, {
         grant_type: 'authorization_code',
         client_id: parsed.clientId,
         code: parsed.code,
@@ -336,26 +397,38 @@ export function createChatgptAuth({
       return fail(error?.code === 'network' ? 'Could not reach ChatGPT to finish signing in. Check your connection and try again.' : 'ChatGPT returned an unusable sign-in. Try again.');
     }
     const claims = tokens.idToken ? idTokenClaims(tokens.idToken) : null;
-    if (!claims || claims.nonce !== entry.nonce) return fail('The sign-in could not be verified. Try again.');
+    if (!idTokenValid(claims, { clientId: parsed.clientId, nonce: entry.nonce, now: now() })) {
+      return fail('The sign-in could not be verified. Try again.');
+    }
     if (!tokens.refreshToken) return fail('ChatGPT did not allow AccessAssist to stay signed in. Try again.');
     if (!tokens.scope.split(/\s+/u).includes(PLAN_SCOPE)) {
       await revokeToken(parsed.clientId, tokens.refreshToken);
       return fail('ChatGPT did not allow AccessAssist to use your plan, so nothing was saved.');
     }
     const email = typeof claims.email === 'string' ? claims.email : null;
-    await local.set({
-      [KEYS.auth]: {
-        clientId: parsed.clientId,
-        refreshToken: tokens.refreshToken,
-        idToken: tokens.idToken,
-        email,
-        subject: typeof claims.sub === 'string' ? claims.sub : null,
-        earliestRefreshAt: tokens.earliestRefreshAt,
-        signedInAt: now(),
-      },
+    // Committed behind the queue: a sign-out that finished while the exchange
+    // was in flight wins, and nothing is stored or announced as done.
+    const committed = await serialized(async () => {
+      if (signOuts !== signOutsAtStart) return false;
+      await local.set({
+        [KEYS.auth]: {
+          clientId: parsed.clientId,
+          refreshToken: tokens.refreshToken,
+          idToken: tokens.idToken,
+          email,
+          subject: typeof claims.sub === 'string' ? claims.sub : null,
+          earliestRefreshAt: tokens.earliestRefreshAt,
+          signedInAt: now(),
+        },
+      });
+      await session.set({ [KEYS.access]: tokens.access });
+      await publish('done', 'Signed in.', { email });
+      return true;
     });
-    await session.set({ [KEYS.access]: tokens.access });
-    await publish('done', 'Signed in.', { email });
+    if (!committed) {
+      await revokeToken(parsed.clientId, tokens.refreshToken);
+      return fail('You signed out of ChatGPT while this sign-in was finishing, so nothing was saved.');
+    }
     return { ok: true, email, entry };
   }
 
@@ -376,7 +449,7 @@ export function createChatgptAuth({
 
   async function refresh(auth, { force }) {
     if (!force && auth.earliestRefreshAt && now() < auth.earliestRefreshAt) return null;
-    const reply = await postForm(fetchImpl, TOKEN_URL, {
+    const reply = await post(TOKEN_URL, {
       grant_type: 'refresh_token',
       client_id: auth.clientId,
       refresh_token: auth.refreshToken,
@@ -426,16 +499,15 @@ export function createChatgptAuth({
   }
 
   function accessToken({ force = false } = {}) {
-    const run = queue.then(() => currentToken({ force }));
-    queue = run.catch(() => {});
-    return run;
+    return serialized(() => currentToken({ force }));
   }
 
   async function revocationEndpoint() {
     try {
-      const response = await fetchImpl(DISCOVERY_URL, { headers: { accept: 'application/json' } });
-      if (!response.ok) return null;
-      const json = await response.json();
+      const json = await withDeadline(requestTimeoutMs, async (signal) => {
+        const response = await fetchImpl(DISCOVERY_URL, { headers: { accept: 'application/json' }, signal });
+        return response.ok ? response.json() : null;
+      });
       const endpoint = typeof json?.revocation_endpoint === 'string' ? new URL(json.revocation_endpoint) : null;
       // Only ever send a refresh token back to the issuer.
       return endpoint && endpoint.origin === AUTH_ISSUER ? endpoint.href : null;
@@ -448,7 +520,7 @@ export function createChatgptAuth({
     const endpoint = await revocationEndpoint();
     if (!endpoint) return false;
     try {
-      const reply = await postForm(fetchImpl, endpoint, {
+      const reply = await post(endpoint, {
         token: refreshToken,
         token_type_hint: 'refresh_token',
         client_id: clientId,
@@ -464,16 +536,15 @@ export function createChatgptAuth({
   // Queued behind any refresh in flight, so a refresh finishing afterwards
   // cannot write the account back.
   function signOut() {
-    const run = queue.then(async () => {
+    return serialized(async () => {
+      signOuts += 1;
       const auth = await read(local, KEYS.auth);
       await dropTokens({ forgetClient: true });
       await session.remove(KEYS.outcome);
       const revoked = auth?.refreshToken && auth.clientId ? await revokeToken(auth.clientId, auth.refreshToken) : true;
       return { revoked };
     });
-    queue = run.catch(() => {});
-    return run;
   }
 
-  return { status, startSignIn, attachTab, signInTabId, cancelSignIn, completeSignIn, accessToken, signOut, pending };
+  return { status, startSignIn, attachTab, signInTabId, releaseTab, cancelSignIn, completeSignIn, accessToken, signOut, pending };
 }

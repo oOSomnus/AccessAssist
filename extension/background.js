@@ -80,8 +80,13 @@ function httpUrl(value) {
 // reloaded from session storage when the worker restarts.
 const chatgptAuth = createChatgptAuth({ local: chrome.storage.local, session: chrome.storage.session });
 let signInTabId = null;
+// A sign-in tab that closed while no worker was listening is let go.
 const signInTabReady = chatgptAuth.signInTabId()
-  .then((id) => { signInTabId = id; })
+  .then(async (id) => {
+    if (id === null) return;
+    if (await chrome.tabs.get(id).then(() => true, () => false)) signInTabId = id;
+    else await chatgptAuth.releaseTab(id);
+  })
   .catch(() => {});
 
 // A web page the assistant may serve: http(s) and not the sign-in tab.
@@ -388,7 +393,10 @@ chrome.tabs.onActivated.addListener(({ tabId }) => {
 chrome.tabs.onRemoved.addListener((tabId) => {
   clearTab(tabId, 'closed');
   if (tabId === signInTabId) signInTabId = null;
-  void signInTabReady.then(() => chatgptAuth.cancelSignIn(undefined, { tabId })).catch(() => {});
+  void signInTabReady
+    .then(() => chatgptAuth.releaseTab(tabId))
+    .then(() => chatgptAuth.cancelSignIn(undefined, { tabId }))
+    .catch(() => {});
 });
 
 // The sign-in redirect goes to a loopback address nothing listens on; the
@@ -426,16 +434,34 @@ async function finishChatgptSignIn(tabId, url) {
 
 // Returns the person to the page they started from, then closes the
 // sign-in tab. Clearing the id first keeps onRemoved from calling it a cancel.
+// Only that tab's id is cleared: a newer attempt's tab stays private.
 async function leaveSignInTab(entry) {
-  signInTabId = null;
+  if (entry?.tabId === signInTabId) signInTabId = null;
   if (Number.isInteger(entry?.returnTabId)) await chrome.tabs.update(entry.returnTabId, { active: true }).catch(() => {});
-  if (Number.isInteger(entry?.tabId)) await chrome.tabs.remove(entry.tabId).catch(() => {});
+  if (Number.isInteger(entry?.tabId)) {
+    await chrome.tabs.remove(entry.tabId).catch(() => {});
+    await chatgptAuth.releaseTab(entry.tabId).catch(() => {});
+  }
 }
 
-async function startChatgptSignIn(message) {
-  // A second request replaces the first attempt; its tab goes away.
+// Starts run one at a time, so two quick requests cannot both find no attempt
+// and open two sign-in tabs, one of them no longer marked private.
+let signInStartQueue = Promise.resolve();
+
+function startChatgptSignIn(message) {
+  const run = signInStartQueue.then(() => openChatgptSignIn(message));
+  signInStartQueue = run.catch(() => {});
+  return run;
+}
+
+async function openChatgptSignIn(message) {
+  await signInTabReady;
+  // A new request replaces the earlier attempt, and the earlier tab closes
+  // before this one takes its place, even if its attempt already expired.
   const previous = await chatgptAuth.cancelSignIn('An earlier sign-in attempt was replaced.');
-  if (previous) await leaveSignInTab({ tabId: previous.tabId });
+  for (const tabId of new Set([previous?.tabId, signInTabId])) {
+    if (Number.isInteger(tabId)) await leaveSignInTab({ tabId });
+  }
   const returnTabId = Number.isInteger(message.returnTabId) ? message.returnTabId : null;
   const windowId = Number.isInteger(message.windowId) ? message.windowId : null;
   const { url } = await chatgptAuth.startSignIn({ returnTabId, windowId });
@@ -1031,7 +1057,8 @@ async function scrollPage(tab, message) {
   if (!['up', 'down', 'left', 'right'].includes(message.direction)) {
     return { error: 'Unsupported scroll direction' };
   }
-  if (message.id === undefined) {
+  // A strict tool schema sends an omitted optional id as null.
+  if (message.id === undefined || message.id === null) {
     const record = observations.get(tab.id);
     if (!record?.documentId) return { error: STALE_PAGE };
     const result = await agentCall(tab.id, { frameId: 0, documentId: record.documentId }, {

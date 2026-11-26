@@ -212,7 +212,9 @@ test('ChatGPT plan: a redirect to the callback finishes sign-in and returns to t
     await context.route('https://auth.openai.com/api/accounts/oauth/token', (route) => {
       const form = new URLSearchParams(route.request().postData() ?? '');
       responses.auth.push(`token ${form.get('grant_type')} ${form.get('client_id')} ${form.get('code')}`);
-      const claims = Buffer.from(JSON.stringify({ nonce, email: 'redirect@example.test', sub: 'u' })).toString('base64url');
+      const claims = Buffer.from(JSON.stringify({
+        iss: 'https://auth.openai.com', aud: 'oaiapp_e2e', exp: Math.floor(Date.now() / 1000) + 3600, nonce, email: 'redirect@example.test', sub: 'u',
+      })).toString('base64url');
       return route.fulfill({
         status: 200,
         contentType: 'application/json',

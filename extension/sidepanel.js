@@ -111,10 +111,11 @@ const state = {
   lastKeyConfig: null,
   lastChatgptConfig: null,
   // What the panel knows about the ChatGPT sign-in. Tokens stay in the
-  // worker; chatgptToken is only the access token of the request in flight,
-  // kept so the debug log can redact it.
+  // worker; chatgptTokens are only the access tokens this panel has used
+  // recently, kept so the debug log can redact them. A request still in
+  // flight may log its reply after the token is replaced or signed out.
   chatgpt: { signedIn: false, email: null, models: null, modelsError: null, loading: false, generation: 0, awaitingSignIn: false },
-  chatgptToken: null,
+  chatgptTokens: [],
   history: [],
   choice: null,
   busy: false,
@@ -159,7 +160,7 @@ const state = {
 
 // Session-scoped: cleared when the panel closes or reloads, kept across
 // conversation resets so a reset does not erase what led to it.
-const debugLog = createDebugLog({ secrets: () => [state.apiKey, state.chatgptToken] });
+const debugLog = createDebugLog({ secrets: () => [state.apiKey, ...state.chatgptTokens] });
 window.addEventListener('error', (event) => debugLog.add('panel.error', {
   message: event.message,
   source: event.filename,
@@ -1620,6 +1621,15 @@ function supersededContent(content, kind) {
   return JSON.stringify({ title: value.title, url: value.url, superseded: SUPERSEDED_PAGE });
 }
 
+// Tokens last an hour and a request at most a few minutes, so the last few
+// cover every request that can still write to the log.
+const KEPT_CHATGPT_TOKENS = 8;
+
+function rememberChatgptToken(token) {
+  if (state.chatgptTokens.includes(token)) return;
+  state.chatgptTokens = [...state.chatgptTokens, token].slice(-KEPT_CHATGPT_TOKENS);
+}
+
 // The worker hands out the ChatGPT access token, refreshing it when needed.
 // Sent directly rather than through send() so the token never enters the
 // debug log, which only records that one came back.
@@ -1633,7 +1643,7 @@ async function chatgptAccessToken({ force = false } = {}) {
   }
   debugLog.add('worker.response', { type: 'CHATGPT_TOKEN', tokenReturned: Boolean(reply?.token), code: reply?.code ?? null });
   if (!reply?.token) throw new ApiError(reply?.code ?? 'signed_out', reply?.error ?? 'Not signed in to ChatGPT');
-  state.chatgptToken = reply.token;
+  rememberChatgptToken(reply.token);
   return reply.token;
 }
 
@@ -3158,7 +3168,6 @@ function applyChatgptAuth(value) {
   const changed = signedIn !== state.chatgpt.signedIn || email !== state.chatgpt.email;
   state.chatgpt.signedIn = signedIn;
   state.chatgpt.email = email;
-  if (!signedIn) state.chatgptToken = null;
   if (changed) {
     state.chatgpt.models = null;
     state.chatgpt.modelsError = null;
@@ -3170,6 +3179,8 @@ function applyChatgptAuth(value) {
 
 function onChatgptAuthChanged(value) {
   if (!applyChatgptAuth(value)) return;
+  // Signed out elsewhere: a reply already on its way must not run page tools.
+  if (!state.chatgpt.signedIn && usesChatgpt(state.config)) turns.current.cancel();
   toggleServiceFields();
 }
 
@@ -3301,12 +3312,15 @@ async function saveSettings(event) {
   if (apiChanged) turns.current.cancel();
   const screenReader = normalizeScreenReader($('screen-reader').value);
   state.screenReader = screenReader;
+  // Leaving a key-based service keeps its configuration, which may not be
+  // stored yet: the key stays bound to it, never to the default origin.
+  if (chatgpt && !usesChatgpt(state.config)) state.lastKeyConfig = state.config;
   if (chatgpt) state.lastChatgptConfig = next;
   else state.lastKeyConfig = next;
   await chrome.storage.local.set({
     apiConfig: next,
     screenReader,
-    ...(chatgpt ? { lastChatgptConfig: next } : { lastKeyConfig: next }),
+    ...(chatgpt ? { lastChatgptConfig: next, ...(state.lastKeyConfig ? { lastKeyConfig: state.lastKeyConfig } : {}) } : { lastKeyConfig: next }),
   });
   if (originChanged) {
     await chrome.storage.session.remove('apiKey');
