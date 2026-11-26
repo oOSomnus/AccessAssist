@@ -3,7 +3,7 @@
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 
-export const PROTOCOLS = ['openai', 'anthropic'];
+export const PROTOCOLS = ['openai', 'anthropic', 'chatgpt'];
 
 // Returns the selected entries, or null when ONLY_PROTOCOL names no protocol.
 export function selectProtocols(entries, only = process.env.ONLY_PROTOCOL) {

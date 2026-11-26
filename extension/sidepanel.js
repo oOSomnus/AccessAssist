@@ -1,8 +1,8 @@
-import { normalizeConfig, requestTurn, REQUEST_TIMEOUT_MS } from './ai.js';
+import { ApiError, listChatgptModels, normalizeConfig, requestTurn, REQUEST_TIMEOUT_MS } from './ai.js';
 import { consentRound } from './consent-round.js';
 import { createDebugLog } from './debug-log.js';
 import { closeChoiceSet, createChoiceSet, formatChoices, parseChoiceNumber, resolveChoice } from './protocol.js';
-import { keyBinding, keyForBinding, configFingerprint, configOrigin, DEFAULT_API_CONFIG, grantUpload, liftRefusal, needsUpload, normalizeScreenReader, refusalFor, refuseUpload, uploadConsentFor } from './settings.js';
+import { keyBinding, keyForBinding, keyConfigFor, configFingerprint, configOrigin, DEFAULT_API_CONFIG, DEFAULT_CHATGPT_CONFIG, usesChatgpt, grantUpload, liftRefusal, needsUpload, normalizeScreenReader, refusalFor, refuseUpload, uploadConsentFor } from './settings.js';
 import { Speech, spokenSites, voiceSetupView } from './speech.js';
 import { detectPlatform, guideFor, GUIDES, readerChoices, resolveReader } from './screen-reader-guide.js';
 import { createTurns } from './turn.js';
@@ -107,6 +107,15 @@ const state = {
   screenReader: 'auto',
   apiKey: null,
   keyStale: false,
+  // The last saved configuration of each service, so switching back restores it.
+  lastKeyConfig: null,
+  lastChatgptConfig: null,
+  // What the panel knows about the ChatGPT sign-in. Tokens stay in the
+  // worker; chatgptTokens are only the access tokens this panel has used
+  // recently, kept so the debug log can redact them. A request still in
+  // flight may log its reply after the token is replaced or signed out.
+  chatgpt: { signedIn: false, email: null, models: null, modelsError: null, loading: false, generation: 0, awaitingSignIn: false },
+  chatgptTokens: [],
   history: [],
   choice: null,
   busy: false,
@@ -151,7 +160,7 @@ const state = {
 
 // Session-scoped: cleared when the panel closes or reloads, kept across
 // conversation resets so a reset does not erase what led to it.
-const debugLog = createDebugLog({ secrets: () => [state.apiKey] });
+const debugLog = createDebugLog({ secrets: () => [state.apiKey, ...state.chatgptTokens] });
 window.addEventListener('error', (event) => debugLog.add('panel.error', {
   message: event.message,
   source: event.filename,
@@ -394,14 +403,14 @@ async function listenOnce(requestId, seq) {
   if (state.listenRequest !== requestId || state.entrySeq !== seq) return false;
   if (document.visibilityState !== 'visible') return false;
   if (state.mode !== 'voice' || !state.voiceReady) return false;
-  if (!state.apiKey) return false;
+  if (!hasCredential()) return false;
   if (state.listening) return false;
   const choiceSetId = state.choice?.set?.id ?? null;
   // Every callback carries the authorization it was created under; a stale
   // event must not read back, consume, or answer a newer request.
   const owned = () => state.listenRequest === requestId && state.entrySeq === seq;
   const usableNow = () => state.ready && !SETUP_PAGE && document.visibilityState === 'visible'
-    && state.mode === 'voice' && state.voiceReady && state.apiKey;
+    && state.mode === 'voice' && state.voiceReady && hasCredential();
   const task = (async () => {
     try {
       // Keep the activation-gated resume request ahead of every await; the
@@ -887,10 +896,10 @@ async function finishPreparation({ generation, install, local, microphone, waitT
     $('return-assistant').focus();
     return true;
   }
-  if (!state.apiKey) {
+  if (!hasCredential()) {
     state.mode = 'idle';
     updateModeLine();
-    await say('Voice is ready. Paste your OpenCode Go API key. The service and model are already set.');
+    await say(`Voice is ready. ${credentialPrompt()}`);
     openSettingsForKey();
     return true;
   }
@@ -1401,8 +1410,24 @@ function setSettingsOpen(open) {
   $('settings-toggle').setAttribute('aria-expanded', String(open));
 }
 
+// Whether the active service can make a request: a pasted key, or a ChatGPT
+// sign-in the worker still holds.
+function hasCredential() {
+  return usesChatgpt(state.config) ? state.chatgpt.signedIn : Boolean(state.apiKey);
+}
+
+function credentialPrompt() {
+  return usesChatgpt(state.config)
+    ? 'Sign in with ChatGPT in Settings, then choose a model.'
+    : 'Paste your OpenCode Go API key. The service and model are already set.';
+}
+
 function openSettingsForKey({ advanced = false } = {}) {
   setSettingsOpen(true);
+  if ($('service').value === 'chatgpt') {
+    chatgptFocusTarget().focus();
+    return;
+  }
   if (advanced) $('advanced-api').open = true;
   $('api-key').focus();
 }
@@ -1442,15 +1467,26 @@ async function runIntro({ page = true } = {}) {
 }
 
 async function apiReady() {
+  const chatgpt = usesChatgpt(state.config);
+  if (chatgpt && !state.chatgpt.signedIn) {
+    await say(credentialPrompt(), { urgent: true });
+    openSettingsForKey();
+    return false;
+  }
   const normalized = normalizeConfig(state.config);
+  if (chatgpt && normalized.errors.length) {
+    await say('Choose a ChatGPT model in Settings, then save.', { urgent: true });
+    openSettingsForKey();
+    return false;
+  }
   if (normalized.errors.length) {
     await say(`API settings have a problem: ${normalized.errors.join('; ')}`, { urgent: true });
     openSettingsForKey({ advanced: true });
     return false;
   }
   state.config = normalized.config;
-  if (!state.apiKey) {
-    await say('Paste your OpenCode Go API key. The service and model are already set.', { urgent: true });
+  if (!hasCredential()) {
+    await say(credentialPrompt(), { urgent: true });
     openSettingsForKey();
     return false;
   }
@@ -1471,6 +1507,14 @@ function errorText(error) {
     case 'empty': return 'The model returned no content.';
     case 'truncated': return 'The model reply was cut off. Try again.';
     case 'denied': return 'The model refused this request.';
+    case 'signed_out': return 'The ChatGPT sign-in has ended.';
+    case 'plan_limit': return 'Your ChatGPT plan has reached its usage limit. Try again later; ChatGPT usage in Settings shows when it resets.';
+    case 'plan_ineligible': return 'This ChatGPT account cannot use its plan in other apps.';
+    case 'plan_unavailable': return 'ChatGPT plan usage is unavailable right now. Try again shortly.';
+    case 'unsupported': return /^reasoning/u.test(error?.details?.param ?? '')
+      ? 'This model does not accept the chosen reasoning effort. Choose another in Settings.'
+      : 'The model service does not support part of this request.';
+    case 'interrupted': return 'The model reply stopped before it finished. Try again.';
     default: return `The model service failed.${detail}`;
   }
 }
@@ -1577,7 +1621,33 @@ function supersededContent(content, kind) {
   return JSON.stringify({ title: value.title, url: value.url, superseded: SUPERSEDED_PAGE });
 }
 
-async function requestModel(turn, { retried = false } = {}) {
+// Tokens last an hour and a request at most a few minutes, so the last few
+// cover every request that can still write to the log.
+const KEPT_CHATGPT_TOKENS = 8;
+
+function rememberChatgptToken(token) {
+  if (state.chatgptTokens.includes(token)) return;
+  state.chatgptTokens = [...state.chatgptTokens, token].slice(-KEPT_CHATGPT_TOKENS);
+}
+
+// The worker hands out the ChatGPT access token, refreshing it when needed.
+// Sent directly rather than through send() so the token never enters the
+// debug log, which only records that one came back.
+async function chatgptAccessToken({ force = false } = {}) {
+  debugLog.add('worker.request', { type: 'CHATGPT_TOKEN', payload: { force } });
+  let reply;
+  try {
+    reply = await chrome.runtime.sendMessage({ type: 'CHATGPT_TOKEN', force });
+  } catch (error) {
+    throw new ApiError('network', 'Could not reach the AccessAssist service worker', { cause: error?.message });
+  }
+  debugLog.add('worker.response', { type: 'CHATGPT_TOKEN', tokenReturned: Boolean(reply?.token), code: reply?.code ?? null });
+  if (!reply?.token) throw new ApiError(reply?.code ?? 'signed_out', reply?.error ?? 'Not signed in to ChatGPT');
+  rememberChatgptToken(reply.token);
+  return reply.token;
+}
+
+async function requestModel(turn, { retried = false, refreshedToken = false } = {}) {
   if (!(await apiReady())) return null;
   if (!turn.isCurrent()) return null;
   syncWorking();
@@ -1593,9 +1663,13 @@ async function requestModel(turn, { retried = false } = {}) {
     messages: state.history.length,
   });
   try {
+    const apiKey = usesChatgpt(state.config)
+      ? await chatgptAccessToken({ force: refreshedToken })
+      : state.apiKey;
+    if (!turn.isCurrent()) return null;
     const response = await requestTurn({
       config: state.config,
-      apiKey: state.apiKey,
+      apiKey,
       sessionId: state.apiSessionId,
       system: `${SYSTEM_PROMPT}\n${pageLineForModel()}`,
       messages: historyForModel(state.history, state.config.protocol),
@@ -1620,6 +1694,10 @@ async function requestModel(turn, { retried = false } = {}) {
     });
     // A user abort surfaces from ai.js as a timeout; it must not be announced.
     if (turn.stale) return null;
+    // An access token can be revoked before it expires; try one fresh token.
+    if (error?.code === 'auth' && usesChatgpt(state.config) && !refreshedToken) {
+      return requestModel(turn, { retried, refreshedToken: true });
+    }
     if (error?.code === 'image_rejected' && !retried) {
       state.visionLimited = true;
       stripImages();
@@ -1628,7 +1706,14 @@ async function requestModel(turn, { retried = false } = {}) {
       return requestModel(turn, { retried: true });
     }
     await announceFailure(error);
-    if (['no_key', 'config', 'auth'].includes(error?.code)) {
+    if (usesChatgpt(state.config)) {
+      if (['no_key', 'auth', 'signed_out'].includes(error?.code)) {
+        await say('Sign in with ChatGPT again in Settings, then try again.');
+        openSettingsForKey();
+      } else if (error?.code === 'config' || error?.code === 'unsupported') {
+        openSettingsForKey();
+      }
+    } else if (['no_key', 'config', 'auth'].includes(error?.code)) {
       await say('Replace the key in Settings, then try again.');
       openSettingsForKey({ advanced: error?.code === 'config' });
     }
@@ -2800,9 +2885,13 @@ async function unbindPage(info, { announce, seq, entry = null }) {
     if (seq !== state.refreshSeq) return 'stale';
   }
   if (announce && changed) {
-    await say(shown
-      ? `Current page: ${shown}. This tab is not a regular web page, so I cannot read or operate it.`
-      : (info.error ?? 'No readable page.'));
+    // The sign-in tab is a normal web page the assistant deliberately leaves
+    // alone, so it gets its own sentence, which also says what happens next.
+    await say(info.signIn
+      ? 'ChatGPT sign-in is open in this tab. AccessAssist does not read it. Sign in there; when you finish, the tab closes and you return to your page.'
+      : shown
+        ? `Current page: ${shown}. This tab is not a regular web page, so I cannot read or operate it.`
+        : (info.error ?? 'No readable page.'));
   }
   return 'unbound';
 }
@@ -2959,18 +3048,203 @@ async function prepareEntry(seq) {
   if (seq !== state.entrySeq) return false;
   if (document.visibilityState !== 'visible') return false;
   if (state.mode !== 'voice' || !state.voiceReady) return false;
-  return Boolean(state.apiKey);
+  return hasCredential();
 }
 
 function fillSettings() {
-  $('protocol').value = state.config.protocol;
-  $('base-url').value = state.config.baseUrl;
-  $('model').value = state.config.model;
-  $('effort').value = state.config.effort ?? 'default';
+  const chatgpt = usesChatgpt(state.config);
+  const keyConfig = keyConfigFor(state.config, state.lastKeyConfig);
+  const chatgptConfig = chatgpt ? state.config : (state.lastChatgptConfig ?? DEFAULT_CHATGPT_CONFIG);
+  $('service').value = chatgpt ? 'chatgpt' : 'key';
+  $('protocol').value = keyConfig.protocol;
+  $('base-url').value = keyConfig.baseUrl;
+  $('model').value = keyConfig.model;
+  $('effort').value = keyConfig.effort ?? 'default';
+  $('anthropic-version').value = keyConfig.anthropicVersion ?? '2026-10-21';
+  $('chatgpt-effort').value = chatgptConfig.effort ?? 'default';
+  state.chatgpt.choice = chatgptConfig.model ?? '';
   $('screen-reader').value = state.screenReader;
-  $('anthropic-version').value = state.config.anthropicVersion ?? '2026-10-21';
   toggleAnthropicFields();
+  toggleServiceFields();
   $('api-key').value = '';
+}
+
+// Only the chosen service's controls are shown, so the numbers 1 to 3 always
+// belong to whichever controls are on screen.
+function toggleServiceFields() {
+  const chatgpt = $('service').value === 'chatgpt';
+  $('key-settings').hidden = chatgpt;
+  $('advanced-api').hidden = chatgpt;
+  $('chatgpt-settings').hidden = !chatgpt;
+  renderChatgptAccount();
+  if (chatgpt && state.chatgpt.signedIn && !state.chatgpt.models && !state.chatgpt.loading) void loadChatgptModels();
+}
+
+function renderChatgptAccount() {
+  const { signedIn, email } = state.chatgpt;
+  $('chatgpt-signed-out').hidden = signedIn;
+  $('chatgpt-signed-in').hidden = !signedIn;
+  $('chatgpt-account').textContent = signedIn ? `Signed in to ChatGPT${email ? ` as ${email}` : ''}.` : '';
+  if (signedIn) fillChatgptModels();
+}
+
+function chatgptModelControl() {
+  return $('chatgpt-model-custom').hidden ? $('chatgpt-model') : $('chatgpt-model-custom');
+}
+
+function chatgptFocusTarget() {
+  return state.chatgpt.signedIn ? chatgptModelControl() : $('chatgpt-sign-in');
+}
+
+function chatgptModelChoice() {
+  return chatgptModelControl().value.trim() || state.chatgpt.choice || '';
+}
+
+function modelOption(value, text) {
+  const option = document.createElement('option');
+  option.value = value;
+  option.textContent = text;
+  return option;
+}
+
+// A native select of the account's models. If the list cannot load, a plain
+// text field takes its place so a known model name can still be typed.
+function fillChatgptModels() {
+  const { models, modelsError, loading } = state.chatgpt;
+  const selected = state.chatgpt.choice;
+  const typed = Boolean(modelsError) && !models?.length;
+  $('chatgpt-model').hidden = typed;
+  $('chatgpt-model-label').hidden = typed;
+  $('chatgpt-model-custom').hidden = !typed;
+  $('chatgpt-model-custom-label').hidden = !typed;
+  if (typed) {
+    $('chatgpt-model-custom').value = selected;
+    $('chatgpt-model-hint').textContent = `Could not load your models: ${modelsError}. Type a model name instead.`;
+    return;
+  }
+  const select = $('chatgpt-model');
+  if (!models) {
+    select.replaceChildren(modelOption(selected, selected || (loading ? 'Loading models' : 'No models loaded')));
+    select.value = selected;
+    $('chatgpt-model-hint').textContent = loading ? 'Loading the models this account can use.' : '';
+    return;
+  }
+  const options = models.map((model) => modelOption(model.id, model.name));
+  if (selected && !models.some((model) => model.id === selected)) {
+    options.unshift(modelOption(selected, `${selected}, saved but not in this account's list`));
+  }
+  select.replaceChildren(...options);
+  // With nothing saved the first listed model is chosen, so Save works at once.
+  select.value = selected || models[0]?.id || '';
+  state.chatgpt.choice = select.value;
+  $('chatgpt-model-hint').textContent = `${models.length} ${models.length === 1 ? 'model' : 'models'} available to this account.`;
+}
+
+async function loadChatgptModels() {
+  const generation = ++state.chatgpt.generation;
+  state.chatgpt.loading = true;
+  state.chatgpt.modelsError = null;
+  fillChatgptModels();
+  let models = null;
+  let failure = null;
+  try {
+    models = await listChatgptModels({ accessToken: await chatgptAccessToken() });
+    if (!models.length) failure = 'the list was empty';
+  } catch (error) {
+    failure = error?.message ?? 'unknown error';
+    debugLog.add('chatgpt.models.error', { code: error?.code, message: error?.message, details: error?.details });
+  }
+  if (generation !== state.chatgpt.generation) return;
+  state.chatgpt.loading = false;
+  state.chatgpt.models = models?.length ? models : null;
+  state.chatgpt.modelsError = failure;
+  if (state.chatgpt.signedIn) fillChatgptModels();
+}
+
+// Only presence and the email reach the panel's state; tokens are not kept.
+function applyChatgptAuth(value) {
+  const signedIn = Boolean(value?.refreshToken);
+  const email = signedIn && typeof value?.email === 'string' ? value.email : null;
+  const changed = signedIn !== state.chatgpt.signedIn || email !== state.chatgpt.email;
+  state.chatgpt.signedIn = signedIn;
+  state.chatgpt.email = email;
+  if (changed) {
+    state.chatgpt.models = null;
+    state.chatgpt.modelsError = null;
+    state.chatgpt.generation += 1;
+    state.chatgpt.loading = false;
+  }
+  return changed;
+}
+
+function onChatgptAuthChanged(value) {
+  if (!applyChatgptAuth(value)) return;
+  // Signed out elsewhere: a reply already on its way must not run page tools.
+  if (!state.chatgpt.signedIn && usesChatgpt(state.config)) turns.current.cancel();
+  toggleServiceFields();
+}
+
+// Only the panel that started the sign-in speaks its outcome.
+async function onChatgptSignInOutcome(outcome) {
+  if (!outcome || outcome.status === 'pending' || !state.chatgpt.awaitingSignIn) return;
+  state.chatgpt.awaitingSignIn = false;
+  debugLog.add('chatgpt.signIn', { status: outcome.status });
+  // Leaving the sign-in tab changes the page on screen, and a page change
+  // clears queued speech. Settle that first so the outcome is heard after it.
+  await syncVisiblePage().catch(() => false);
+  setSettingsOpen(true);
+  $('service').value = 'chatgpt';
+  if (outcome.status === 'done') {
+    const stored = await chrome.storage.local.get('chatgptAuth').catch(() => ({}));
+    applyChatgptAuth(stored.chatgptAuth);
+    toggleServiceFields();
+    chatgptModelControl().focus();
+    await say(`Signed in to ChatGPT${state.chatgpt.email ? ` as ${state.chatgpt.email}` : ''}. Choose a model and reasoning effort, then save.`);
+    return;
+  }
+  toggleServiceFields();
+  $('chatgpt-sign-in').focus();
+  await say(outcome.message || 'ChatGPT sign-in did not finish.', { urgent: true });
+}
+
+async function signInChatgpt() {
+  state.chatgpt.awaitingSignIn = true;
+  // The panel follows the new tab and announces it as the sign-in tab, so
+  // the spoken explanation comes from there; this line is the visible copy.
+  $('settings-status').textContent = 'ChatGPT sign-in is open in a new tab. Sign in there; when you finish, you return here.';
+  try {
+    await send('CHATGPT_SIGN_IN', { windowId: state.windowId, returnTabId: state.tab?.tabId ?? null });
+  } catch (error) {
+    state.chatgpt.awaitingSignIn = false;
+    $('chatgpt-sign-in').focus();
+    await say(`Could not start ChatGPT sign-in. ${error?.message ?? ''}`.trim(), { urgent: true });
+  }
+}
+
+async function signOutChatgpt() {
+  const active = usesChatgpt(state.config);
+  if (active) {
+    cancelVoice();
+    turns.current.cancel();
+  }
+  let result;
+  try {
+    result = await send('CHATGPT_SIGN_OUT');
+  } catch (error) {
+    await say(`Could not sign out of ChatGPT. ${error?.message ?? ''}`.trim(), { urgent: true });
+    return;
+  }
+  applyChatgptAuth(null);
+  if (active) {
+    state.uploadConsent = null;
+    await send('RESET_SESSION', { tabId: state.tab?.tabId }).catch(() => {});
+    resetConversation();
+  }
+  toggleServiceFields();
+  $('chatgpt-sign-in').focus();
+  await say(result?.revoked === false
+    ? 'Signed out of ChatGPT on this device. ChatGPT could not be reached to end the sign-in there; you can remove AccessAssist in your ChatGPT settings.'
+    : 'Signed out of ChatGPT.', { urgent: true });
 }
 
 function toggleAnthropicFields() {
@@ -2981,6 +3255,10 @@ function toggleAnthropicFields() {
 
 function firstInvalidField(errors) {
   const text = errors.join(' ');
+  if ($('service').value === 'chatgpt') {
+    if (/Effort/u.test(text)) return $('chatgpt-effort');
+    return chatgptFocusTarget();
+  }
   if (/Protocol/u.test(text)) return $('protocol');
   if (/URL|HTTPS|HTTP|query|fragment|username|password/u.test(text)) return $('base-url');
   if (/model/u.test(text)) return $('model');
@@ -2991,28 +3269,40 @@ function firstInvalidField(errors) {
 
 async function saveSettings(event) {
   event.preventDefault();
-  const raw = {
-    protocol: $('protocol').value,
-    baseUrl: $('base-url').value.trim(),
-    model: $('model').value.trim(),
-    effort: $('effort').value,
-    anthropicVersion: $('anthropic-version').value.trim(),
-  };
+  const chatgpt = $('service').value === 'chatgpt';
+  if (chatgpt && !state.chatgpt.signedIn) {
+    const message = 'Settings not saved: sign in with ChatGPT first.';
+    $('settings-status').textContent = message;
+    $('chatgpt-sign-in').focus();
+    await say(message, { urgent: true });
+    return;
+  }
+  const raw = chatgpt
+    ? { protocol: 'chatgpt', model: chatgptModelChoice(), effort: $('chatgpt-effort').value }
+    : {
+      protocol: $('protocol').value,
+      baseUrl: $('base-url').value.trim(),
+      model: $('model').value.trim(),
+      effort: $('effort').value,
+      anthropicVersion: $('anthropic-version').value.trim(),
+    };
   const normalized = normalizeConfig(raw);
   if (normalized.errors.length) {
-    $('advanced-api').open = true;
-    const message = `Settings not saved: ${normalized.errors.join('; ')}`;
+    if (!chatgpt) $('advanced-api').open = true;
+    const message = `Settings not saved: ${chatgpt && /model/u.test(normalized.errors.join(' ')) ? 'choose a ChatGPT model' : normalized.errors.join('; ')}`;
     $('settings-status').textContent = message;
     firstInvalidField(normalized.errors).focus();
     await say(message, { urgent: true });
     return;
   }
   cancelVoice();
-  const previousOrigin = configOrigin(state.config);
+  // The key belongs to the key-based service; it is cleared only when that
+  // service moves to another origin, not when the ChatGPT plan is chosen.
+  const previousOrigin = configOrigin(keyConfigFor(state.config, state.lastKeyConfig));
   const previousFingerprint = configFingerprint(state.config);
   const next = normalized.config;
-  const originChanged = previousOrigin !== configOrigin(next);
-  const keyValue = $('api-key').value.trim();
+  const originChanged = !chatgpt && previousOrigin !== configOrigin(next);
+  const keyValue = chatgpt ? '' : $('api-key').value.trim();
   // The Screen reader preference reaches no model, so changing only that keeps
   // the conversation, its pending messages, and upload consent.
   const apiChanged = Boolean(keyValue)
@@ -3022,7 +3312,16 @@ async function saveSettings(event) {
   if (apiChanged) turns.current.cancel();
   const screenReader = normalizeScreenReader($('screen-reader').value);
   state.screenReader = screenReader;
-  await chrome.storage.local.set({ apiConfig: next, screenReader });
+  // Leaving a key-based service keeps its configuration, which may not be
+  // stored yet: the key stays bound to it, never to the default origin.
+  if (chatgpt && !usesChatgpt(state.config)) state.lastKeyConfig = state.config;
+  if (chatgpt) state.lastChatgptConfig = next;
+  else state.lastKeyConfig = next;
+  await chrome.storage.local.set({
+    apiConfig: next,
+    screenReader,
+    ...(chatgpt ? { lastChatgptConfig: next, ...(state.lastKeyConfig ? { lastKeyConfig: state.lastKeyConfig } : {}) } : { lastKeyConfig: next }),
+  });
   if (originChanged) {
     await chrome.storage.session.remove('apiKey');
     state.apiKey = null;
@@ -3054,13 +3353,13 @@ async function saveSettings(event) {
     return;
   }
   if (apiChanged) {
-    await say(keyValue ? `Settings saved. ${listenSentence()}.` : 'Settings saved.');
+    await say((keyValue || chatgpt) && hasCredential() ? `Settings saved. ${listenSentence()}.` : 'Settings saved.');
   } else {
     // A reader-only save leaves the turn running; say() would take output
     // ownership and mark that turn's queued message as interrupted.
     speech.writeStatus('Settings saved.');
   }
-  if (!state.apiKey) openSettingsForKey();
+  if (!hasCredential()) openSettingsForKey();
 }
 
 // One JSON file per export, built from the in-memory log plus a state snapshot.
@@ -3075,6 +3374,7 @@ async function exportDebugLog() {
     apiSessionId: state.apiSessionId,
     config: state.config,
     apiKeySet: Boolean(state.apiKey),
+    chatgptSignedIn: state.chatgpt.signedIn,
     requestTimeoutMs: REQUEST_TIMEOUT_MS,
     state: {
       tab: state.tab,
@@ -3185,6 +3485,15 @@ function bindEvents() {
   $('export-log').addEventListener('click', () => void exportDebugLog());
   $('settings-form').addEventListener('submit', (event) => void saveSettings(event));
   $('protocol').addEventListener('change', toggleAnthropicFields);
+  $('service').addEventListener('change', toggleServiceFields);
+  $('chatgpt-model').addEventListener('change', () => { state.chatgpt.choice = $('chatgpt-model').value; });
+  $('chatgpt-model-custom').addEventListener('input', () => { state.chatgpt.choice = $('chatgpt-model-custom').value.trim(); });
+  $('chatgpt-sign-in').addEventListener('click', () => void signInChatgpt());
+  $('chatgpt-sign-out').addEventListener('click', () => void signOutChatgpt());
+  chrome.storage.onChanged.addListener((changes, area) => {
+    if (area === 'local' && changes.chatgptAuth) onChatgptAuthChanged(changes.chatgptAuth.newValue);
+    if (area === 'session' && changes.chatgptSignIn) void onChatgptSignInOutcome(changes.chatgptSignIn.newValue);
+  });
   guardModifiedSpace();
   document.addEventListener('keydown', handleNumberShortcut);
   document.addEventListener('keydown', (event) => {
@@ -3368,12 +3677,15 @@ async function closePanel() {
 }
 
 async function loadPreferences() {
-  const stored = await chrome.storage.local.get(['apiConfig', 'outputMode', 'screenReader']);
+  const stored = await chrome.storage.local.get(['apiConfig', 'outputMode', 'screenReader', 'lastKeyConfig', 'lastChatgptConfig', 'chatgptAuth']);
   if ('outputMode' in stored) await chrome.storage.local.remove('outputMode');
   state.config = stored.apiConfig ?? { ...DEFAULT_API_CONFIG };
+  state.lastKeyConfig = usesChatgpt(stored.lastKeyConfig) ? null : stored.lastKeyConfig ?? null;
+  state.lastChatgptConfig = usesChatgpt(stored.lastChatgptConfig) ? stored.lastChatgptConfig : null;
+  applyChatgptAuth(stored.chatgptAuth);
   state.screenReader = normalizeScreenReader(stored.screenReader);
   const session = await chrome.storage.session.get(['apiKey', 'allowNetwork']);
-  state.apiKey = keyForBinding(session.apiKey, state.config);
+  state.apiKey = keyForBinding(session.apiKey, keyConfigFor(state.config, state.lastKeyConfig));
   if (session.apiKey?.value && !state.apiKey) {
     state.keyStale = true;
     await chrome.storage.session.remove('apiKey');

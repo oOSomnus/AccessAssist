@@ -237,16 +237,35 @@ async function checkFormat({ name, config, key }) {
   return summary;
 }
 
+// The ChatGPT plan check runs only with a Sign in with ChatGPT access token
+// (an hour-long token from a signed-in extension; see CONTRIBUTING.md) and
+// the model to use, so a Go-only run never needs one.
+export function chatgptEntry(env = process.env) {
+  if (!env.CHATGPT_ACCESS_TOKEN) return null;
+  return {
+    name: 'chatgpt',
+    key: env.CHATGPT_ACCESS_TOKEN,
+    config: { protocol: 'chatgpt', model: env.CHATGPT_MODEL ?? '', effort: env.CHATGPT_EFFORT ?? 'default' },
+  };
+}
+
 export async function main() {
-  const selected = selectProtocols(CONFIGS);
+  const goKey = process.env.OPENCODE_ACCESS_KEY;
+  const chatgpt = chatgptEntry();
+  const entries = [...CONFIGS.map((entry) => ({ ...entry, key: goKey })), ...(chatgpt ? [chatgpt] : [])];
+  const selected = selectProtocols(entries);
   if (!selected) {
     console.error(protocolSelectionError());
     process.exitCode = 2;
     return;
   }
-  const key = process.env.OPENCODE_ACCESS_KEY;
-  if (!key) {
+  if (selected.some((entry) => entry.name !== 'chatgpt') && !goKey) {
     console.error('Missing OPENCODE_ACCESS_KEY');
+    process.exitCode = 2;
+    return;
+  }
+  if (chatgpt && selected.includes(chatgpt) && !chatgpt.config.model) {
+    console.error('Missing CHATGPT_MODEL');
     process.exitCode = 2;
     return;
   }
@@ -254,7 +273,7 @@ export async function main() {
   let failed = false;
   for (const entry of selected) {
     try {
-      results.push(await checkFormat({ ...entry, key }));
+      results.push(await checkFormat(entry));
       console.log(`Passed ${entry.name}`);
     } catch (error) {
       failed = true;

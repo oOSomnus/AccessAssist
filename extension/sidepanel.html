@@ -50,10 +50,47 @@
       <section id="settings" class="settings" data-number-scope="settings" aria-labelledby="settings-heading" hidden>
         <h2 id="settings-heading">Settings</h2>
         <form id="settings-form" novalidate>
-          <label for="api-key">OpenCode Go API key, kept only for this browser session</label>
-          <input id="api-key" name="apiKey" type="password" autocomplete="off" spellcheck="false">
-          <p class="hint">Billing and access are handled by OpenCode Go. The field clears after saving; the key is never read aloud.</p>
-          <p class="hint"><a href="https://opencode.ai/console" target="_blank" rel="noreferrer" data-number="1">1 Get an API key</a>. Sign in, subscribe to Go if needed, copy the key, then paste it here. <a href="https://opencode.ai/docs/go/" target="_blank" rel="noreferrer" data-number="2">2 Go help</a>.</p>
+          <label for="service">Model service</label>
+          <select id="service" name="service" aria-describedby="service-hint">
+            <option value="key">OpenCode Go API key</option>
+            <option value="chatgpt">ChatGPT plan</option>
+          </select>
+          <p id="service-hint" class="hint">Choose who runs and pays for the model. The settings below change with this choice.</p>
+
+          <div id="key-settings" class="service-settings">
+            <label for="api-key">OpenCode Go API key, kept only for this browser session</label>
+            <input id="api-key" name="apiKey" type="password" autocomplete="off" spellcheck="false">
+            <p class="hint">Billing and access are handled by OpenCode Go. The field clears after saving; the key is never read aloud.</p>
+            <p class="hint"><a href="https://opencode.ai/console" target="_blank" rel="noreferrer" data-number="1">1 Get an API key</a>. Sign in, subscribe to Go if needed, copy the key, then paste it here. <a href="https://opencode.ai/docs/go/" target="_blank" rel="noreferrer" data-number="2">2 Go help</a>.</p>
+          </div>
+
+          <div id="chatgpt-settings" class="service-settings" hidden>
+            <p id="chatgpt-account" class="account"></p>
+            <div id="chatgpt-signed-out">
+              <p class="hint">Uses the usage included in your ChatGPT plan. Sign-in opens in a new tab; AccessAssist never sees your password and brings you back here when you finish.</p>
+              <button id="chatgpt-sign-in" type="button" data-number="1">1 Continue with ChatGPT</button>
+            </div>
+            <div id="chatgpt-signed-in" hidden>
+              <label for="chatgpt-model" id="chatgpt-model-label">ChatGPT model</label>
+              <select id="chatgpt-model" name="chatgptModel" aria-describedby="chatgpt-model-hint"></select>
+              <label for="chatgpt-model-custom" id="chatgpt-model-custom-label" hidden>ChatGPT model name</label>
+              <input id="chatgpt-model-custom" name="chatgptModelCustom" type="text" autocomplete="off" spellcheck="false" aria-describedby="chatgpt-model-hint" hidden>
+              <p id="chatgpt-model-hint" class="hint"></p>
+
+              <label for="chatgpt-effort">Reasoning effort</label>
+              <select id="chatgpt-effort" name="chatgptEffort" aria-describedby="chatgpt-effort-hint">
+                <option value="default">Model default</option>
+                <option value="low">Low</option>
+                <option value="medium">Medium</option>
+                <option value="high">High</option>
+                <option value="xhigh">Extra high</option>
+              </select>
+              <p id="chatgpt-effort-hint" class="hint">Model default sends no effort setting. Higher effort thinks longer before answering and uses more of your plan's limit.</p>
+
+              <p class="hint"><a href="https://chatgpt.com/settings/usage" target="_blank" rel="noreferrer" data-number="2">2 ChatGPT usage</a> shows how much of your plan is left.</p>
+              <button id="chatgpt-sign-out" type="button" class="quiet" data-number="3">3 Sign out of ChatGPT</button>
+            </div>
+          </div>
 
           <label for="screen-reader">Screen reader</label>
           <select id="screen-reader" name="screenReader" aria-describedby="screen-reader-hint">
@@ -65,7 +102,7 @@
           </select>
           <p id="screen-reader-hint" class="hint">Used only to give the right keys when you explore an image yourself. Detecting from this system can only tell Windows from macOS, so set it if you use NVDA or JAWS.</p>
 
-          <details id="advanced-api">
+          <details id="advanced-api" class="key-only">
             <summary data-number="3">3 Advanced API settings</summary>
             <label for="protocol">API format</label>
             <select id="protocol" name="protocol">

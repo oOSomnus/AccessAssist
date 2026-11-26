@@ -1,7 +1,11 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import {
+  DEFAULT_API_CONFIG,
+  DEFAULT_CHATGPT_CONFIG,
   SCREEN_READER_CHOICES,
+  keyConfigFor,
+  usesChatgpt,
   configFingerprint,
   configOrigin,
   grantUpload,
@@ -104,4 +108,22 @@ test('the screen-reader preference is not part of the API fingerprint', () => {
   // Folding it into apiConfig would clear the session key whenever it changed.
   const before = configFingerprint(config);
   assert.equal(configFingerprint({ ...config, screenReader: 'nvda' }), before);
+});
+
+test('switching to the ChatGPT plan changes the receiver but keeps the key binding', () => {
+  const go = { ...DEFAULT_API_CONFIG };
+  const chatgpt = { ...DEFAULT_CHATGPT_CONFIG, model: 'gpt-test' };
+  assert.equal(usesChatgpt(chatgpt), true);
+  assert.equal(usesChatgpt(go), false);
+  // A new receiver: upload consent and the conversation must not carry over.
+  assert.notEqual(configFingerprint(chatgpt), configFingerprint(go));
+  assert.equal(configOrigin(chatgpt), 'https://api.openai.com');
+  // The pasted key stays bound to the key-based service while ChatGPT is active.
+  const custom = { ...go, baseUrl: 'https://example.test/v1' };
+  assert.equal(keyConfigFor(chatgpt, custom), custom);
+  assert.equal(keyConfigFor(chatgpt, null), DEFAULT_API_CONFIG);
+  assert.equal(keyConfigFor(chatgpt, chatgpt), DEFAULT_API_CONFIG);
+  assert.equal(keyConfigFor(go, custom), go);
+  const binding = keyBinding('k', custom);
+  assert.equal(keyForBinding(binding, keyConfigFor(chatgpt, custom)), 'k');
 });

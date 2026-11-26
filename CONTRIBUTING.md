@@ -23,6 +23,8 @@ npm run smoke:ai        # needs OPENCODE_ACCESS_KEY in .env
 
 The check calls OpenCode Go with `deepseek-v4.1-flash` only. It covers one tool round trip, a PNG pixel round trip, and screenshot grounding for both API formats, and reports the Go billing source. Images are synthetic; no page or audio is uploaded.
 
+The ChatGPT plan format runs too when `.env` sets `CHATGPT_ACCESS_TOKEN` and `CHATGPT_MODEL` (and optionally `CHATGPT_EFFORT`). To get a token, sign in with ChatGPT in the extension, then run `(await chrome.storage.session.get('chatgptAccess')).chatgptAccess.token` in the service worker's DevTools console. The token lasts an hour. Use `ONLY_PROTOCOL=chatgpt` to run just that check without an OpenCode key.
+
 ## Packaging
 
 ```bash

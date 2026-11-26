@@ -301,13 +301,13 @@ function voiceStubs(options) {
   }
 }
 
-export async function launch({ voice = null, deviceScaleFactor = 1, locale = 'en-US' } = {}) {
+export async function launch({ voice = null, deviceScaleFactor = 1, locale = 'en-US', args = [] } = {}) {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'accessassist-'));
   const context = await chromium.launchPersistentContext(dir, {
     channel: 'chromium',
     headless: true,
     locale,
-    args: [`--disable-extensions-except=${EXTENSION}`, `--load-extension=${EXTENSION}`],
+    args: [`--disable-extensions-except=${EXTENSION}`, `--load-extension=${EXTENSION}`, ...args],
     viewport: { width: 1000, height: 760 },
     deviceScaleFactor,
   });

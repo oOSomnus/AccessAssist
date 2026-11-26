@@ -6,6 +6,7 @@ import {
   buildHeaders,
   endpointFor,
   isGoConfig,
+  listChatgptModels,
   normalizeConfig,
   plainText,
   reportedOutputCap,
@@ -572,4 +573,168 @@ test('reportedOutputCap reads only an output-cap complaint', () => {
   assert.equal(reportedOutputCap('{"message":"max_tokens: 128000 > 32000, which is the maximum"}'), 32000);
   assert.equal(reportedOutputCap('messages: bad role'), null);
   assert.equal(reportedOutputCap(undefined), null);
+});
+
+const chatgptConfig = { protocol: 'chatgpt', model: 'gpt-test', effort: 'default' };
+const sse = (...events) => new Response(
+  events.map((event) => `event: ${event.type}\ndata: ${JSON.stringify(event)}\n\n`).join(''),
+  { status: 200, headers: { 'content-type': 'text/event-stream' } },
+);
+const completed = (output, extra = {}) => ({ type: 'response.completed', response: { status: 'completed', output, usage: { total_tokens: 5 }, ...extra } });
+
+test('chatgpt config is pinned to OpenAI and takes its own effort levels', () => {
+  const normalized = normalizeConfig({ ...chatgptConfig, baseUrl: 'https://evil.example/v1', effort: 'XHIGH' });
+  assert.deepEqual(normalized.errors, []);
+  assert.deepEqual(normalized.config, { protocol: 'chatgpt', baseUrl: 'https://api.openai.com/v1', model: 'gpt-test', effort: 'xhigh' });
+  assert.match(normalizeConfig({ ...chatgptConfig, effort: 'max' }).errors[0], /^Effort must be default, low, medium, high, or xhigh$/u);
+  assert.deepEqual(normalizeConfig({ ...chatgptConfig, model: '' }).errors, ['Missing model name']);
+  assert.equal(endpointFor(normalized.config), 'https://api.openai.com/v1/responses');
+  assert.deepEqual(buildHeaders(normalized.config, 'tok', 'session'), {
+    'content-type': 'application/json',
+    authorization: 'Bearer tok',
+    accept: 'text/event-stream',
+  });
+});
+
+test('chatgpt body is a Responses request with replayed items and no output cap', async () => {
+  const sent = [];
+  const send = (config) => requestTurn({
+    config,
+    apiKey: 'tok',
+    sessionId: 's',
+    system: 'Be brief',
+    maxTokens: 999,
+    messages: [
+      { role: 'user', content: [{ type: 'text', text: 'Look' }, { type: 'image', mediaType: 'image/png', data: 'AAAA' }] },
+      {
+        role: 'assistant',
+        text: '',
+        toolCalls: [{ id: 'call_1', name: 'observe_page', args: {} }],
+        raw: {
+          provider: 'chatgpt',
+          output: [
+            { id: 'rs_1', type: 'reasoning', encrypted_content: 'enc', summary: [] },
+            { id: 'fc_1', type: 'function_call', call_id: 'call_1', name: 'observe_page', arguments: '{}' },
+          ],
+        },
+      },
+      { role: 'tool', results: [{ id: 'call_1', content: 'boom', isError: true }] },
+      { role: 'assistant', text: 'From another service', toolCalls: [], raw: { provider: 'openai' } },
+    ],
+    fetchImpl: async (url, init) => {
+      sent.push({ url, body: JSON.parse(init.body) });
+      return sse(completed([{ type: 'message', content: [{ type: 'output_text', text: 'ok' }] }]));
+    },
+  });
+  await send(chatgptConfig);
+  await send({ ...chatgptConfig, effort: 'low' });
+  const [plain, low] = sent;
+  assert.equal(plain.url, 'https://api.openai.com/v1/responses');
+  assert.equal(plain.body.store, false);
+  assert.equal(plain.body.stream, true);
+  assert.equal(plain.body.instructions, 'Be brief');
+  assert.equal('max_output_tokens' in plain.body, false);
+  assert.equal('max_tokens' in plain.body, false);
+  assert.equal('reasoning' in plain.body, false);
+  assert.deepEqual(low.body.reasoning, { effort: 'low' });
+  assert.deepEqual(plain.body.include, ['reasoning.encrypted_content']);
+  assert.deepEqual(plain.body.tools[0], {
+    type: 'function',
+    name: plain.body.tools[0].name,
+    description: plain.body.tools[0].description,
+    parameters: plain.body.tools[0].parameters,
+  });
+  assert.deepEqual(plain.body.input, [
+    { role: 'user', content: [{ type: 'input_text', text: 'Look' }, { type: 'input_image', image_url: 'data:image/png;base64,AAAA' }] },
+    { type: 'reasoning', encrypted_content: 'enc', summary: [] },
+    { type: 'function_call', call_id: 'call_1', name: 'observe_page', arguments: '{}' },
+    { type: 'function_call_output', call_id: 'call_1', output: 'Error: boom' },
+    { role: 'assistant', content: [{ type: 'output_text', text: 'From another service' }] },
+  ]);
+});
+
+test('chatgpt stream results are parsed only from the terminal event', async () => {
+  const turn = (response) => requestTurn({
+    config: chatgptConfig, apiKey: 'tok', system: 'x', messages: [{ role: 'user', content: 'x' }], fetchImpl: async () => response,
+  });
+  const output = [
+    { id: 'rs_1', type: 'reasoning', encrypted_content: 'enc' },
+    { type: 'message', content: [{ type: 'output_text', text: '**Two** buttons' }] },
+    { type: 'function_call', call_id: 'call_9', name: 'observe_page', arguments: '{"cursor":"c"}' },
+  ];
+  const result = await turn(sse(
+    { type: 'response.created', response: { status: 'in_progress', output: [] } },
+    { type: 'response.output_text.delta', delta: 'Two' },
+    completed(output),
+  ));
+  assert.equal(result.text, 'Two buttons');
+  assert.deepEqual(result.toolCalls, [{ id: 'call_9', name: 'observe_page', args: { cursor: 'c' } }]);
+  assert.deepEqual(result.raw, { provider: 'chatgpt', output });
+  assert.equal(result.stopReason, 'completed');
+
+  await assert.rejects(turn(sse({ type: 'response.incomplete', response: { status: 'incomplete', incomplete_details: { reason: 'max_output_tokens' }, output: [] } })), (error) => error.code === 'truncated');
+  await assert.rejects(turn(sse({ type: 'response.incomplete', response: { status: 'incomplete', incomplete_details: { reason: 'content_filter' }, output: [] } })), (error) => error.code === 'denied');
+  await assert.rejects(turn(sse(completed([{ type: 'message', content: [{ type: 'refusal', refusal: 'no' }] }]))), (error) => error.code === 'denied');
+  await assert.rejects(turn(sse({ type: 'response.output_text.delta', delta: 'half' })), (error) => error.code === 'interrupted');
+  await assert.rejects(
+    turn(sse({ type: 'response.failed', response: { status: 'failed', error: { code: 'subscription_sharing_usage_limit_exceeded', message: 'limit for sk-secret' } } })),
+    (error) => error.code === 'plan_limit' && !error.message.includes('sk-secret'),
+  );
+  await assert.rejects(turn(sse({ type: 'error', code: 'server_error', message: 'x' })), (error) => error.code === 'http');
+  await assert.rejects(turn(sse(completed([{ type: 'function_call', call_id: 'c', name: 'observe_page', arguments: '{bad' }]))), (error) => error.code === 'bad_arguments');
+});
+
+test('plan errors map to stable codes without echoing the body', async () => {
+  const secret = 'sk-reflected-secret-456';
+  const attempt = (status, body) => requestTurn({
+    config: chatgptConfig, apiKey: 'tok', system: 'x', messages: [{ role: 'user', content: 'x' }], fetchImpl: async () => json(body, status),
+  });
+  for (const [status, code, expected] of [
+    [429, 'subscription_sharing_usage_limit_exceeded', 'plan_limit'],
+    [403, 'subscription_sharing_user_not_eligible', 'plan_ineligible'],
+    [503, 'subscription_sharing_usage_unavailable', 'plan_unavailable'],
+    [401, 'subscription_sharing_invalid_user', 'signed_out'],
+  ]) {
+    await assert.rejects(attempt(status, { error: { code, message: `nope ${secret}` } }), (error) => {
+      assert.equal(error.code, expected);
+      assert.equal(error.message.includes(secret), false);
+      assert.equal(error.details.status, status);
+      return true;
+    });
+  }
+  await assert.rejects(
+    attempt(400, { error: { code: 'subscription_sharing_unsupported_capability', param: 'reasoning.effort' } }),
+    (error) => error.code === 'unsupported' && error.details.param === 'reasoning.effort',
+  );
+  await assert.rejects(
+    attempt(400, { error: { code: 'subscription_sharing_unsupported_capability', param: `x ${secret}` } }),
+    (error) => error.code === 'unsupported' && !error.message.includes(secret) && !('param' in error.details),
+  );
+  // Admission failures can carry {"detail": ...}; they map by status.
+  await assert.rejects(attempt(401, { detail: `bad ${secret}` }), (error) => error.code === 'auth' && !error.message.includes(secret));
+});
+
+test('ChatGPT models come from the account listing', async () => {
+  let request;
+  const models = await listChatgptModels({
+    accessToken: 'tok',
+    fetchImpl: async (url, init) => {
+      request = { url, init };
+      return json({ models: [
+        { slug: 'gpt-a', display_name: 'GPT A', visibility: 'list' },
+        { slug: 'gpt-hidden', display_name: 'Hidden', visibility: 'hide' },
+        { slug: 'gpt-b' },
+        { slug: 'gpt-a', display_name: 'Duplicate' },
+      ] });
+    },
+  });
+  assert.equal(request.url, 'https://api.openai.com/v1/models');
+  assert.equal(request.init.headers.authorization, 'Bearer tok');
+  assert.deepEqual(models, [{ id: 'gpt-a', name: 'GPT A' }, { id: 'gpt-b', name: 'gpt-b' }]);
+  assert.deepEqual(
+    await listChatgptModels({ accessToken: 'tok', fetchImpl: async () => json({ data: [{ id: 'gpt-c' }] }) }),
+    [{ id: 'gpt-c', name: 'gpt-c' }],
+  );
+  await assert.rejects(listChatgptModels({ accessToken: 'tok', fetchImpl: async () => json({}, 401) }), (error) => error.code === 'auth');
+  await assert.rejects(listChatgptModels({ accessToken: '' }), (error) => error.code === 'signed_out');
 });
