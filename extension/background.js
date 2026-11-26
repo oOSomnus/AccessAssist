@@ -25,7 +25,6 @@ import {
   CLICK_FIELDS,
   CONFLICT_CLICK_FIELDS,
   KEY_FIELDS,
-  carryBatchChanges,
   changedSince,
   conflictFor,
   differsFromApproved,
@@ -33,7 +32,14 @@ import {
   pickState,
   projectTargetState,
   roundedRect,
+  trustedAtStart,
 } from './target-state.js';
+
+// A trusted batch target may change, but never to another document.
+function documentDrift(state, expected) {
+  if (!expected || state.docToken === expected.docToken) return null;
+  return 'Page state changed (docToken); observe the page again';
+}
 
 const ARIA_STATE_FIELDS = Object.freeze(['ariaChecked', 'ariaSelected', 'ariaExpanded', 'ariaPressed']);
 const PANEL_URL = chrome.runtime.getURL('sidepanel.html');
@@ -723,41 +729,35 @@ const STALE_PAGE = 'The page changed; observe it again';
 const NOT_WEB_PAGE = 'Screenshot unavailable: this tab is not showing a web page.';
 const FRAME_IMAGE = 'This image is inside an embedded frame, which cannot be captured on its own.';
 
-async function ensureAgent(tabId, frame) {
-  if (!frame?.documentId) throw new Error(STALE_PAGE);
-  const check = await chrome.scripting.executeScript({
-    target: { tabId, documentIds: [frame.documentId] },
-    world: 'ISOLATED',
-    func: () => Boolean(globalThis.__accessAssistAgent?.version === 1),
-  }).catch(() => {
-    throw new Error(STALE_PAGE);
-  });
-  if (check?.[0]?.result) {
-    if (check[0].documentId !== frame.documentId) throw new Error(STALE_PAGE);
-    return;
-  }
-  await chrome.scripting.executeScript({
-    target: { tabId, documentIds: [frame.documentId] },
-    world: 'ISOLATED',
-    files: ['page-agent.js'],
-  }).catch(() => {
-    throw new Error(STALE_PAGE);
-  });
-}
-
+// One injection per call: the agent answers if it is already in the document,
+// and only a document without it pays for loading page-agent.js and a retry.
 async function agentCall(tabId, frame, payload) {
-  await ensureAgent(tabId, frame);
-  const results = await chrome.scripting.executeScript({
-    target: { tabId, documentIds: [frame.documentId] },
-    world: 'ISOLATED',
-    func: (data) => globalThis.__accessAssistAgent.handle(data),
-    args: [payload],
-  }).catch(() => {
-    throw new Error(STALE_PAGE);
-  });
-  const outcome = results?.[0];
-  if (!outcome || outcome.documentId !== frame.documentId) throw new Error(STALE_PAGE);
-  return outcome.result;
+  if (!frame?.documentId) throw new Error(STALE_PAGE);
+  const target = { tabId, documentIds: [frame.documentId] };
+  const call = async () => {
+    const results = await chrome.scripting.executeScript({
+      target,
+      world: 'ISOLATED',
+      func: (data) => (globalThis.__accessAssistAgent?.version === 1
+        ? { value: globalThis.__accessAssistAgent.handle(data) }
+        : { missing: true }),
+      args: [payload],
+    }).catch(() => {
+      throw new Error(STALE_PAGE);
+    });
+    const outcome = results?.[0];
+    if (!outcome || outcome.documentId !== frame.documentId) throw new Error(STALE_PAGE);
+    return outcome.result;
+  };
+  let answer = await call();
+  if (answer?.missing) {
+    await chrome.scripting.executeScript({ target, world: 'ISOLATED', files: ['page-agent.js'] }).catch(() => {
+      throw new Error(STALE_PAGE);
+    });
+    answer = await call();
+  }
+  if (!answer || answer.missing) throw new Error(STALE_PAGE);
+  return answer.value;
 }
 
 // Frame metadata is the authority for which document a frame ID currently
@@ -1154,15 +1154,6 @@ function currentTargets(tabId) {
   return map;
 }
 
-async function expectedState(step, entry, { fullValue = false } = {}) {
-  const state = await agentCall(entry.tabId, entry, {
-    op: 'state', snapshotId: step.snapshotId, nodeId: step.nodeId,
-    includeHash: step.type === 'click' || step.type === 'drag', fullValue,
-  });
-  if (state?.error) return { error: state.error };
-  return { state };
-}
-
 // The model names targets with one short id; policy, execution and undo keep
 // the internal snapshot/node pair they were written against.
 function internalSteps(tabId, steps) {
@@ -1214,15 +1205,18 @@ async function proposeAction(tab, message) {
   for (const step of outcome.proposal.steps) {
     const entry = registry.get(step.snapshotId);
     if (!entry || entry.tabId !== tab.id) return { ok: false, errors: ['Snapshot expired; observe the page again'] };
-    const state = await expectedState(step, entry, { fullValue: step.type === 'set_value' });
-    if (!state.state?.exists) return { ok: false, errors: ['Target no longer exists; observe the page again'] };
-    const drift = driftFromObserved(step, state.state, entry.targets.get(step.nodeId));
+  }
+  const live = await readTargetStates(tab, outcome.proposal.steps, { strict: true }).catch((error) => ({ error }));
+  if (live.error) return { ok: false, errors: [live.error.message ?? STALE_PAGE] };
+  for (const step of outcome.proposal.steps) {
+    const entry = registry.get(step.snapshotId);
+    const state = live.get(`${step.snapshotId}:${step.nodeId}`);
+    if (!state?.exists) return { ok: false, errors: ['Target no longer exists; observe the page again'] };
+    const drift = driftFromObserved(step, state, entry.targets.get(step.nodeId));
     if (drift) return { ok: false, errors: [`The page changed since it was observed (${drift}); observe the page again`] };
-    expected.set(`${step.snapshotId}:${step.nodeId}`, projectTargetState(state.state));
+    expected.set(`${step.snapshotId}:${step.nodeId}`, projectTargetState(state));
     if (step.toNodeId !== undefined) {
-      const end = await agentCall(tab.id, entry, {
-        op: 'state', snapshotId: step.snapshotId, nodeId: step.toNodeId,
-      });
+      const end = live.get(`${step.snapshotId}:${step.toNodeId}`);
       if (!end?.exists) return { ok: false, errors: ['Drag endpoint no longer exists; observe the page again'] };
       const endDrift = driftFromObserved(step, end, entry.targets.get(step.toNodeId));
       if (endDrift) return { ok: false, errors: [`The page changed since it was observed (${endDrift}); observe the page again`] };
@@ -1322,15 +1316,18 @@ async function runProposal(tab, message) {
   return executeAccepted(tab, message.proposalId, outcome.session);
 }
 
-// States of the targets that steps after `index` still check, read in one call
-// per observation. A target that cannot be read is left out, so its own step
-// keeps the approved state and decides for itself.
-async function laterTargetStates(tab, steps, index) {
+// The page agent answers at most this many targets per states call.
+const STATES_PER_CALL = 400;
+
+// States of every target the steps check, keyed `${snapshotId}:${nodeId}`,
+// read in one call per observation. Each key keeps the value width of the
+// last step that names it. Strict reads fail on an unreachable page; otherwise
+// a target that cannot be read is left out, so its own step decides alone.
+async function readTargetStates(tab, steps, { strict = false } = {}) {
   const groups = new Map();
-  for (const step of steps.slice(index + 1)) {
+  for (const step of steps) {
     const group = groups.get(step.snapshotId) ?? new Map();
     groups.set(step.snapshotId, group);
-    // Same value width proposeAction recorded for each key, last write winning.
     group.set(step.nodeId, step.type === 'set_value');
     if (step.toNodeId !== undefined) group.set(step.toNodeId, false);
   }
@@ -1339,16 +1336,21 @@ async function laterTargetStates(tab, steps, index) {
     const entry = registry.get(snapshotId);
     if (!entry || entry.tabId !== tab.id) continue;
     const items = [...group].map(([nodeId, fullValue]) => ({ nodeId, fullValue }));
-    let result;
-    try {
-      result = await agentCall(tab.id, entry, { op: 'states', snapshotId, items });
-    } catch {
-      continue;
+    for (let start = 0; start < items.length; start += STATES_PER_CALL) {
+      const chunk = items.slice(start, start + STATES_PER_CALL);
+      let result;
+      try {
+        result = await agentCall(tab.id, entry, { op: 'states', snapshotId, items: chunk });
+      } catch (error) {
+        if (strict) throw error;
+        break;
+      }
+      if (strict && result?.error) throw new Error(result.error);
+      chunk.forEach((item, position) => {
+        const state = result?.states?.[position];
+        if (state) states.set(`${snapshotId}:${item.nodeId}`, state);
+      });
     }
-    items.forEach((item, position) => {
-      const state = result?.states?.[position];
-      if (state) states.set(`${snapshotId}:${item.nodeId}`, state);
-    });
   }
   return states;
 }
@@ -1386,9 +1388,15 @@ async function executeProposal(tab, proposal) {
   let stepNumber = 0;
   // Every page opened by any step of this action, in the order seen.
   const openedTabIds = new Set();
-  // Approved state per target, moved forward only by this batch's own steps.
+  // Approved state per target. Keys in `trusted` matched it when the batch
+  // started, so the batch's own steps may change them; the rest must still match.
   const expectations = new Map(proposal.expected ?? []);
-  let laterBefore = null;
+  let trusted = null;
+  const driftFor = (step, key, state) => {
+    const expected = expectations.get(key);
+    if (!trusted?.has(key)) return differsFromApproved(step, state, expected);
+    return documentDrift(state, expected);
+  };
   try {
     cdp = await debuggerSession(tab.id);
     await setLauncherHidden(cdp, true);
@@ -1404,34 +1412,35 @@ async function executeProposal(tab, proposal) {
         break;
       }
       const fullValue = step.type === 'set_value';
+      // Only an element click compares the page text before and after.
+      const includeHash = step.type === 'click' && !step.point;
       const stateResult = await agentCall(tab.id, entry, {
-        op: 'state', snapshotId: step.snapshotId, nodeId: step.nodeId, includeHash: true, fullValue,
+        op: 'state', snapshotId: step.snapshotId, nodeId: step.nodeId, includeHash, fullValue,
       });
       if (!stateResult?.exists) {
         failedStep = `Step ${index + 1}: target no longer exists`;
         break;
       }
-      const expected = expectations.get(`${step.snapshotId}:${step.nodeId}`);
-      const stale = differsFromApproved(step, stateResult, expected);
+      const stale = driftFor(step, `${step.snapshotId}:${step.nodeId}`, stateResult);
       if (stale) {
         failedStep = `Step ${index + 1}: ${stale}`;
         break;
       }
-      const endExpected = step.toNodeId === undefined
-        ? null
-        : expectations.get(`${step.snapshotId}:${step.toNodeId}`);
-      if (endExpected) {
+      const endKey = step.toNodeId === undefined ? null : `${step.snapshotId}:${step.toNodeId}`;
+      if (endKey && expectations.has(endKey)) {
         const endState = await agentCall(tab.id, entry, {
           op: 'state', snapshotId: step.snapshotId, nodeId: step.toNodeId,
         });
-        const endStale = endState?.exists ? differsFromApproved(step, endState, endExpected) : 'Page state changed; observe the page again';
+        const endStale = endState?.exists ? driftFor(step, endKey, endState) : 'Page state changed; observe the page again';
         if (endStale) {
           failedStep = `Step ${index + 1}: ${endStale}`;
           break;
         }
       }
-      const lastStep = index === proposal.steps.length - 1;
-      if (!lastStep && !laterBefore) laterBefore = await laterTargetStates(tab, proposal.steps, index);
+      // One read of every later target, before the first step changes anything.
+      if (index === 0 && proposal.steps.length > 1) {
+        trusted = trustedAtStart(expectations, await readTargetStates(tab, proposal.steps.slice(1)));
+      }
       const openable = OPENABLE_STEPS.has(step.type);
       const openedBefore = openedTabIds.size;
       if (openable) {
@@ -1461,8 +1470,9 @@ async function executeProposal(tab, proposal) {
       if (outcome.detail) details.push(outcome.detail);
       if (openable) {
         // Browsers report the new tab asynchronously; give the action a short,
-        // bounded window and never guess about pages opened later.
-        const finishedWindow = await waitSlices(tab.id, NEW_PAGE_WINDOW_MS);
+        // bounded window from its input and never guess about pages opened later.
+        const sinceInput = Date.now() - (outcome.inputAt ?? Date.now());
+        const finishedWindow = await waitSlices(tab.id, Math.max(0, NEW_PAGE_WINDOW_MS - sinceInput));
         const execution = activeExecutions.get(tab.id);
         activeExecutions.delete(tab.id);
         if (!finishedWindow) {
@@ -1484,12 +1494,8 @@ async function executeProposal(tab, proposal) {
           }
         }
       }
-      await sleep(SETTLE_MS);
-      if (!lastStep) {
-        const laterAfter = await laterTargetStates(tab, proposal.steps, index);
-        carryBatchChanges(expectations, laterBefore, laterAfter);
-        laterBefore = laterAfter;
-      }
+      // Steps that send input already waited for the page to settle.
+      if (!outcome.settled) await sleep(SETTLE_MS);
     }
   } catch (error) {
     const message = error?.message ?? 'Execution failed';
@@ -1635,9 +1641,11 @@ async function executeStep(tab, step, entry, beforeState, cdp, record) {
         commit.cancel();
         return { ok: false, error: result.error };
       }
+      const inputAt = Date.now();
       const changed = await commit.done;
       return {
         ok: true,
+        inputAt,
         verified: changed,
         changed,
         detail: changed ? 'Page opened' : 'The page did not finish opening (navigation timeout)',
@@ -1667,11 +1675,14 @@ async function executeStep(tab, step, entry, beforeState, cdp, record) {
           button: step.button, clickCount: step.clickCount, holdMs: step.holdMs,
           modifiers: step.modifiers, tabId: tab.id,
         }));
+        const inputAt = Date.now();
         await sleep(SETTLE_MS);
         const after = await grabPixels(cdp, visual, beforeState, { validate: false });
         const changed = !after.error && fresh.fingerprint !== after.fingerprint;
         return {
           ok: true,
+          inputAt,
+          settled: true,
           changed,
           verified: false,
           detail: step.button === 'right'
@@ -1687,6 +1698,7 @@ async function executeStep(tab, step, entry, beforeState, cdp, record) {
         button: step.button, clickCount: step.clickCount, holdMs: step.holdMs,
         modifiers: step.modifiers, tabId: tab.id,
       }));
+      const inputAt = Date.now();
       await sleep(SETTLE_MS);
       let after;
       try {
@@ -1706,6 +1718,8 @@ async function executeStep(tab, step, entry, beforeState, cdp, record) {
       });
       return {
         ok: true,
+        inputAt,
+        settled: true,
         changed,
         verified,
         detail: step.button === 'right'
@@ -1746,6 +1760,7 @@ async function executeStep(tab, step, entry, beforeState, cdp, record) {
       await sleep(SETTLE_MS);
       return {
         ok: true,
+        settled: true,
         changed: true,
         verified: false,
         detail: `Hovered for ${step.durationMs} ms; observe the page for revealed items.`,
@@ -1755,10 +1770,10 @@ async function executeStep(tab, step, entry, beforeState, cdp, record) {
       const result = await agentCall(tab.id, entry, { op: 'blurTarget', snapshotId, nodeId });
       if (result?.error) return { ok: false, error: result.error };
       await sleep(SETTLE_MS);
-      const after = await agentCall(tab.id, entry, { op: 'state', snapshotId, nodeId }).catch(() => null);
       const changedNow = result.changed === true;
       return {
         ok: true,
+        settled: true,
         changed: changedNow,
         verified: true,
         detail: changedNow ? 'Removed focus so the page can update.' : 'The field was not focused; nothing changed.',
@@ -1831,12 +1846,18 @@ async function executeStep(tab, step, entry, beforeState, cdp, record) {
         await dragPoints(cdp, localPoints.map((point) => ({ x: offset.x + point.x, y: offset.y + point.y })), {
           modifiers: step.modifiers, tabId: tab.id,
         });
+        const inputAt = Date.now();
         await sleep(SETTLE_MS);
         if (executions.stopped(tab.id)) {
-          return { ok: true, changed: true, verified: false, detail: 'Cancelled during the drag; the mouse button was released.' };
+          return {
+            ok: true, inputAt, settled: true, changed: true, verified: false,
+            detail: 'Cancelled during the drag; the mouse button was released.',
+          };
         }
         return {
           ok: true,
+          inputAt,
+          settled: true,
           changed: true,
           verified: false,
           detail: 'Dragged between the two targets; observe the page for the new order or value.',
@@ -1859,11 +1880,14 @@ async function executeStep(tab, step, entry, beforeState, cdp, record) {
       await dragPoints(cdp, step.points.map(({ x, y }) => ({ x, y })), {
         modifiers: step.modifiers, tabId: tab.id,
       });
+      const inputAt = Date.now();
       await sleep(SETTLE_MS);
       const after = await grabPixels(cdp, visual, beforeState, { validate: false });
       const changed = !after.error && fresh.fingerprint !== after.fingerprint;
       return {
         ok: true,
+        inputAt,
+        settled: true,
         changed,
         verified: false,
         detail: changed
@@ -1878,6 +1902,7 @@ async function executeStep(tab, step, entry, beforeState, cdp, record) {
       if (!before?.exists) return { ok: false, error: 'Target no longer exists' };
       if (!before.focused) return { ok: false, error: 'Could not focus the target for the key' };
       await withModifiers(cdp, step.modifiers, () => pressKey(cdp, step.key, step.modifiers));
+      const inputAt = Date.now();
       await sleep(SETTLE_MS);
       let after;
       try {
@@ -1888,6 +1913,8 @@ async function executeStep(tab, step, entry, beforeState, cdp, record) {
       const { changed } = changedSince(before, after, KEY_FIELDS);
       return {
         ok: true,
+        inputAt,
+        settled: true,
         changed,
         verified: false,
         detail: changed
@@ -2242,7 +2269,18 @@ async function debuggerSession(tabId) {
       throw new Error(`Could not connect to the page debugger: ${message || 'close DevTools and try again'}`);
     }
   }
-  const cdp = { tabId, sessions: new Set(['']), contexts: [], docFrames: new Map() };
+  // docFrames and frameTree are caches of what the browser reported; every
+  // target or context change drops both, so they never outlive the layout.
+  // frameEpoch counts those drops: a collection that awaited across one must
+  // not store what it saw.
+  const cdp = {
+    tabId, sessions: new Set(['']), contexts: [], docFrames: new Map(), frameTree: null, frameEpoch: 0,
+  };
+  const forgetFrames = () => {
+    cdp.docFrames.clear();
+    cdp.frameTree = null;
+    cdp.frameEpoch += 1;
+  };
   const onEvent = (source, method, params) => {
     if (source?.tabId !== tabId) return;
     const sessionId = source.sessionId ?? '';
@@ -2250,7 +2288,7 @@ async function debuggerSession(tabId) {
       const child = params?.sessionId;
       if (!child) return;
       cdp.sessions.add(child);
-      cdp.docFrames.clear();
+      forgetFrames();
       // Flat sessions are not recursive: enable the child and let it attach
       // its own embedded descendants.
       cdp.send('Runtime.enable', {}, child).catch(() => {});
@@ -2258,7 +2296,7 @@ async function debuggerSession(tabId) {
     } else if (method === 'Target.detachedFromTarget') {
       cdp.sessions.delete(params?.sessionId ?? '');
       cdp.contexts = cdp.contexts.filter((context) => context.sessionId !== params?.sessionId);
-      cdp.docFrames.clear();
+      forgetFrames();
     } else if (method === 'Runtime.executionContextCreated') {
       const context = params?.context;
       if (!context || !Number.isInteger(context.id)) return;
@@ -2267,13 +2305,16 @@ async function debuggerSession(tabId) {
         contextId: context.id,
         frameId: context.auxData?.frameId ?? null,
       });
+      // A new context can mean a new frame in the tree.
+      cdp.frameTree = null;
+      cdp.frameEpoch += 1;
     } else if (method === 'Runtime.executionContextDestroyed') {
       cdp.contexts = cdp.contexts.filter((context) => !(context.sessionId === sessionId
         && context.contextId === params?.executionContextId));
-      cdp.docFrames.clear();
+      forgetFrames();
     } else if (method === 'Runtime.executionContextsCleared') {
       cdp.contexts = cdp.contexts.filter((context) => context.sessionId !== sessionId);
-      cdp.docFrames.clear();
+      forgetFrames();
     }
   };
   chrome.debugger.onEvent.addListener(onEvent);
@@ -2294,39 +2335,54 @@ async function documentFrameMap(cdp, tokens) {
   const wanted = new Set(tokens.filter(Boolean));
   const found = new Map();
   if (!wanted.size) return found;
+  const epoch = cdp.frameEpoch;
+  // Contexts already matched to a document, so each is evaluated at most once.
+  const matched = new Set();
+  for (const token of wanted) {
+    const cached = cdp.docFrames.get(token);
+    if (!cached) continue;
+    found.set(token, cached);
+    matched.add(`${cached.sessionId}:${cached.frameId}`);
+  }
   const deadline = Date.now() + 1000;
-  while (Date.now() < deadline) {
+  while (found.size < wanted.size && Date.now() < deadline) {
     for (const context of cdp.contexts) {
       if (found.size === wanted.size) break;
       if (!context.frameId) continue;
-      const known = [...found.values()].some((entry) => (
-        entry.frameId === context.frameId && entry.sessionId === context.sessionId
-      ));
-      if (known) continue;
+      if (matched.has(`${context.sessionId}:${context.frameId}`)) continue;
       const value = await cdp.send('Runtime.evaluate', {
         expression: 'globalThis.__accessAssistAgent?.docToken ?? null',
         contextId: context.contextId,
         returnByValue: true,
       }, context.sessionId).then((response) => response?.result?.value ?? null).catch(() => null);
-      if (wanted.has(value)) {
+      if (wanted.has(value) && !found.has(value)) {
         found.set(value, { frameId: context.frameId, sessionId: context.sessionId });
+        matched.add(`${context.sessionId}:${context.frameId}`);
       }
     }
     if (found.size === wanted.size) break;
     // Bounded discovery of browser-provided contexts; no page action runs yet.
     await sleep(20);
   }
-  for (const [token, info] of found) cdp.docFrames.set(token, info);
+  if (cdp.frameEpoch === epoch) {
+    for (const [token, info] of found) cdp.docFrames.set(token, info);
+  }
   return found;
 }
 
 async function frameTreeSessions(cdp) {
+  if (cdp.frameTree) return cdp.frameTree;
+  const epoch = cdp.frameEpoch;
   const roots = new Map();
   const parents = new Map();
+  let complete = true;
   const collect = async (sessionId) => {
     const response = await cdp.send('Page.getFrameTree', {}, sessionId).catch(() => null);
     const tree = response?.frameTree;
-    if (!tree) return;
+    if (!tree) {
+      complete = false;
+      return;
+    }
     roots.set(tree.frame.id, sessionId);
     const walk = (node, parentId) => {
       if (parentId && !parents.has(node.frame.id)) parents.set(node.frame.id, parentId);
@@ -2338,7 +2394,11 @@ async function frameTreeSessions(cdp) {
   for (const sessionId of [...cdp.sessions]) {
     if (sessionId) await collect(sessionId);
   }
-  return { roots, parents };
+  const frameTree = { roots, parents };
+  // A failed or interrupted collection still answers this caller but is not
+  // kept, so the next call reads the tree again.
+  if (complete && cdp.frameEpoch === epoch) cdp.frameTree = frameTree;
+  return frameTree;
 }
 
 async function frameOffset(cdp, frameId) {
@@ -2677,10 +2737,12 @@ async function sensitiveAreas(cdp, root, viewport) {
     for (const child of node.children ?? []) stack.push(child);
     for (const shadow of node.shadowRoots ?? []) stack.push(shadow);
   }
+  const boxes = await Promise.all(found.map(({ node }) => (
+    cdp.send('DOM.getBoxModel', { backendNodeId: node.backendNodeId }).catch(() => null)
+  )));
   const areas = [];
-  for (const { node, reason } of found) {
-    const box = await cdp.send('DOM.getBoxModel', { backendNodeId: node.backendNodeId }).catch(() => null);
-    const quad = box?.model?.border;
+  for (const [index, { reason }] of found.entries()) {
+    const quad = boxes[index]?.model?.border;
     if (!Array.isArray(quad) || quad.length < 8) continue;
     const xs = [quad[0], quad[2], quad[4], quad[6]];
     const ys = [quad[1], quad[3], quad[5], quad[7]];
@@ -2794,14 +2856,18 @@ async function pixelDigest(bitmap) {
   };
 }
 
+// RGBA pixels compared four bytes at a time; both buffers are whole
+// ImageData arrays, so their byte offsets are 4-aligned.
 function samePixelRegion(fresh, freshWidth, stored, storedWidth, width, height) {
   if (!fresh || !stored || width < 1 || height < 1) return false;
   if (fresh.length < freshWidth * height * 4 || stored.length < storedWidth * height * 4) return false;
+  const freshWords = new Uint32Array(fresh.buffer, fresh.byteOffset, fresh.length >> 2);
+  const storedWords = new Uint32Array(stored.buffer, stored.byteOffset, stored.length >> 2);
   for (let row = 0; row < height; row += 1) {
-    const freshStart = row * freshWidth * 4;
-    const storedStart = row * storedWidth * 4;
-    for (let index = 0; index < width * 4; index += 1) {
-      if (fresh[freshStart + index] !== stored[storedStart + index]) return false;
+    const freshStart = row * freshWidth;
+    const storedStart = row * storedWidth;
+    for (let index = 0; index < width; index += 1) {
+      if (freshWords[freshStart + index] !== storedWords[storedStart + index]) return false;
     }
   }
   return true;
@@ -2850,11 +2916,7 @@ async function viewportShot(cdp, viewport, scroll, masks = []) {
 }
 
 async function captureViewport(tab, visual, { expectedDocumentId }) {
-  try {
-    await captureCensus(tab, expectedDocumentId);
-  } catch (error) {
-    return { error: captureError(error) };
-  }
+  // withPausedRenderer checks the page before, during and after the pause.
   return withPausedRenderer(tab, expectedDocumentId, {
     prepare: async (cdp) => {
       await setLauncherHidden(cdp, true);

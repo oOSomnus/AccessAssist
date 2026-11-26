@@ -95,19 +95,20 @@ export function differsFromApproved(step, state, expected) {
   return null;
 }
 
-// One approved batch: later steps are checked against the state each target
-// had when the user confirmed. A target that changed while an earlier step ran
-// takes the new state, but only if it still matched the approved state just
-// before that step: the batch's own work is accepted, outside drift still fails.
-export function carryBatchChanges(expected, before, after) {
-  for (const [key, prior] of before) {
+// One approved batch: the targets of later steps, read once just before the
+// first step runs. A target that still matched what the user approved may
+// take whatever state the batch's own steps give it; one that had already
+// drifted keeps being checked against the approved state, so outside drift
+// still fails. Unreadable targets are never trusted.
+export function trustedAtStart(expected, states) {
+  const trusted = new Set();
+  for (const [key, state] of states) {
     const approved = expected.get(key);
-    const now = after.get(key);
-    if (!approved || !prior?.exists || !now?.exists) continue;
-    if (differsFromApproved({}, prior, approved)) continue;
-    expected.set(key, projectTargetState(now));
+    if (!approved || !state?.exists) continue;
+    if (differsFromApproved({}, state, approved)) continue;
+    trusted.add(key);
   }
-  return expected;
+  return trusted;
 }
 
 export function conflictFor(field, state) {

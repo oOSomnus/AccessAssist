@@ -1603,15 +1603,30 @@ function historyForModel(history, protocol) {
     const message = copy[messageIndex];
     const results = message.results.slice();
     const result = results[resultIndex];
-    results[resultIndex] = { ...result, content: supersededContent(result.content, kind) };
+    let superseded = supersededResults.get(result);
+    if (!superseded) {
+      superseded = { ...result, content: supersededContent(result.content, kind) };
+      supersededResults.set(result, superseded);
+    }
+    results[resultIndex] = superseded;
     copy[messageIndex] = { ...message, results };
   }
   return copy;
 }
 
+// Tool results are never changed after they enter the history, so each one is
+// parsed once rather than on every model call of every later turn.
+const readingKinds = new WeakMap();
+const supersededResults = new WeakMap();
+
 // 'observe' for an observe_page result, 'action' for an action result that
 // carries the page after it, null for anything else.
 function pageReadingKind(result) {
+  if (!readingKinds.has(result)) readingKinds.set(result, readPageReadingKind(result));
+  return readingKinds.get(result);
+}
+
+function readPageReadingKind(result) {
   if (result.isError || (result.name !== 'observe_page' && result.name !== 'propose_action')) return null;
   let value;
   try {

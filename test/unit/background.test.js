@@ -521,24 +521,32 @@ test('a local undo is marked as an execution', async () => {
   assert.equal('executing:7' in behavior.sessionState, false);
 });
 
-// A page whose agent answers observe/state/setAlt, then fails every injection
-// like a document that navigated under the worker.
-function fakePage(tabId) {
+// A page whose agent answers observe/state/states/setAlt. With `vanish`, every
+// injection after the first setAlt fails like a document that navigated under
+// the worker. The agent is loaded on first use, as on a fresh page.
+function fakePage(tabId, { vanish = true } = {}) {
   behavior.tab = { id: tabId, windowId: 3, active: true, title: 'Page', url: 'https://example.test/page' };
   behavior.activeTabs = [behavior.tab];
   behavior.frames = [{ frameId: 0, documentId: 'doc-1', url: 'https://example.test/page' }];
   const alts = new Map();
+  const ops = [];
   let gone = false;
+  let loaded = false;
   const img = (nodeId) => ({
     nodeId, tag: 'img', role: 'img', name: `Image ${nodeId}`, visible: true, disabled: false,
     checkable: false, selectable: false, editable: false, focusable: false,
     checked: null, ariaChecked: null, value: null,
     alt: alts.get(nodeId) ?? { present: false, value: '' },
   });
-  behavior.agent = async ({ args }) => {
+  behavior.agent = async ({ args, files }) => {
     if (gone) throw new Error('Frame removed');
-    if (!args) return [{ documentId: 'doc-1', result: true }];
+    if (files) {
+      loaded = true;
+      return [{ documentId: 'doc-1' }];
+    }
+    if (!loaded) return [{ documentId: 'doc-1', result: { missing: true } }];
     const payload = args[0];
+    ops.push(payload.op);
     let result;
     if (payload.op === 'observe') {
       result = {
@@ -547,16 +555,19 @@ function fakePage(tabId) {
       };
     } else if (payload.op === 'state') {
       result = { exists: true, docToken: 'tok', ...img(payload.nodeId) };
+    } else if (payload.op === 'states') {
+      result = { states: payload.items.map((item) => ({ exists: true, docToken: 'tok', ...img(item.nodeId) })) };
     } else if (payload.op === 'setAlt') {
       const after = { present: true, value: payload.alt };
       alts.set(payload.nodeId, after);
-      gone = true;
+      if (vanish) gone = true;
       result = { before: { present: false, value: '' }, after };
     } else {
       throw new Error(`Unexpected agent op ${payload.op}`);
     }
-    return [{ documentId: 'doc-1', result }];
+    return [{ documentId: 'doc-1', result: { value: result } }];
   };
+  return { ops };
 }
 
 async function observeAndPropose(tabId) {
@@ -591,6 +602,18 @@ test('a step that throws mid-proposal keeps the completed step and its undo reco
   const record = behavior.sessionState['undo:11'];
   assert.equal(record.fields.length, 1);
   assert.equal(record.fields[0].after.value, 'First');
+});
+
+test('a batch reads its later targets once, not after every step', async () => {
+  reset();
+  const page = fakePage(13, { vanish: false });
+  const proposalId = await observeAndPropose(13);
+  page.ops.length = 0;
+  const response = await panelMessage({ type: 'RUN_PROPOSAL', proposalId, tabId: 13 });
+
+  assert.equal(response.report.completed, 2, JSON.stringify(response.report));
+  assert.equal(response.report.failedStep, null);
+  assert.deepEqual(page.ops, ['state', 'states', 'setAlt', 'state', 'setAlt']);
 });
 
 test('a failure before any step reports nothing done and stores no undo record', async () => {
