@@ -9,7 +9,9 @@ Requires Chrome 142 or later. No build step and no npm install: `extension/` is 
 1. Open `chrome://extensions`, turn on Developer mode, choose "Load unpacked", and select the `extension/` folder.
 2. Open a web page and press `Control+Shift+Space` (physical Control on macOS too), or use the toolbar button or the "Assistant" button on the page. This opens or focuses the panel without recording. Drag the Assistant button anywhere in the viewport to move it, or focus it and press Shift+Arrow to nudge it; the position is remembered. After updating the extension, reload already open pages to get the new button.
 3. Press `Control+Shift+Y` for one dictated command, or choose Listen. `Control+Shift+Period` closes the panel. Replay introduction has no default key; use the Settings button or assign one at `chrome://extensions/shortcuts`. An existing profile keeps its saved key until you rebind Close panel there once.
-4. In Settings, paste an OpenCode Go API key and save. The panel has a "Get an API key" link. The key lasts for this browser session, and changing the API origin clears it. Advanced API settings also include Reasoning effort. Provider default sends no effort parameter; supported levels depend on the model, and some models map levels to the same behavior.
+4. In Settings, choose a Model service:
+   - **OpenCode Go API key**: paste an OpenCode Go API key and save. The panel has a "Get an API key" link. The key lasts for this browser session, and changing the API origin clears it. Advanced API settings also include Reasoning effort. Provider default sends no effort parameter; supported levels depend on the model, and some models map levels to the same behavior.
+   - **ChatGPT plan**: choose "Continue with ChatGPT". OpenAI's sign-in opens in a new tab; sign in there, and when you finish the tab closes and you return to your page. Then choose a ChatGPT model (the list shows the models your account can use) and a Reasoning effort, and save. Requests use the usage included in your ChatGPT plan through OpenAI's Sign in with ChatGPT program, not an API key. You stay signed in across browser restarts until you choose "Sign out of ChatGPT". A pasted OpenCode key is kept while the ChatGPT plan is chosen, so you can switch back.
 
 The shortcuts use physical Control, not Command, so they avoid macOS Command+Shift screenshot keys. Distribute them across both sides of the keyboard or use the native buttons and system sticky keys; no timed key sequence is required.
 
@@ -47,6 +49,10 @@ A screenshot can guide a click or drag on visual targets such as canvases, but o
 
 Some custom controls save a change as soon as they are clicked. The panel says whether it saw a change and whether it verified the requested result, asks again before an action it cannot undo, and never claims a color change or server save it could not confirm.
 
+### Signing in with ChatGPT
+
+The sign-in tab belongs to OpenAI. AccessAssist never reads, captures, or operates that tab, even though it is a normal web page, and it never sees your password. When the tab returns to AccessAssist, the extension exchanges the one-time code for tokens and closes the tab. The long-lived sign-in is kept in the browser profile, readable only by the extension. The short-lived access token is kept only for this browser session. "Sign out of ChatGPT" deletes both and asks OpenAI to end the sign-in.
+
 ## Development
 
 See [CONTRIBUTING.md](CONTRIBUTING.md) for tests, the live AI check, and packaging.
@@ -54,6 +60,8 @@ See [CONTRIBUTING.md](CONTRIBUTING.md) for tests, the live AI check, and packagi
 ## Known limits
 
 - OpenCode Go is designed for coding-agent requests. This project's use of the service has not been confirmed by OpenCode.
+- The ChatGPT plan option uses OpenAI's Sign in with ChatGPT program for open-source apps, which OpenAI describes as limited to eligible plans. Plan usage stops when you reach your plan's limit (on Plus, the five-hour limit is shared with every app that uses your plan); it never falls back to paid API billing. "ChatGPT usage" in Settings links to your remaining usage. Which reasoning effort levels a model accepts depends on the model; one that refuses a level is reported, and you can choose another.
+- The ChatGPT sign-in returns to `http://127.0.0.1:1455/auth/callback`. AccessAssist reads the code from the navigation itself; nothing needs to listen on that port.
 - Automated tests use a scripted voice and an extension tab; they cannot prove OS shortcut registration, native side-panel focus or closure, audible speech, or real screen-reader behavior. They check that the panel delivers messages in the intended order, not that a reader speaks them that way. Check VoiceOver, Narrator, NVDA, and JAWS on Windows and macOS with the actual side panel.
 - The hold between announcements is an estimate from message length, not a signal from the screen reader; no such signal exists for a web page. A reader set to a slow rate can still be speaking when the next message arrives.
 - The image-exploration keys for each screen reader depend on that reader's version and settings, and Narrator's and JAWS's description features may use online services. AccessAssist cannot enable or configure any of them. The JAWS guide names Picture Smart but gives no keys: Freedom Scientific's documentation could not be checked, so add them only once they are verified.

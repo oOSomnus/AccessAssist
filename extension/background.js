@@ -14,6 +14,14 @@ import {
 } from './policy.js';
 import { createExecutionQueue } from './execution.js';
 import {
+  CALLBACK_HOST,
+  CALLBACK_PATH,
+  CALLBACK_PORT,
+  SIGN_IN_TIMEOUT_MS,
+  createChatgptAuth,
+  isCallbackUrl,
+} from './chatgpt-auth.js';
+import {
   CLICK_FIELDS,
   CONFLICT_CLICK_FIELDS,
   KEY_FIELDS,
@@ -64,6 +72,21 @@ function panelSender(sender) {
 
 function httpUrl(value) {
   return typeof value === 'string' && /^https?:\/\//iu.test(value);
+}
+
+// Sign in with ChatGPT runs in a tab of its own. That tab holds a login form,
+// so it is never a page the assistant may read, capture, or act on, whatever
+// site it shows. The id is cached for the synchronous checks below and
+// reloaded from session storage when the worker restarts.
+const chatgptAuth = createChatgptAuth({ local: chrome.storage.local, session: chrome.storage.session });
+let signInTabId = null;
+const signInTabReady = chatgptAuth.signInTabId()
+  .then((id) => { signInTabId = id; })
+  .catch(() => {});
+
+// A web page the assistant may serve: http(s) and not the sign-in tab.
+function pageTab(tab) {
+  return Boolean(tab) && httpUrl(tab.url) && tab.id !== signInTabId;
 }
 
 let launcherPositionQueue = Promise.resolve();
@@ -165,7 +188,7 @@ async function claimIntent(windowId, intentId = null) {
 }
 
 async function trackTab(tab) {
-  if (tab && httpUrl(tab.url)) lastHttpTab.set(tab.windowId, { tabId: tab.id, at: Date.now() });
+  if (pageTab(tab)) lastHttpTab.set(tab.windowId, { tabId: tab.id, at: Date.now() });
 }
 
 async function targetTab(tabId, windowId) {
@@ -187,13 +210,13 @@ async function targetTab(tabId, windowId) {
 async function visibleTab(windowId) {
   const [active] = await chrome.tabs.query({ active: true, windowId }).catch(() => []);
   if (!active) return { tab: null, active: null };
-  if (httpUrl(active.url)) return { tab: active, active };
+  if (pageTab(active)) return { tab: active, active };
   if (typeof active.url === 'string' && active.url.startsWith(PANEL_URL)) {
     const remembered = lastHttpTab.get(windowId);
     if (remembered) {
       try {
         const tab = await chrome.tabs.get(remembered.tabId);
-        if (httpUrl(tab.url) && tab.windowId === windowId) return { tab, active };
+        if (pageTab(tab) && tab.windowId === windowId) return { tab, active };
       } catch {}
       lastHttpTab.delete(windowId);
     }
@@ -201,7 +224,7 @@ async function visibleTab(windowId) {
     // used web page is the one this panel tab was opened beside.
     const tabs = await chrome.tabs.query({ windowId }).catch(() => []);
     const newest = tabs
-      .filter((tab) => httpUrl(tab.url))
+      .filter((tab) => pageTab(tab))
       .sort((left, right) => (right.lastAccessed ?? 0) - (left.lastAccessed ?? 0))[0];
     if (newest) {
       trackTab(newest);
@@ -211,6 +234,7 @@ async function visibleTab(windowId) {
   return { tab: null, active };
 }
 
+const SIGN_IN_PAGE = 'This is the ChatGPT sign-in page. AccessAssist does not read or operate it.';
 const NOT_ON_SCREEN = 'That page is no longer on screen; the user switched to another tab. Nothing was done there.';
 
 // Every request that reads or changes a page must name the page on screen.
@@ -223,6 +247,7 @@ async function visiblePageTab(tabId) {
 
 function requireTab(tab) {
   if (!tab) throw new Error('No web page tab is available');
+  if (tab.id === signInTabId) throw new Error(SIGN_IN_PAGE);
   if (!httpUrl(tab.url)) throw new Error('The current tab is not a regular web page and cannot be read or acted on');
   return tab;
 }
@@ -362,12 +387,91 @@ chrome.tabs.onActivated.addListener(({ tabId }) => {
 
 chrome.tabs.onRemoved.addListener((tabId) => {
   clearTab(tabId, 'closed');
+  if (tabId === signInTabId) signInTabId = null;
+  void signInTabReady.then(() => chatgptAuth.cancelSignIn(undefined, { tabId })).catch(() => {});
 });
+
+// The sign-in redirect goes to a loopback address nothing listens on; the
+// worker reads the code from the navigation itself. OpenAI may get there by a
+// server redirect, which starts no navigation of its own, so every signal
+// that can carry the final address is watched; the first one finishes the
+// attempt. Only the tab this worker opened for the current attempt counts.
+const CALLBACK_FILTER = { url: [{ hostEquals: CALLBACK_HOST, ports: [CALLBACK_PORT], pathEquals: CALLBACK_PATH }] };
+for (const event of ['onBeforeNavigate', 'onCommitted', 'onErrorOccurred']) {
+  chrome.webNavigation[event].addListener((details) => {
+    if (details.frameId !== 0) return;
+    void finishChatgptSignIn(details.tabId, details.url).catch(() => {});
+  }, CALLBACK_FILTER);
+}
+chrome.tabs.onUpdated.addListener((tabId, changeInfo) => {
+  if (changeInfo.url && isCallbackUrl(changeInfo.url)) void finishChatgptSignIn(tabId, changeInfo.url).catch(() => {});
+});
+
+let signInFinishing = false;
+
+async function finishChatgptSignIn(tabId, url) {
+  if (!isCallbackUrl(url)) return;
+  await signInTabReady;
+  if (signInFinishing) return;
+  const pending = await chatgptAuth.pending();
+  // Checked again after the await: another signal may have started first.
+  if (signInFinishing || !pending || pending.tabId !== tabId) return;
+  signInFinishing = true;
+  try {
+    await chatgptAuth.completeSignIn(url, { beforeOutcome: leaveSignInTab });
+  } finally {
+    signInFinishing = false;
+  }
+}
+
+// Returns the person to the page they started from, then closes the
+// sign-in tab. Clearing the id first keeps onRemoved from calling it a cancel.
+async function leaveSignInTab(entry) {
+  signInTabId = null;
+  if (Number.isInteger(entry?.returnTabId)) await chrome.tabs.update(entry.returnTabId, { active: true }).catch(() => {});
+  if (Number.isInteger(entry?.tabId)) await chrome.tabs.remove(entry.tabId).catch(() => {});
+}
+
+async function startChatgptSignIn(message) {
+  // A second request replaces the first attempt; its tab goes away.
+  const previous = await chatgptAuth.cancelSignIn('An earlier sign-in attempt was replaced.');
+  if (previous) await leaveSignInTab({ tabId: previous.tabId });
+  const returnTabId = Number.isInteger(message.returnTabId) ? message.returnTabId : null;
+  const windowId = Number.isInteger(message.windowId) ? message.windowId : null;
+  const { url } = await chatgptAuth.startSignIn({ returnTabId, windowId });
+  // The tab is marked private before it loads anything: it opens blank, and
+  // only then goes to the sign-in page.
+  let tab;
+  try {
+    tab = await chrome.tabs.create({ url: 'about:blank', active: true, ...(windowId != null ? { windowId } : {}) });
+    signInTabId = tab.id;
+    await chatgptAuth.attachTab(tab.id);
+    await chrome.tabs.update(tab.id, { url });
+  } catch (error) {
+    await chatgptAuth.cancelSignIn('Could not open the ChatGPT sign-in tab.');
+    if (tab) await leaveSignInTab({ tabId: tab.id });
+    return { error: `Could not open the sign-in tab: ${error?.message ?? 'unknown error'}` };
+  }
+  setTimeout(() => {
+    void chatgptAuth.cancelSignIn('Sign-in timed out. Nothing was saved. Try again.', { tabId: tab.id })
+      .then((entry) => (entry ? leaveSignInTab(entry) : null))
+      .catch(() => {});
+  }, SIGN_IN_TIMEOUT_MS);
+  return { ok: true };
+}
+
+async function chatgptToken(message) {
+  try {
+    return { token: await chatgptAuth.accessToken({ force: message.force === true }) };
+  } catch (error) {
+    return { error: error?.message ?? 'ChatGPT sign-in failed', code: error?.code ?? 'signed_out' };
+  }
+}
 
 chrome.webNavigation.onHistoryStateUpdated.addListener((details) => {
   if (details.frameId !== 0) return;
   chrome.tabs.get(details.tabId).then((tab) => {
-    if (!httpUrl(tab.url)) return;
+    if (!pageTab(tab)) return;
     lastHttpTab.set(tab.windowId, { tabId: tab.id, at: Date.now() });
     clearTab(details.tabId, 'document');
   }).catch(() => {});
@@ -376,7 +480,7 @@ chrome.webNavigation.onHistoryStateUpdated.addListener((details) => {
 chrome.webNavigation.onCommitted.addListener((details) => {
   if (details.frameId !== 0) return;
   chrome.tabs.get(details.tabId).then((tab) => {
-    if (!httpUrl(tab.url)) return;
+    if (!pageTab(tab)) return;
     lastHttpTab.set(tab.windowId, { tabId: tab.id, at: Date.now() });
     clearTab(details.tabId, 'document');
   }).catch(() => {});
@@ -399,7 +503,7 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
         return { error: 'Unauthorized launcher message' };
       }
       const tab = sender.tab;
-      if (!httpUrl(tab.url)) return { error: 'The Assistant cannot be opened on this page' };
+      if (!pageTab(tab)) return { error: 'The Assistant cannot be opened on this page' };
       const intent = setIntent(tab.windowId, { mode: 'voice', source: 'launcher', tabId: tab.id });
       try {
         await chrome.sidePanel.open({ windowId: tab.windowId });
@@ -497,6 +601,8 @@ async function claimIntroOnce() {
 }
 
 async function route(message) {
+  // Page checks below rely on knowing which tab is the sign-in tab.
+  await signInTabReady;
   switch (message.type) {
     case 'CLAIM_INTENT': {
       // The panel names its own window; a message without one cannot claim.
@@ -518,6 +624,7 @@ async function route(message) {
       if (!tab) {
         // Name the tab on screen so the panel can say which page it cannot use.
         const shown = visible?.active ?? null;
+        if (shown && shown.id === signInTabId) return { error: SIGN_IN_PAGE, title: 'ChatGPT sign-in', signIn: true };
         if (shown) {
           return {
             error: 'This tab is not a regular web page, so it cannot be read or operated.',
@@ -535,7 +642,7 @@ async function route(message) {
         url: modelUrl(tab.url),
         origin: originOf(tab.url),
         documentId,
-        readable: httpUrl(tab.url),
+        readable: pageTab(tab),
       };
     }
     case 'GET_PAGE_ORIGINS': {
@@ -570,6 +677,13 @@ async function route(message) {
     case 'RESET_SESSION': return resetSession(message.tabId, { clearSnapshots: message.clearSnapshots === true });
     case 'GET_COMMANDS': return { commands: await chrome.commands.getAll() };
     case 'SET_CHOICE_KEYS': return setChoiceKeys(message);
+    case 'CHATGPT_SIGN_IN': return startChatgptSignIn(message);
+    case 'CHATGPT_TOKEN': return chatgptToken(message);
+    case 'CHATGPT_SIGN_OUT': {
+      const entry = await chatgptAuth.cancelSignIn('Signed out.');
+      if (entry) await leaveSignInTab({ tabId: entry.tabId });
+      return chatgptAuth.signOut();
+    }
     // Sent during a turn only so Chrome does not stop this worker, and its
     // in-memory snapshots, while the model thinks or the user decides.
     case 'KEEP_ALIVE': return { ok: true };
@@ -1814,7 +1928,7 @@ async function resetSession(tabId, { clearSnapshots = false } = {}) {
 async function waitForCandidateHttp(tabId, timeoutMs) {
   const tab = await chrome.tabs.get(tabId).catch(() => null);
   if (!tab) return null;
-  if (httpUrl(tab.url)) return tab;
+  if (pageTab(tab)) return tab;
   return new Promise((resolve) => {
     let settled = false;
     const finish = (value) => {
@@ -1828,7 +1942,7 @@ async function waitForCandidateHttp(tabId, timeoutMs) {
     const updated = (id, info, changed) => {
       if (id !== tabId) return;
       const candidate = changed ?? info;
-      if (candidate && httpUrl(candidate.url)) finish(candidate);
+      if (candidate && pageTab(candidate)) finish(candidate);
     };
     const removed = (id) => {
       if (id === tabId) finish(null);
@@ -1867,7 +1981,7 @@ async function activateTab(message) {
     return { error: 'The opened page is no longer available' };
   }
   if (tab.windowId !== message.windowId) return { error: 'The opened page moved to another window; choose the page again.' };
-  if (!httpUrl(tab.url)) return { error: 'The opened page is not a regular web page' };
+  if (!pageTab(tab)) return { error: 'The opened page is not a regular web page' };
   // Putting the source page back is only right while the page the action opened
   // is still in front; a tab the user has picked since stays selected.
   if (Number.isInteger(message.expectedActiveTabId)) {
@@ -1877,7 +1991,7 @@ async function activateTab(message) {
   await chrome.tabs.update(tab.id, { active: true });
   await chrome.windows.update(tab.windowId, { focused: true }).catch(() => {});
   const fresh = await chrome.tabs.get(tab.id).catch(() => null);
-  if (!fresh || !httpUrl(fresh.url)) return { error: 'The opened page is no longer readable' };
+  if (!pageTab(fresh)) return { error: 'The opened page is no longer readable' };
   trackTab(fresh);
   return {
     ok: true,
@@ -1906,7 +2020,7 @@ async function choiceKeysFor(windowId) {
 async function broadcastChoiceKeys(windowId, choiceKeys) {
   const tabs = await chrome.tabs.query({ windowId }).catch(() => []);
   await Promise.all(tabs
-    .filter((tab) => Number.isInteger(tab.id) && httpUrl(tab.url))
+    .filter((tab) => Number.isInteger(tab.id) && pageTab(tab))
     .map((tab) => chrome.tabs.sendMessage(tab.id, { type: 'CHOICE_KEYS', choiceKeys }, { frameId: 0 })
       .catch(() => {})));
 }
@@ -1968,7 +2082,7 @@ async function setLauncherPosition(position, sourceTabId) {
   }
   const tabs = await chrome.tabs.query({}).catch(() => []);
   await Promise.all(tabs
-    .filter((tab) => tab.id !== sourceTabId && Number.isInteger(tab.id) && httpUrl(tab.url))
+    .filter((tab) => tab.id !== sourceTabId && Number.isInteger(tab.id) && pageTab(tab))
     .map((tab) => chrome.tabs.sendMessage(tab.id, { type: 'SET_LAUNCHER_POSITION', position: next }).catch(() => {})));
   return { ok: true, position: next };
 }

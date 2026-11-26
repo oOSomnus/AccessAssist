@@ -414,7 +414,7 @@ test('regression: ONLY_PROTOCOL selects one known protocol and keeps both when a
     if (saved === undefined) delete process.env.ONLY_PROTOCOL;
     else process.env.ONLY_PROTOCOL = saved;
   }
-  assert.equal(protocolSelectionError(), 'ONLY_PROTOCOL must be one of: openai, anthropic');
+  assert.equal(protocolSelectionError(), 'ONLY_PROTOCOL must be one of: openai, anthropic, chatgpt');
   assert.equal(isMain(new URL('../../scripts/live-check.mjs', import.meta.url).href, ''), false);
 });
 

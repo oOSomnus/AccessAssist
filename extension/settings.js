@@ -6,6 +6,27 @@ export const DEFAULT_API_CONFIG = Object.freeze({
   effort: 'default',
 });
 
+// The ChatGPT plan service: OpenAI's API, reached with a Sign in with ChatGPT
+// token instead of a pasted key. The model is chosen from the account's list.
+export const DEFAULT_CHATGPT_CONFIG = Object.freeze({
+  protocol: 'chatgpt',
+  baseUrl: 'https://api.openai.com/v1',
+  model: '',
+  effort: 'default',
+});
+
+export function usesChatgpt(config) {
+  return config?.protocol === 'chatgpt';
+}
+
+// The pasted key belongs to the key-based service. While the ChatGPT plan is
+// active the key stays bound to the last key-based configuration, so
+// switching services and back does not throw it away.
+export function keyConfigFor(config, lastKeyConfig) {
+  if (!usesChatgpt(config)) return config;
+  return lastKeyConfig && !usesChatgpt(lastKeyConfig) ? lastKeyConfig : DEFAULT_API_CONFIG;
+}
+
 // Kept out of apiConfig on purpose: configOrigin and configFingerprint hash
 // that object, so an extra field there would clear the session key and upload
 // consent every time this preference changed.

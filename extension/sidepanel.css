@@ -96,6 +96,11 @@ label { display: block; margin-top: var(--space-sm); font-weight: 600; }
 #advanced-api[open] > summary,
 #voice-help[open] > summary { margin-bottom: var(--space-sm); }
 #advanced-api > input, #advanced-api > select { margin-top: var(--space-xs); }
+.service-settings > input, .service-settings select, .service-settings input { margin-top: var(--space-xs); }
+.service-settings { margin-top: var(--space-sm); }
+.service-settings button { margin-top: var(--space-sm); }
+.service-settings .account { margin-top: 0; font-weight: 600; }
+.service-settings .account:empty { display: none; }
 #save-settings { margin-top: var(--space-sm); }
 #replay-intro, #export-log { align-self: flex-start; }
 .shortcut-help { padding-top: var(--space-md); border-top: 1px solid var(--color-rule); }

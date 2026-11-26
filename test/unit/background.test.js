@@ -68,6 +68,8 @@ globalThis.chrome = {
     onHistoryStateUpdated: listener(),
     onCommitted: listener(),
     onCreatedNavigationTarget: listener(),
+    onBeforeNavigate: listener(),
+    onErrorOccurred: listener(),
   },
   windows: {
     getLastFocused: async () => behavior.lastFocused,
