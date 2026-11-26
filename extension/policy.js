@@ -1,11 +1,10 @@
 // Consent, proposal validation and one-time choice rules. Pure state so the
 // worker and unit tests exercise the same code without Chrome APIs.
-import { PRESS_KEYS, PRESS_MODIFIERS, STEP_TYPES } from './protocol.js';
+import { MAX_STEPS, PRESS_KEYS, PRESS_MODIFIERS, STEP_TYPES } from './protocol.js';
 
 export const PHASE = Object.freeze({
   guide: 'guide',
   consent: 'awaiting_consent',
-  risk: 'awaiting_risk_consent',
   executing: 'executing',
   result: 'awaiting_result_confirmation',
 });
@@ -370,8 +369,12 @@ export function validateStep(raw, ctx) {
   return { ok: true, step };
 }
 
+// A drag between two observed targets re-checks both endpoints when it runs,
+// so several of them (painting ranges of a grid) can share one proposal. A
+// drag along screenshot points still depends on that screenshot alone.
 export function isIsolatedStep(step) {
-  if (step.type === 'hover' || step.type === 'blur' || step.type === 'drag') return true;
+  if (step.type === 'hover' || step.type === 'blur') return true;
+  if (step.type === 'drag') return step.toNodeId === undefined || Boolean(step.points);
   if (step.point) return true;
   return step.type === 'click' && (step.button === 'right' || step.clickCount === 2
     || step.holdMs > 0 || (step.modifiers?.length ?? 0) > 0);
@@ -385,7 +388,7 @@ export function validateProposal(raw, ctx) {
   else if (summary.length > MAX_SUMMARY) errors.push('Summary is too long');
   const steps = [];
   if (!Array.isArray(raw.steps) || raw.steps.length === 0) errors.push('No executable steps');
-  else if (raw.steps.length > 20) errors.push('Too many steps');
+  else if (raw.steps.length > MAX_STEPS) errors.push(`Too many steps (at most ${MAX_STEPS})`);
   else {
     const acted = new Set();
     raw.steps.forEach((candidate, index) => {
@@ -437,7 +440,7 @@ export function cancelToGuide(session) {
 }
 
 export function armConsent(session, { choiceSetId, now = Date.now() }) {
-  if (session.phase !== PHASE.consent && session.phase !== PHASE.risk) {
+  if (session.phase !== PHASE.consent) {
     return { error: 'There is no pending confirmation' };
   }
   return {
@@ -455,7 +458,7 @@ export function autoConsent(session) {
 }
 
 export function acceptConsent(session, { choiceSetId, optionValue, now = Date.now() }) {
-  if (session.phase !== PHASE.consent && session.phase !== PHASE.risk) {
+  if (session.phase !== PHASE.consent) {
     return { error: 'There is no pending confirmation' };
   }
   const consent = session.consent;
@@ -469,9 +472,6 @@ export function acceptConsent(session, { choiceSetId, optionValue, now = Date.no
     usedConsentIds: [...session.usedConsentIds, choiceSetId],
     consent: { ...consent, used: true },
   };
-  if (session.phase === PHASE.consent && session.proposal?.risk === 'irreversible') {
-    return { session: { ...used, phase: PHASE.risk, consent: null }, action: 'risk' };
-  }
   return { session: { ...used, phase: PHASE.executing, consent: null }, action: 'execute' };
 }
 

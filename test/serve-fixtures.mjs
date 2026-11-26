@@ -719,6 +719,74 @@ const root = document.getElementById('host').attachShadow({ mode: 'open' });
 root.innerHTML = '<label>Shadow secret <input id="shadow-secret" type="password"></label>';
 </script></body></html>`;
 
+// A schedule grid with no names anywhere: blank paint cells, two-line date
+// headers above, one element holding every hour label on the left (drawn on
+// the hour line), selection shown only by colour, an advertising frame from
+// another site, and a form that submits to a second page.
+const PAINT_DATES = [['Nov 26', 'Thu'], ['Nov 27', 'Fri'], ['Nov 28', 'Sat'], ['Nov 29', 'Sun'],
+  ['Nov 30', 'Mon'], ['Dec 1', 'Tue'], ['Dec 2', 'Wed'], ['Dec 3', 'Thu']];
+const PAINT_HOURS = ['10:00 AM', '11:00 AM', '12:00 PM', '1:00 PM', '2:00 PM', '3:00 PM', '4:00 PM', '5:00 PM'];
+const PAINT_ROWS = 28;
+
+function paintColumn([date, day], column, split) {
+  const state = split ? ' aria-selected="false"' : '';
+  const cells = Array.from({ length: PAINT_ROWS }, (_, row) => (
+    `<div class="slot" data-col="${column}" data-row="${row}"${state} onmousedown="paintDown(this)" onmouseover="paintOver(this)"></div>`
+  )).join('');
+  return `<div class="col"><div class="head">${date}<br>${day}</div>${cells}</div>`;
+}
+
+// split: each hour label is drawn from two text pieces ("11:00" and a styled
+// "AM"), and a marked cell changes only aria-selected, never its colour.
+function paintPage({ split = false } = {}) {
+  const hour = (text) => (split ? text.replace(/ (AM|PM)$/u, ' <span>$1</span>') : text);
+  const mark = split ? "cell.setAttribute('aria-selected', String(on))" : "cell.classList.toggle('on', on)";
+  const isOn = split ? "cell.getAttribute('aria-selected') === 'true'" : "cell.classList.contains('on')";
+  return `<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><title>Paint schedule</title>
+<style>
+body{font-family:sans-serif;margin:16px}
+#schedule{display:flex;align-items:flex-start}
+#hours{width:60px;font-size:10px;text-align:right;margin-right:4px;padding-top:30px}
+#hours div{height:40px;position:relative;top:-6px;line-height:12px}
+.col{width:45px}
+.head{height:30px;font-size:10px;text-align:center;line-height:12px}
+.slot{height:9px;border-bottom:1px solid #ccc;background:#ffdede}
+.slot.on{background:#339900}
+</style></head>
+<body><main>
+<h1>Paint schedule</h1>
+<p>Click and drag to mark the times you are free.</p>
+<h2>Your availability</h2>
+<div id="schedule"><div id="hours">${PAINT_HOURS.map((text) => `<div>${hour(text)}</div>`).join('')}</div>${PAINT_DATES.map((date, column) => paintColumn(date, column, split)).join('')}</div>
+<form action="/paint-done" method="get">
+<label for="who">Your name</label> <input id="who" name="who" value="Sam">
+<button type="submit">Save availability</button>
+</form>
+<iframe src="http://127.0.0.1:4174/frame" width="300" height="60" title="Advertisement"></iframe>
+</main>
+<script>
+let painting = null;
+function mark(cell, on) { ${mark}; }
+function paintDown(cell) {
+  painting = !(${isOn});
+  mark(cell, painting);
+}
+function paintOver(cell) {
+  if (painting === null) return;
+  mark(cell, painting);
+}
+document.addEventListener('mouseup', () => { painting = null; });
+</script></body></html>`;
+}
+
+const GRID_PAINT = paintPage();
+const GRID_PAINT_SPLIT = paintPage({ split: true });
+
+const PAINT_DONE = `<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><title>Availability saved</title></head>
+<body><main><h1>Availability saved</h1><p>Thanks, your times were saved.</p></main></body></html>`;
+
 const INDEX = `<!doctype html>
 <html lang="en"><head><meta charset="utf-8"><title>Test pages</title></head>
 <body><main><h1>AccessAssist test pages</h1>
@@ -741,6 +809,9 @@ const PAGES = new Map([
   ['/grid-native', GRID_NATIVE],
   ['/grid-custom', GRID_CUSTOM],
   ['/grid-pointer', GRID_POINTER],
+  ['/grid-paint', GRID_PAINT],
+  ['/grid-paint-split', GRID_PAINT_SPLIT],
+  ['/paint-done', PAINT_DONE],
   ['/days-legacy', DAYS_LEGACY],
   ['/keyboard', KEYBOARD],
   ['/visual', VISUAL],
@@ -900,6 +971,31 @@ function expandPage(page) {
     }
     return full;
   });
+  // Grid cells come row by row inside grids; older scenarios look for cells
+  // among targets by their labels, so each cell is also listed as a target.
+  for (const grid of page.grids ?? []) {
+    const rowText = new Map((grid.rowLabels ?? []).map((label) => [label.row, label.text]));
+    (grid.cells ?? []).forEach((row, rowIndex) => {
+      const looks = String(grid.cellStyles?.[rowIndex] ?? '').split(' ');
+      row.forEach((id, column) => {
+        if (!id) return;
+        const above = grid.columnLabels?.[column];
+        const left = rowText.get(rowIndex);
+        targets.push({
+          id,
+          kind: 'custom-control',
+          role: 'div',
+          tag: 'div',
+          name: '',
+          visible: true,
+          inViewport: true,
+          styleState: styles[looks[column]] ?? null,
+          near: { above: above ? { text: above } : null, left: left ? { text: left } : null },
+          grid: { id: grid.id, row: rowIndex, column },
+        });
+      });
+    });
+  }
   return { ...page, targets };
 }
 
@@ -1331,6 +1427,124 @@ function maskScenario(context) {
   return { text: `Saw the masked screen: ${observation.visual?.allowed !== false}` };
 }
 
+// Paint check: one grid of unnamed cells. The scripted model works only from
+// the grid's labels: rows between hourly labels are quarter hours.
+const PAINT_PLAN = [
+  { days: ['Nov 26 Thu', 'Nov 27 Fri', 'Nov 28 Sat'], from: '11:00 AM', to: '2:00 PM' },
+  { days: ['Nov 29 Sun', 'Nov 30 Mon'], from: '4:00 PM', to: '5:00 PM' },
+];
+
+function paintCells(grid) {
+  const rowOf = (text) => grid.rowLabels.find((label) => label.text === text)?.row;
+  const ids = [];
+  for (const block of PAINT_PLAN) {
+    const from = rowOf(block.from);
+    const to = rowOf(block.to);
+    if (from === undefined || to === undefined) return null;
+    for (const day of block.days) {
+      const column = grid.columnLabels.indexOf(day);
+      if (column < 0) return null;
+      for (let row = from; row < to; row += 1) ids.push({ id: grid.cells[row]?.[column], row, column });
+    }
+  }
+  return ids.every((cell) => cell.id) ? ids : null;
+}
+
+function selectedCells(page) {
+  const grid = page?.grids?.[0];
+  if (!grid) return null;
+  const on = new Set(Object.entries(page.styles ?? {})
+    .filter(([, look]) => /\bon\b/u.test(look?.className ?? ''))
+    .map(([id]) => id));
+  const picked = [];
+  grid.cellStyles.forEach((row, rowIndex) => row.split(' ').forEach((look, column) => {
+    if (on.has(look)) picked.push(`${rowIndex}:${column}`);
+  }));
+  return picked;
+}
+
+function paintScenario(context) {
+  const observation = observationOf(context);
+  if (!observation) return toolReply(context, 'observe_page', {});
+  const proposal = lastCall(context, 'propose_action');
+  const saving = /save/i.test(context.lastUser ?? '');
+  if (saving) {
+    if (proposal) {
+      const result = context.results.get(proposal.id);
+      if (!result || result.isError) return { text: 'Saving did not run.' };
+      if (!/Availability saved/u.test(observation.title ?? '')) {
+        // The page after the action may still be loading: look once more.
+        const lookedAgain = context.calls.findLastIndex((call) => call.name === 'observe_page')
+          > context.calls.findLastIndex((call) => call.name === 'propose_action');
+        if (!lookedAgain) return toolReply(context, 'observe_page', {});
+        return { text: `Not saved: the page is ${observation.title}.` };
+      }
+      const earlier = context.userTexts.length > 1 ? 'history kept' : 'history lost';
+      return { text: `Saved: ${observation.title}; ${earlier}.` };
+    }
+    const save = (observation.targets ?? []).find((target) => target.name === 'Save availability');
+    if (!save) return { text: 'I could not find the save button.' };
+    return toolReply(context, 'propose_action', {
+      summary: 'Save your availability',
+      steps: [{ type: 'click', id: save.id }],
+    });
+  }
+  const grid = observation.grids?.[0];
+  if (!grid) return { text: 'I could not find a grid.' };
+  if (proposal) {
+    const result = context.results.get(proposal.id);
+    if (!result || result.isError) return { text: `The cells were not marked: ${result?.content ?? 'no result'}` };
+    const picked = selectedCells(observation) ?? [];
+    return { text: `Marked ${picked.length} slots in a ${grid.rows} by ${grid.columns} grid.` };
+  }
+  const cells = paintCells(grid);
+  if (!cells) {
+    return { text: `I could not place the times. Columns ${grid.columnLabels.join('|')}; rows ${JSON.stringify(grid.rowLabels)}` };
+  }
+  return toolReply(context, 'propose_action', {
+    summary: 'Mark Thursday to Saturday 11 AM to 2 PM and Sunday and Monday 4 to 5 PM',
+    steps: cells.map((cell) => ({ type: 'click', id: cell.id })),
+  });
+}
+
+// Paint chain check: two drags in one batch, the second starting where the
+// first one painted. Labels and marks come only from the grid in the reading.
+function ariaSelectedCells(page) {
+  const grid = page?.grids?.[0];
+  if (!grid) return [];
+  const on = new Set(Object.entries(page.styles ?? {})
+    .filter(([, look]) => look?.ariaSelected === 'true')
+    .map(([id]) => id));
+  const picked = [];
+  grid.cellStyles.forEach((row, rowIndex) => row.split(' ').forEach((look, column) => {
+    if (on.has(look)) picked.push(`${column}:${rowIndex}`);
+  }));
+  return picked;
+}
+
+function paintChainScenario(context) {
+  const observation = observationOf(context);
+  if (!observation) return toolReply(context, 'observe_page', {});
+  const grid = observation.grids?.[0];
+  if (!grid) return { text: 'I could not find a grid.' };
+  const proposal = lastCall(context, 'propose_action');
+  if (proposal) {
+    const result = context.results.get(proposal.id);
+    if (!result || result.isError) return { text: `The drags did not finish: ${result?.content ?? 'no result'}` };
+    return { text: `Chain marked ${ariaSelectedCells(observation).join(' ')}.` };
+  }
+  const row = grid.rowLabels.find((label) => label.text === '11:00 AM')?.row;
+  if (row === undefined) return { text: `No 11:00 AM row: ${JSON.stringify(grid.rowLabels)}` };
+  const cell = (rowIndex, column) => grid.cells[rowIndex][column];
+  return toolReply(context, 'propose_action', {
+    summary: 'Mark Monday 11 to 12 and Tuesday and Wednesday 11:45',
+    steps: [
+      { type: 'drag', id: cell(row, 4), toId: cell(row + 3, 4) },
+      { type: 'drag', id: cell(row + 3, 6), toId: cell(row + 3, 4) },
+    ],
+  });
+}
+
 function markdownScenario() {
   return { text: '## Result\n- **Monday** and **Wednesday** are available.\n- Use `Start talking` to continue.' };
 }
@@ -1723,6 +1937,8 @@ function decide(context) {
   if (/action page/iu.test(current)) return actionPagesScenario(context);
   if (/visual drag/i.test(text)) return visualDragScenario(context);
   if (/mask check/i.test(text)) return maskScenario(context);
+  if (/paint chain check/iu.test(current)) return paintChainScenario(context);
+  if (/paint check/iu.test(current)) return paintScenario(context);
   if (/markdown/i.test(text)) return markdownScenario();
   if (/days of the week|weekday survey|monday and wednesday only/i.test(text)) return legacyDaysScenario(context);
   if (/pointer grid|monday and wednesday at 2|click the day cells/i.test(text)) return pointerScenario(context);

@@ -12,10 +12,9 @@ import {
   undoLastChange,
 } from './helpers.js';
 
-// Two-step confirmation for an irreversible proposal.
+// One confirmation for an irreversible proposal.
 async function run(panel) {
   await answerWhen(panel, 'Run this?', 0);
-  await answerWhen(panel, 'Run anyway?', 0);
 }
 
 test('browser text entry commits a new value and clearing does not submit', async () => {
@@ -541,6 +540,72 @@ test('anthropic: scrolling a container reveals its own content', async () => {
     await run(panel);
     await expect(page.locator('#deep')).toHaveText('Deep item selected');
     expect(await page.evaluate(() => window.scrollY)).toBe(0);
+  } finally {
+    await context.close();
+  }
+});
+
+// A schedule grid of unnamed cells (hour labels only every fourth row, one
+// element holding them all, an advertising frame) is read as one grid: the
+// model places 44 cells from the labels, the user confirms once, and saving
+// moves to a new page without losing the conversation.
+test('a batch of drags may start where an earlier drag painted, and split labels and ARIA state reach the model', async () => {
+  const { context, extensionId } = await launch();
+  try {
+    await resetMock();
+    const page = await openFixture(context, '/grid-paint-split');
+    const panel = await openPanel(context, extensionId);
+    await expect(panel.locator('#page-line')).toContainText('Paint schedule');
+
+    await sendText(panel, 'Paint chain check');
+    await answerWhen(panel, 'Allow these sources', 1);
+    await answerWhen(panel, 'Run this?', 0);
+    // "11:00" and "AM" are two text pieces; the second drag ends on a cell the first one marked.
+    const expected = ['4:4', '4:5', '4:6', '4:7', '5:7', '6:7'];
+    await expect(panel.locator('#transcript')).toContainText(`Chain marked ${expected.join(' ')}.`, { timeout: 60_000 });
+    const marked = await page.locator('.slot[aria-selected="true"]').evaluateAll((cells) => cells
+      .map((cell) => `${cell.dataset.col}:${cell.dataset.row}`).sort());
+    expect(marked).toEqual([...expected].sort());
+  } finally {
+    await context.close();
+  }
+});
+
+test('an unlabeled grid is marked in one confirmed batch and saving keeps the conversation', async () => {
+  const { context, extensionId } = await launch();
+  try {
+    await resetMock();
+    const page = await openFixture(context, '/grid-paint');
+    const panel = await openPanel(context, extensionId);
+    await expect(panel.locator('#page-line')).toContainText('Paint schedule');
+
+    await sendText(panel, 'Paint check: mark my times');
+    await answerWhen(panel, 'Allow these sources', 1);
+    await answerWhen(panel, 'Run this?', 0);
+    await expect(panel.locator('#transcript')).toContainText('Marked 44 slots in a 28 by 8 grid', { timeout: 60_000 });
+
+    const on = await page.locator('.slot.on').evaluateAll((cells) => cells
+      .map((cell) => `${cell.dataset.col}:${cell.dataset.row}`).sort());
+    const expected = [];
+    for (const column of [0, 1, 2]) for (let row = 4; row < 16; row += 1) expected.push(`${column}:${row}`);
+    for (const column of [3, 4]) for (let row = 24; row < 28; row += 1) expected.push(`${column}:${row}`);
+    expect(on).toEqual(expected.sort());
+
+    // The grid replaces 224 one-by-one targets, so the page reading stays small.
+    const observed = (await mockRequests())
+      .flatMap((request) => request.body?.messages ?? [])
+      .filter((message) => message.role === 'tool' && typeof message.content === 'string')
+      .map((message) => message.content)
+      .find((content) => content.includes('"grids"'));
+    expect(observed).toBeTruthy();
+    expect(observed.length).toBeLessThan(15_000);
+
+    await sendText(panel, 'Paint check: save');
+    // "Current site only" lasts one request, so the embedded site is asked about again.
+    await answerWhen(panel, 'Allow these sources', 1);
+    await answerWhen(panel, 'Run this?', 0);
+    await expect(panel.locator('#transcript')).toContainText('Saved: Availability saved; history kept', { timeout: 60_000 });
+    await expect(page).toHaveTitle('Availability saved');
   } finally {
     await context.close();
   }

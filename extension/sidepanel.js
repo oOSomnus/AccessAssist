@@ -78,10 +78,11 @@ const SYSTEM_PROMPT = [
   '12. Use a screenshot only when standard DOM or ARIA information is insufficient and the user separately allows it. Point coordinates are CSS viewport coordinates from that screenshot. Never infer a submitted or saved state from pixels alone.',
   '13. For ordinary text fields use set_value; it replaces the whole field and reads the page back. To pick an autocomplete suggestion, propose set_value with blur false, observe the suggestions, click one, then propose blur. Some date, time, and number fields use their native value instead of typed keys.',
   '14. Use press_key only for controls driven by keyboard events. Only the listed keys and modifier combinations are accepted; clipboard shortcuts, browser tab or address-bar commands, native context menus, file pickers, and page alert or confirm dialogs are not available. Never claim one of them happened.',
-  '15. A hover, blur, drag, screenshot point, double, right, held, or modified click is proposed alone. After a focus change or scroll, observe again before a screenshot point action; an earlier screenshot no longer maps to the page. A DOM drag uses the mouse and cannot carry files.',
+  '15. Put every step of one request in a single propose_action (up to 200 steps) so the user confirms once, and make its summary say what all steps change. A hover, blur, screenshot point or screenshot drag, double, right, held, or modified click is proposed alone; drags between two observed targets may be batched. After a focus change or scroll, observe again before a screenshot point action; an earlier screenshot no longer maps to the page. A DOM drag uses the mouse and cannot carry files.',
   '16. If a new page opens, the user may choose to continue there. After switching, observe the new page first; earlier snapshots belong to the previous page and will fail.',
   '17. When the user asks how to do something, give every step in one reply, in order. Never split instructions across turns or ask whether to continue; the user can replay the conversation.',
   '18. When the user declines or cancels a question, accept it. Do not ask again, retry, or try another way to get the same thing in this request; say briefly what was not done and stop. A declined page or screenshot stays declined for this site: set ask_again only when the user\'s newest message explicitly asks you to read or look at the page.',
+  '19. A page grid lists unnamed cells row by row: cells[row][column] is the target id, columnLabels names each column, and rowLabels gives the text drawn beside a row. With rowLabelsAt row-top-edge a label marks the line where that row starts (a row equal to rows is the bottom edge); with row it names that row. Rows between two labels split the gap evenly, so with rowsPerLabel 4 between hourly labels each row is 15 minutes. cellStyles gives each cell\'s look by styles id, including its ariaChecked, ariaSelected, ariaPressed or ariaExpanded state when the page sets one, which is how selected and unselected cells differ; confirm a cell\'s state from the page after an action.',
 ].join('\n');
 
 // Tool results for refusals. The "did not allow" wording is what the model and
@@ -152,6 +153,9 @@ const state = {
   // Bumped only when the bound page actually changes; a refresh that finds the
   // same tab and document leaves it alone, so an open question stays valid.
   pageEpoch: 0,
+  // Set when the bound tab moves to a new page with the conversation kept;
+  // cleared by the next page reading.
+  pageChanged: false,
   // Bumped by an explicit stop, so a command still waiting to start is dropped.
   requestSeq: 0,
   unreadablePage: null,
@@ -1552,9 +1556,13 @@ function pageLineForModel() {
   if (refusalFor(state.uploadRefusal, tab.origin, fingerprint, 'text')) {
     return 'Current page: not shared. The user declined to share this page; its title, address, and content are unavailable. Work only from what the user says.';
   }
+  const changed = state.pageChanged
+    ? ' This tab moved to a new page since earlier messages; target ids observed before no longer work, so observe the page again before acting.'
+    : '';
   if (!needsUpload(uploadConsentFor(state.uploadConsent, tab.origin, fingerprint), 'text')) {
-    return `Current page: ${tab.title || ''}; address: ${tab.url}`;
+    return `Current page: ${tab.title || ''}; address: ${tab.url}.${changed}`;
   }
+  if (changed) return `Current page: not shared yet.${changed} Call observe_page to ask.`;
   return 'Current page: not shared yet. Its title, address, and content are sent only after the user allows it; call observe_page to ask.';
 }
 
@@ -1837,7 +1845,7 @@ function preemptTurn() {
 // Chrome stops an idle extension worker after about 30 seconds, and the page
 // snapshots and pending proposals live in its memory. A model call or a
 // question to the user often takes longer, after which every target id was
-// refused ("Observe the page first"). Any message resets the idle timer.
+// refused as expired. Any message resets the idle timer.
 const WORKER_KEEPALIVE_MS = 20_000;
 
 async function runTurn(text) {
@@ -2186,16 +2194,52 @@ function pageForModel(value) {
   const targets = Array.isArray(value.targets)
     ? value.targets.map((target) => compactTarget(target, styleIdFor))
     : value.targets;
+  const grids = Array.isArray(value.grids) ? value.grids.map((grid, index) => compactGrid(grid, index, styleIdFor)) : [];
   return {
     title: value.title,
     url: value.url,
     viewport: value.viewport,
     sections: value.sections,
     targets,
+    ...(grids.length ? { grids } : {}),
     ...(styleIds.size ? { styles } : {}),
+    ...(value.omittedTargets ? { omittedTargets: value.omittedTargets } : {}),
     nextCursor: value.nextCursor,
     blockedFrames: value.blockedFrames,
   };
+}
+
+const GRID_ARIA_FIELDS = Object.freeze(['ariaChecked', 'ariaSelected', 'ariaExpanded', 'ariaPressed']);
+
+// A grid of unnamed cells, row by row: cells holds each cell's target id and
+// cellStyles its look and ARIA state (a styles id, or - for a gap), so state
+// is read per row.
+function compactGrid(grid, index, styleIdFor) {
+  const cells = grid.cells ?? [];
+  const out = {
+    id: `grid${index + 1}`,
+    ...(grid.region ? { region: grid.region } : {}),
+    ...(grid.caption ? { caption: grid.caption } : {}),
+    rows: cells.length,
+    columns: cells[0]?.length ?? 0,
+    columnLabels: grid.columnLabels ?? [],
+    rowLabels: grid.rowLabels ?? [],
+  };
+  if (grid.rowLabelsAt) out.rowLabelsAt = grid.rowLabelsAt;
+  if (grid.rowsPerLabel) out.rowsPerLabel = grid.rowsPerLabel;
+  if (grid.partial) out.partial = true;
+  out.cells = cells.map((row) => row.map((cell) => cell?.id ?? null));
+  out.cellStyles = cells.map((row) => row
+    .map((cell) => {
+      if (!cell) return '-';
+      const aria = Object.fromEntries(GRID_ARIA_FIELDS
+        .filter((field) => cell[field] !== null && cell[field] !== undefined)
+        .map((field) => [field, cell[field]]));
+      if (!cell.styleState && !Object.keys(aria).length) return '-';
+      return styleIdFor({ ...(cell.styleState ?? {}), ...aria });
+    })
+    .join(' '));
+  return out;
 }
 
 // Reading the page in the panel keeps the per-origin upload consent gate.
@@ -2210,6 +2254,7 @@ async function readPage(turn, cursor, { askAgain = false } = {}) {
     cursor,
   });
   if (turn.stale) return { error: 'The user interrupted; the page was not read.' };
+  state.pageChanged = false;
   return { observation };
 }
 
@@ -2257,13 +2302,24 @@ async function toolObserve(call, ok, fail, turn) {
       { type: 'image', mediaType: 'image/png', data: metadata.dataUrl.split(',')[1] },
       {
         type: 'text',
-        text: `Screenshot of the visible page, ${metadata.viewport.width} by ${metadata.viewport.height} CSS pixels at scale ${metadata.scale}, scrolled to ${metadata.scroll.x}, ${metadata.scroll.y}. Point coordinates are CSS viewport pixels, not device pixels or desktop coordinates. This page had no embedded frames or password fields when it was captured.`,
+        text: `Screenshot of the visible page, ${metadata.viewport.width} by ${metadata.viewport.height} CSS pixels at scale ${metadata.scale}, scrolled to ${metadata.scroll.x}, ${metadata.scroll.y}. Point coordinates are CSS viewport pixels, not device pixels or desktop coordinates. ${maskNote(metadata.masks)}`,
       },
     ],
   });
   const { dataUrl, ...visible } = metadata;
   await say('The screenshot was sent.');
   return ok({ ...pageForModel(seen), visual: visible });
+}
+
+// Painted-over areas are named so the model neither describes nor clicks them.
+function maskNote(masks) {
+  if (!Array.isArray(masks) || !masks.length) return 'Nothing on screen was hidden.';
+  const embedded = masks.filter((area) => area.reason === 'embedded').length;
+  const passwords = masks.length - embedded;
+  const parts = [];
+  if (embedded) parts.push(`${embedded} embedded area${embedded === 1 ? '' : 's'} from other content`);
+  if (passwords) parts.push(`${passwords} password field${passwords === 1 ? '' : 's'}`);
+  return `Solid black boxes hide ${parts.join(' and ')} (listed in visual.masks); their content is not shown and point actions inside them are refused.`;
 }
 
 async function toolReadTarget(call, ok, fail, turn) {
@@ -2399,21 +2455,9 @@ async function consentForProposal(proposed, turn) {
   });
   if (first.stale) return { cancelled: true, stale: true };
   if (!first.choice) return { cancelled: true };
-  let response = first.response;
-  if (response.action === 'risk') {
-    if (turn.stale) return { cancelled: true, stale: true };
-    await say('Please confirm again: this action may not be undoable.');
-    if (turn.stale) return { cancelled: true, stale: true };
-    const second = await consentRound(consentPorts(() => turn.stale), {
-      tabId: state.tab.tabId,
-      proposalId: proposed.proposalId,
-      question: 'Run anyway?',
-      runLabel: 'Run anyway',
-      keepLabel: 'Cancel',
-    });
-    if (second.stale) return { cancelled: true, stale: true };
-    response = second.response;
-  }
+  // One informed confirmation covers the whole proposal: the sentence above
+  // already said it may submit and may not be undoable.
+  const response = first.response;
   if (response.action === 'cancel' || !response.report) {
     if (!turn.stale) await say('Cancelled.');
     return { cancelled: true };
@@ -2849,14 +2893,33 @@ async function refreshTab({ announce = false, reason = '', windowId = null, entr
   if (changed) {
     state.pageEpoch += 1;
     cancelVoiceFor(entry);
-    resetConversation({ keepQueued: true });
-    if (previous?.tabId) await send('RESET_SESSION', { tabId: previous.tabId }).catch(() => {});
+    if (previous && previous.tabId === info.tabId) {
+      continueInTab(previous, info);
+    } else {
+      resetConversation({ keepQueued: true });
+      if (previous?.tabId) await send('RESET_SESSION', { tabId: previous.tabId }).catch(() => {});
+    }
     if (seq !== state.refreshSeq) return 'stale';
     if (announce) {
       await say(`${reason ? `${reason}. ` : ''}Current page: ${pageName}.`);
     }
   }
   return 'bound';
+}
+
+// The same tab showing a new document or address (a submitted form, a
+// followed link) is the same task going on, so the conversation and a running
+// turn carry on: an action that submitted a form still reports its result.
+// The worker drops the old document's snapshots when the new one commits, and
+// the model is told to observe again before acting. Upload consent is kept per
+// site; consent for embedded sites is kept only while the site stays the same.
+function continueInTab(previous, info) {
+  debugLog.add('conversation.continue', { from: previous.url, to: info.url });
+  state.pageChanged = true;
+  if (previous.origin !== info.origin) {
+    state.frameConsent = new Set();
+    state.frameSkipped = new Set();
+  }
 }
 
 // A rebind ends any voice session, but the Listen entry that asked for the
@@ -2924,6 +2987,7 @@ function resetConversation({ keepQueued = false } = {}) {
   state.history = [];
   state.pendingMessages = [];
   state.callsThisTurn = 0;
+  state.pageChanged = false;
   state.uploadConsent = null;
   state.uploadRefusal = null;
   state.frameConsent = new Set();

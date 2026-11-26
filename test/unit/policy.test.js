@@ -12,6 +12,7 @@ import {
   finishExecution,
   validateProposal,
 } from '../../extension/policy.js';
+import { MAX_STEPS } from '../../extension/protocol.js';
 
 const target = (overrides = {}) => ({
   disabled: false, visible: true, editable: false, checkable: false, selectable: false,
@@ -227,20 +228,33 @@ test('undoable and hover-only proposals run without asking', () => {
   assert.equal(wrongPhase.error, 'There is no pending confirmation');
 });
 
-test('irreversible actions need two separate confirmations', () => {
+test('irreversible actions run after one confirmation that cannot be reused', () => {
   let session = createSession();
   const outcome = validateProposal(proposal({ steps: [{ type: 'click', snapshotId: 's1', nodeId: 3 }] }), context());
+  assert.equal(outcome.proposal.risk, 'irreversible');
   session = { ...session, phase: PHASE.consent, proposal: outcome.proposal };
   session = armConsent(session, { choiceSetId: 'a', now: 1000 }).session;
-  const first = acceptConsent(session, { choiceSetId: 'a', optionValue: 'execute', now: 1001 });
-  assert.equal(first.action, 'risk');
-  assert.equal(first.session.phase, PHASE.risk);
-  const reused = acceptConsent(first.session, { choiceSetId: 'a', optionValue: 'execute', now: 1002 });
-  assert.match(reused.error, /expired/u);
-  const second = armConsent(first.session, { choiceSetId: 'b', now: 1003 }).session;
-  const execute = acceptConsent(second, { choiceSetId: 'b', optionValue: 'execute', now: 1004 });
+  const execute = acceptConsent(session, { choiceSetId: 'a', optionValue: 'execute', now: 1001 });
   assert.equal(execute.action, 'execute');
   assert.equal(execute.session.phase, PHASE.executing);
+  const reused = acceptConsent(execute.session, { choiceSetId: 'a', optionValue: 'execute', now: 1002 });
+  assert.match(reused.error, /no pending confirmation/u);
+  assert.equal(armConsent(execute.session, { choiceSetId: 'b', now: 1003 }).error, 'There is no pending confirmation');
+});
+
+test('one proposal carries up to MAX_STEPS steps', () => {
+  const targets = new Map(context().targets);
+  for (let nodeId = 100; nodeId < 100 + MAX_STEPS + 1; nodeId += 1) {
+    targets.set(`s1:${nodeId}`, target({ role: 'div', kind: 'custom-control', inViewport: true }));
+  }
+  const ctx = context({ targets });
+  const clicks = (count) => Array.from({ length: count }, (_, index) => ({ type: 'click', snapshotId: 's1', nodeId: 100 + index }));
+  const full = validateProposal(proposal({ steps: clicks(MAX_STEPS) }), ctx);
+  assert.equal(full.ok, true, JSON.stringify(full.errors));
+  assert.equal(full.proposal.steps.length, MAX_STEPS);
+  const over = validateProposal(proposal({ steps: clicks(MAX_STEPS + 1) }), ctx);
+  assert.equal(over.ok, false);
+  assert.match(over.errors.join(), /Too many steps/u);
 });
 
 test('consent expires, cancels and cannot be consumed twice', () => {
@@ -379,12 +393,24 @@ test('DOM drag endpoints are validated as one same-frame pair', () => {
   }), ctx);
   assert.equal(fromVisual.ok, false);
 
-  const mixed = validateProposal(proposal({
+  // Target-to-target drags re-check their endpoints when they run, so a
+  // grid can be painted with several of them in one proposal.
+  const batched = validateProposal(proposal({
     steps: [
       { type: 'drag', snapshotId: 's1', nodeId: 20, toNodeId: 21 },
+      { type: 'drag', snapshotId: 's1', nodeId: 21, toNodeId: 20 },
       { type: 'click', snapshotId: 's1', nodeId: 21 },
     ],
   }), ctx);
-  assert.equal(mixed.ok, false);
-  assert.match(mixed.errors.join(), /fresh observation/u);
+  assert.equal(batched.ok, true, JSON.stringify(batched.errors));
+
+  // A drag along screenshot points still stands alone.
+  const pointDrag = validateProposal(proposal({
+    steps: [
+      { type: 'drag', snapshotId: 's1', nodeId: 24, points: [{ x: 1, y: 1 }, { x: 50, y: 50 }] },
+      { type: 'click', snapshotId: 's1', nodeId: 21 },
+    ],
+  }), ctx);
+  assert.equal(pointDrag.ok, false);
+  assert.match(pointDrag.errors.join(), /fresh observation/u);
 });

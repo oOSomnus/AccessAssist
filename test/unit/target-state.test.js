@@ -4,6 +4,7 @@ import {
   CLICK_FIELDS,
   CONFLICT_CLICK_FIELDS,
   KEY_FIELDS,
+  carryBatchChanges,
   changedSince,
   conflictFor,
   differsFromApproved,
@@ -69,6 +70,35 @@ test('a target is compared with the approved state field by field', () => {
     'Page state changed; observe the page again',
   );
   assert.equal(differsFromApproved(step, live, undefined), null);
+});
+
+test('a batch accepts changes its own step made and keeps rejecting drift', () => {
+  const step = { type: 'click', snapshotId: 's1', nodeId: 3 };
+  const read = { ...live, exists: true };
+  const painted = { ...read, styleState: { ...live.styleState, backgroundColor: 'rgb(0, 128, 0)' } };
+  const moved = { ...read, rect: { ...live.rect, y: live.rect.y - 200 } };
+  const expected = new Map([
+    ['s1:3', projectTargetState(live)],
+    ['s1:4', projectTargetState(live)],
+    ['s1:5', projectTargetState(live)],
+  ]);
+  // Before the step: 3 and 4 match what was approved, 5 had already been recolored.
+  const before = new Map([['s1:3', read], ['s1:4', read], ['s1:5', painted]]);
+  // The step painted 3 and scrolled 4; 5 is unchanged since but stays drifted.
+  const after = new Map([['s1:3', painted], ['s1:4', moved], ['s1:5', painted]]);
+  carryBatchChanges(expected, before, after);
+  assert.equal(differsFromApproved(step, painted, expected.get('s1:3')), null);
+  assert.equal(differsFromApproved(step, moved, expected.get('s1:4')), null);
+  assert.equal(
+    differsFromApproved(step, painted, expected.get('s1:5')),
+    'Page state changed (styleState); observe the page again',
+  );
+  // A target that vanished or could not be read keeps the approved state.
+  const kept = new Map([['s1:3', projectTargetState(live)]]);
+  carryBatchChanges(kept, new Map([['s1:3', read]]), new Map([['s1:3', { exists: false }]]));
+  assert.deepEqual(kept.get('s1:3'), projectTargetState(live));
+  carryBatchChanges(kept, new Map([['s1:3', read]]), new Map());
+  assert.deepEqual(kept.get('s1:3'), projectTargetState(live));
 });
 
 test('a projected target normalizes rect and style state', () => {
