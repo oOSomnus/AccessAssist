@@ -308,6 +308,9 @@
         if (!rects.length) continue;
         if (rects.length === 1) {
           const line = lineBox(rects[0], text.slice(0, MAX_NEAR_CHARS));
+          // Whether a neighbouring piece of the same line is a separate word.
+          line.spaceBefore = /^\s/u.test(node.data);
+          line.spaceAfter = /\s$/u.test(node.data);
           if (boxesMeet(line, box)) lines.push(line);
           continue;
         }
@@ -392,12 +395,22 @@
     return centers;
   }
 
-  function nearestIndex(centers, value) {
-    let best = 0;
-    for (let index = 1; index < centers.length; index += 1) {
-      if (Math.abs(centers[index] - value) < Math.abs(centers[best] - value)) best = index;
-    }
-    return best;
+  // Every center of every run, in order, so one search places a value in its
+  // run: the nearest center overall is also the nearest within its own run.
+  function runLocator(runs) {
+    const flat = runs.flatMap((run, runIndex) => run.map((center, index) => ({ center, runIndex, index })));
+    return (value) => {
+      let low = 0;
+      let high = flat.length - 1;
+      while (low < high) {
+        const middle = (low + high) >> 1;
+        if (flat[middle].center < value) low = middle + 1;
+        else high = middle;
+      }
+      // Ties go to the lower center, as a scan from the start would.
+      if (low > 0 && Math.abs(flat[low - 1].center - value) <= Math.abs(flat[low].center - value)) low -= 1;
+      return flat[low];
+    };
   }
 
   // Runs of evenly spaced centers; a gap much wider than a cell starts a new run.
@@ -441,34 +454,49 @@
       });
       const xs = clusterAxis(group.members.map((target) => center(target).x));
       const ys = clusterAxis(group.members.map((target) => center(target).y));
-      for (const columnRun of splitRuns(xs, group.width)) {
-        for (const rowRun of splitRuns(ys, group.height)) {
-          const cells = rowRun.map(() => columnRun.map(() => null));
-          let count = 0;
-          for (const target of group.members) {
-            const point = center(target);
-            const column = nearestIndex(columnRun, point.x);
-            const row = nearestIndex(rowRun, point.y);
-            if (Math.abs(columnRun[column] - point.x) > GRID_AXIS_TOLERANCE * 2) continue;
-            if (Math.abs(rowRun[row] - point.y) > GRID_AXIS_TOLERANCE * 2) continue;
-            if (cells[row][column] !== null) continue;
-            cells[row][column] = target;
-            count += 1;
-          }
-          const size = rowRun.length * columnRun.length;
-          if (count < 4 || count / size < GRID_MIN_FILL) continue;
-          // A short single row or column (seven weekday boxes) reads fine with
-          // per-control labels; a long one is one day's list of time slots.
-          const lattice = rowRun.length >= 2 && columnRun.length >= 2;
-          if (!lattice && Math.max(rowRun.length, columnRun.length) < 8) continue;
-          grids.push({
-            cells,
-            columns: columnRun,
-            rows: rowRun,
-            cellWidth: group.width,
-            cellHeight: group.height,
-          });
+      const columnRuns = splitRuns(xs, group.width);
+      const rowRuns = splitRuns(ys, group.height);
+      const columnAt = runLocator(columnRuns);
+      const rowAt = runLocator(rowRuns);
+      // Each member is placed once; only run pairs that hold a member are
+      // checked, so a sparse spread of runs costs nothing extra.
+      const pairs = new Map();
+      for (const target of group.members) {
+        const point = center(target);
+        const column = columnAt(point.x);
+        const row = rowAt(point.y);
+        if (Math.abs(column.center - point.x) > GRID_AXIS_TOLERANCE * 2) continue;
+        if (Math.abs(row.center - point.y) > GRID_AXIS_TOLERANCE * 2) continue;
+        const key = `${column.runIndex}:${row.runIndex}`;
+        let pair = pairs.get(key);
+        if (!pair) {
+          pair = { columnRun: columnRuns[column.runIndex], rowRun: rowRuns[row.runIndex], placed: [] };
+          pairs.set(key, pair);
         }
+        pair.placed.push({ target, row: row.index, column: column.index });
+      }
+      for (const { columnRun, rowRun, placed } of pairs.values()) {
+        const size = rowRun.length * columnRun.length;
+        if (placed.length < 4 || placed.length / size < GRID_MIN_FILL) continue;
+        const cells = rowRun.map(() => columnRun.map(() => null));
+        let count = 0;
+        for (const { target, row, column } of placed) {
+          if (cells[row][column] !== null) continue;
+          cells[row][column] = target;
+          count += 1;
+        }
+        if (count < 4 || count / size < GRID_MIN_FILL) continue;
+        // A short single row or column (seven weekday boxes) reads fine with
+        // per-control labels; a long one is one day's list of time slots.
+        const lattice = rowRun.length >= 2 && columnRun.length >= 2;
+        if (!lattice && Math.max(rowRun.length, columnRun.length) < 8) continue;
+        grids.push({
+          cells,
+          columns: columnRun,
+          rows: rowRun,
+          cellWidth: group.width,
+          cellHeight: group.height,
+        });
       }
     }
     grids.sort((a, b) => (a.rows[0] - b.rows[0]) || (a.columns[0] - b.columns[0]));
@@ -515,15 +543,41 @@
     return { labels, labelTop };
   }
 
+  // Pieces of one drawn line ("11:00" and a styled "AM") joined left to right.
+  // Pieces further apart than about a word gap stay separate labels.
+  function joinLineFragments(lines) {
+    const joined = [];
+    for (const line of [...lines].sort((a, b) => a.left - b.left)) {
+      const gapLimit = Math.max(6, line.height * 0.6);
+      const host = joined.find((other) => Math.abs(other.cy - line.cy) <= Math.max(2, Math.min(other.height, line.height) / 2)
+        && line.left - other.right >= -2 && line.left - other.right <= gapLimit);
+      if (!host) {
+        joined.push(line);
+        continue;
+      }
+      const left = Math.min(host.left, line.left);
+      const right = Math.max(host.right, line.right);
+      const top = Math.min(host.top, line.top);
+      const bottom = Math.max(host.bottom, line.bottom);
+      const spaced = host.spaceAfter || line.spaceBefore || line.left - host.right > 1;
+      const text = `${host.text}${spaced ? ' ' : ''}${line.text}`.slice(0, MAX_NEAR_CHARS);
+      const merged = lineBox({ left, right, top, bottom, width: right - left, height: bottom - top }, text);
+      merged.spaceBefore = host.spaceBefore;
+      merged.spaceAfter = line.spaceAfter;
+      joined[joined.indexOf(host)] = merged;
+    }
+    return joined;
+  }
+
   // Row labels: text drawn left of the grid. A label either sits inside its
   // row or on the line where its row starts; whichever the labels do as a
   // group decides how each one is assigned.
   function rowLabelsOf(grid, bounds, lines) {
     const pitch = pitchOf(grid.rows, grid.cellHeight);
-    const candidates = lines.filter((line) => line.right <= bounds.left + 2
+    const candidates = joinLineFragments(lines.filter((line) => line.right <= bounds.left + 2
       && line.right >= bounds.left - 220
       && line.cy >= bounds.top - pitch && line.cy <= bounds.bottom + pitch
-      && line.height <= pitch * 4 + 16);
+      && line.height <= pitch * 4 + 16));
     if (!candidates.length) return { labels: [], at: null, perLabel: null };
     const offsets = candidates.map((line) => (line.cy - bounds.top) / pitch);
     const drift = offsets.map((offset) => Math.abs(offset - Math.round(offset))).sort((a, b) => a - b);
@@ -1429,6 +1483,11 @@
         case 'scroll': return scrollPage(payload);
         case 'scrollTo': return scrollToTarget(payload);
         case 'state': return stateFor(payload);
+        case 'states': return {
+          states: (Array.isArray(payload.items) ? payload.items : []).slice(0, 400).map((item) => stateFor({
+            snapshotId: payload.snapshotId, nodeId: item?.nodeId, fullValue: item?.fullValue === true,
+          })),
+        };
         case 'hitTest': return hitTest(payload);
         case 'sensitive': return { rects: sensitiveRects(), docToken };
         case 'masks': return interactionMasks();

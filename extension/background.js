@@ -25,6 +25,7 @@ import {
   CLICK_FIELDS,
   CONFLICT_CLICK_FIELDS,
   KEY_FIELDS,
+  carryBatchChanges,
   changedSince,
   conflictFor,
   differsFromApproved,
@@ -34,6 +35,7 @@ import {
   roundedRect,
 } from './target-state.js';
 
+const ARIA_STATE_FIELDS = Object.freeze(['ariaChecked', 'ariaSelected', 'ariaExpanded', 'ariaPressed']);
 const PANEL_URL = chrome.runtime.getURL('sidepanel.html');
 const LAUNCHER_ID = 'accessassist-launcher-host';
 const LAUNCHER_DEFAULT_POSITION = Object.freeze({ x: 1, y: 1 });
@@ -950,7 +952,12 @@ async function observePage(tab, allowedOrigins, { visual = false, expectedDocume
         partial: grid.partial || null,
         cells: grid.cells.map((row) => row.map((nodeId) => {
           const cell = nodeId === null ? null : cellTargets.get(nodeId);
-          return cell ? { id: cell.id, styleState: cell.styleState ?? null } : null;
+          if (!cell) return null;
+          // A cell's ARIA state can differ where its colours do not.
+          const aria = Object.fromEntries(ARIA_STATE_FIELDS
+            .filter((field) => cell[field] !== null && cell[field] !== undefined)
+            .map((field) => [field, cell[field]]));
+          return { id: cell.id, styleState: cell.styleState ?? null, ...aria };
         })),
       }).filter(([, value]) => value !== null && value !== undefined)));
     }
@@ -1315,6 +1322,37 @@ async function runProposal(tab, message) {
   return executeAccepted(tab, message.proposalId, outcome.session);
 }
 
+// States of the targets that steps after `index` still check, read in one call
+// per observation. A target that cannot be read is left out, so its own step
+// keeps the approved state and decides for itself.
+async function laterTargetStates(tab, steps, index) {
+  const groups = new Map();
+  for (const step of steps.slice(index + 1)) {
+    const group = groups.get(step.snapshotId) ?? new Map();
+    groups.set(step.snapshotId, group);
+    // Same value width proposeAction recorded for each key, last write winning.
+    group.set(step.nodeId, step.type === 'set_value');
+    if (step.toNodeId !== undefined) group.set(step.toNodeId, false);
+  }
+  const states = new Map();
+  for (const [snapshotId, group] of groups) {
+    const entry = registry.get(snapshotId);
+    if (!entry || entry.tabId !== tab.id) continue;
+    const items = [...group].map(([nodeId, fullValue]) => ({ nodeId, fullValue }));
+    let result;
+    try {
+      result = await agentCall(tab.id, entry, { op: 'states', snapshotId, items });
+    } catch {
+      continue;
+    }
+    items.forEach((item, position) => {
+      const state = result?.states?.[position];
+      if (state) states.set(`${snapshotId}:${item.nodeId}`, state);
+    });
+  }
+  return states;
+}
+
 async function executeProposal(tab, proposal) {
   if (executions.stopped(tab.id)) {
     return {
@@ -1348,6 +1386,9 @@ async function executeProposal(tab, proposal) {
   let stepNumber = 0;
   // Every page opened by any step of this action, in the order seen.
   const openedTabIds = new Set();
+  // Approved state per target, moved forward only by this batch's own steps.
+  const expectations = new Map(proposal.expected ?? []);
+  let laterBefore = null;
   try {
     cdp = await debuggerSession(tab.id);
     await setLauncherHidden(cdp, true);
@@ -1370,7 +1411,7 @@ async function executeProposal(tab, proposal) {
         failedStep = `Step ${index + 1}: target no longer exists`;
         break;
       }
-      const expected = proposal.expected?.get(`${step.snapshotId}:${step.nodeId}`);
+      const expected = expectations.get(`${step.snapshotId}:${step.nodeId}`);
       const stale = differsFromApproved(step, stateResult, expected);
       if (stale) {
         failedStep = `Step ${index + 1}: ${stale}`;
@@ -1378,7 +1419,7 @@ async function executeProposal(tab, proposal) {
       }
       const endExpected = step.toNodeId === undefined
         ? null
-        : proposal.expected?.get(`${step.snapshotId}:${step.toNodeId}`);
+        : expectations.get(`${step.snapshotId}:${step.toNodeId}`);
       if (endExpected) {
         const endState = await agentCall(tab.id, entry, {
           op: 'state', snapshotId: step.snapshotId, nodeId: step.toNodeId,
@@ -1389,6 +1430,8 @@ async function executeProposal(tab, proposal) {
           break;
         }
       }
+      const lastStep = index === proposal.steps.length - 1;
+      if (!lastStep && !laterBefore) laterBefore = await laterTargetStates(tab, proposal.steps, index);
       const openable = OPENABLE_STEPS.has(step.type);
       const openedBefore = openedTabIds.size;
       if (openable) {
@@ -1442,6 +1485,11 @@ async function executeProposal(tab, proposal) {
         }
       }
       await sleep(SETTLE_MS);
+      if (!lastStep) {
+        const laterAfter = await laterTargetStates(tab, proposal.steps, index);
+        carryBatchChanges(expectations, laterBefore, laterAfter);
+        laterBefore = laterAfter;
+      }
     }
   } catch (error) {
     const message = error?.message ?? 'Execution failed';

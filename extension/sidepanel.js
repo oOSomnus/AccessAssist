@@ -82,7 +82,7 @@ const SYSTEM_PROMPT = [
   '16. If a new page opens, the user may choose to continue there. After switching, observe the new page first; earlier snapshots belong to the previous page and will fail.',
   '17. When the user asks how to do something, give every step in one reply, in order. Never split instructions across turns or ask whether to continue; the user can replay the conversation.',
   '18. When the user declines or cancels a question, accept it. Do not ask again, retry, or try another way to get the same thing in this request; say briefly what was not done and stop. A declined page or screenshot stays declined for this site: set ask_again only when the user\'s newest message explicitly asks you to read or look at the page.',
-  '19. A page grid lists unnamed cells row by row: cells[row][column] is the target id, columnLabels names each column, and rowLabels gives the text drawn beside a row. With rowLabelsAt row-top-edge a label marks the line where that row starts (a row equal to rows is the bottom edge); with row it names that row. Rows between two labels split the gap evenly, so with rowsPerLabel 4 between hourly labels each row is 15 minutes. cellStyles gives each cell\'s look by styles id, which is how selected and unselected cells differ; confirm a cell\'s state from the page after an action.',
+  '19. A page grid lists unnamed cells row by row: cells[row][column] is the target id, columnLabels names each column, and rowLabels gives the text drawn beside a row. With rowLabelsAt row-top-edge a label marks the line where that row starts (a row equal to rows is the bottom edge); with row it names that row. Rows between two labels split the gap evenly, so with rowsPerLabel 4 between hourly labels each row is 15 minutes. cellStyles gives each cell\'s look by styles id, including its ariaChecked, ariaSelected, ariaPressed or ariaExpanded state when the page sets one, which is how selected and unselected cells differ; confirm a cell\'s state from the page after an action.',
 ].join('\n');
 
 // Tool results for refusals. The "did not allow" wording is what the model and
@@ -2209,8 +2209,11 @@ function pageForModel(value) {
   };
 }
 
+const GRID_ARIA_FIELDS = Object.freeze(['ariaChecked', 'ariaSelected', 'ariaExpanded', 'ariaPressed']);
+
 // A grid of unnamed cells, row by row: cells holds each cell's target id and
-// cellStyles its look (a styles id, or - for a gap), so state is read per row.
+// cellStyles its look and ARIA state (a styles id, or - for a gap), so state
+// is read per row.
 function compactGrid(grid, index, styleIdFor) {
   const cells = grid.cells ?? [];
   const out = {
@@ -2227,7 +2230,14 @@ function compactGrid(grid, index, styleIdFor) {
   if (grid.partial) out.partial = true;
   out.cells = cells.map((row) => row.map((cell) => cell?.id ?? null));
   out.cellStyles = cells.map((row) => row
-    .map((cell) => (cell?.styleState ? styleIdFor(cell.styleState) : '-'))
+    .map((cell) => {
+      if (!cell) return '-';
+      const aria = Object.fromEntries(GRID_ARIA_FIELDS
+        .filter((field) => cell[field] !== null && cell[field] !== undefined)
+        .map((field) => [field, cell[field]]));
+      if (!cell.styleState && !Object.keys(aria).length) return '-';
+      return styleIdFor({ ...(cell.styleState ?? {}), ...aria });
+    })
     .join(' '));
   return out;
 }

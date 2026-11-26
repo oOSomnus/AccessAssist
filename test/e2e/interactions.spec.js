@@ -549,6 +549,28 @@ test('anthropic: scrolling a container reveals its own content', async () => {
 // element holding them all, an advertising frame) is read as one grid: the
 // model places 44 cells from the labels, the user confirms once, and saving
 // moves to a new page without losing the conversation.
+test('a batch of drags may start where an earlier drag painted, and split labels and ARIA state reach the model', async () => {
+  const { context, extensionId } = await launch();
+  try {
+    await resetMock();
+    const page = await openFixture(context, '/grid-paint-split');
+    const panel = await openPanel(context, extensionId);
+    await expect(panel.locator('#page-line')).toContainText('Paint schedule');
+
+    await sendText(panel, 'Paint chain check');
+    await answerWhen(panel, 'Allow these sources', 1);
+    await answerWhen(panel, 'Run this?', 0);
+    // "11:00" and "AM" are two text pieces; the second drag ends on a cell the first one marked.
+    const expected = ['4:4', '4:5', '4:6', '4:7', '5:7', '6:7'];
+    await expect(panel.locator('#transcript')).toContainText(`Chain marked ${expected.join(' ')}.`, { timeout: 60_000 });
+    const marked = await page.locator('.slot[aria-selected="true"]').evaluateAll((cells) => cells
+      .map((cell) => `${cell.dataset.col}:${cell.dataset.row}`).sort());
+    expect(marked).toEqual([...expected].sort());
+  } finally {
+    await context.close();
+  }
+});
+
 test('an unlabeled grid is marked in one confirmed batch and saving keeps the conversation', async () => {
   const { context, extensionId } = await launch();
   try {
