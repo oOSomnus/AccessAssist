@@ -1,12 +1,14 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import {
+  ANTHROPIC_MAX_OUTPUT_TOKENS,
   DEFAULT_CONFIG,
   buildHeaders,
   endpointFor,
   isGoConfig,
   normalizeConfig,
   plainText,
+  reportedOutputCap,
   requestTurn,
 } from '../../extension/ai.js';
 
@@ -508,4 +510,66 @@ test('regression: a refusal response is denied before tool parsing', async () =>
     }),
     (error) => error.code === 'empty',
   );
+});
+
+test('no output cap of our own: OpenAI omits max_tokens, Anthropic sends the model maximum', async () => {
+  const sent = [];
+  const fetchImpl = async (url, init) => {
+    const body = JSON.parse(init.body);
+    sent.push(body);
+    return json(url.endsWith('/messages')
+      ? { content: [{ type: 'text', text: 'ok' }], stop_reason: 'end_turn', usage: { opencode: { billing_source: 'go' } } }
+      : { choices: [{ message: { content: 'ok' } }], usage: { opencode: { billing_source: 'go' } } });
+  };
+  const base = { apiKey: 'k', sessionId: 's', system: 'sys', messages: [{ role: 'user', content: 'hi' }], fetchImpl };
+  await requestTurn({ ...base, config: { ...goOpenAI, effort: 'max' } });
+  await requestTurn({ ...base, config: goAnthropic });
+  assert.equal('max_tokens' in sent[0], false);
+  assert.equal(sent[0].reasoning_effort, 'max');
+  assert.equal(sent[1].max_tokens, ANTHROPIC_MAX_OUTPUT_TOKENS);
+  assert.equal(ANTHROPIC_MAX_OUTPUT_TOKENS, 128_000);
+});
+
+test('an Anthropic model with a smaller output cap is retried once at its reported cap', async () => {
+  const config = { ...goAnthropic, baseUrl: 'https://example.test/anthropic/v1', model: 'older-model' };
+  const sent = [];
+  const fetchImpl = async (url, init) => {
+    const body = JSON.parse(init.body);
+    sent.push(body.max_tokens);
+    if (body.max_tokens > 64000) {
+      return json({
+        type: 'error',
+        error: { type: 'invalid_request_error', message: `max_tokens: ${body.max_tokens} > 64000, which is the maximum allowed number of output tokens for older-model` },
+      }, 400);
+    }
+    return json({ content: [{ type: 'text', text: 'ok' }], stop_reason: 'end_turn' });
+  };
+  const base = { config, apiKey: 'k', sessionId: 's', system: 'sys', messages: [{ role: 'user', content: 'hi' }], fetchImpl };
+  assert.equal((await requestTurn(base)).text, 'ok');
+  assert.deepEqual(sent, [128_000, 64_000]);
+  // The reported cap is remembered: the next request goes straight to it.
+  assert.equal((await requestTurn(base)).text, 'ok');
+  assert.deepEqual(sent, [128_000, 64_000, 64_000]);
+
+  // An unrelated 400 is not retried.
+  let attempts = 0;
+  await assert.rejects(
+    requestTurn({
+      ...base,
+      config: { ...config, model: 'other-model' },
+      fetchImpl: async () => {
+        attempts += 1;
+        return json({ type: 'error', error: { type: 'invalid_request_error', message: 'messages: bad role' } }, 400);
+      },
+    }),
+    (error) => error.code === 'bad_request',
+  );
+  assert.equal(attempts, 1);
+});
+
+test('reportedOutputCap reads only an output-cap complaint', () => {
+  assert.equal(reportedOutputCap('max_tokens: 128000 > 64000, which is the maximum allowed number of output tokens for x'), 64000);
+  assert.equal(reportedOutputCap('{"message":"max_tokens: 128000 > 32000, which is the maximum"}'), 32000);
+  assert.equal(reportedOutputCap('messages: bad role'), null);
+  assert.equal(reportedOutputCap(undefined), null);
 });

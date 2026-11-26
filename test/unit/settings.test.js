@@ -7,8 +7,11 @@ import {
   grantUpload,
   keyBinding,
   keyForBinding,
+  liftRefusal,
   needsUpload,
   normalizeScreenReader,
+  refuseUpload,
+  refusalFor,
   uploadConsentFor,
 } from '../../extension/settings.js';
 
@@ -46,6 +49,42 @@ test('upload consent is per page origin and API configuration', () => {
   assert.equal(needsUpload(consent, 'image'), false);
   const changedFingerprint = configFingerprint({ ...config, model: 'different' });
   assert.equal(uploadConsentFor(consent, 'https://example.test', changedFingerprint), null);
+});
+
+test('an upload refusal is per page origin, API configuration and part', () => {
+  const fingerprint = configFingerprint(config);
+  assert.equal(refusalFor(null, 'https://example.test', fingerprint, 'text'), null);
+  const marker = { turn: 1 };
+  let refusal = refuseUpload(null, 'https://example.test', fingerprint, 'text', marker);
+  assert.equal(refusalFor(refusal, 'https://example.test', fingerprint, 'text'), marker);
+  assert.equal(refusalFor(refusal, 'https://example.test', fingerprint, 'image'), null);
+  assert.equal(refusalFor(refusal, 'https://other.test', fingerprint, 'text'), null);
+  assert.equal(refusalFor(refusal, 'https://example.test', configFingerprint({ ...config, model: 'x' }), 'text'), null);
+  refusal = refuseUpload(refusal, 'https://example.test', fingerprint, 'image', marker);
+  assert.equal(refusalFor(refusal, 'https://example.test', fingerprint, 'image'), marker);
+  refusal = liftRefusal(refusal, 'https://example.test', fingerprint, 'text');
+  assert.equal(refusalFor(refusal, 'https://example.test', fingerprint, 'text'), null);
+  assert.equal(refusalFor(refusal, 'https://example.test', fingerprint, 'image'), marker);
+  // A refusal for another site is not touched by lifting this one.
+  assert.equal(liftRefusal(refusal, 'https://other.test', fingerprint, 'image'), refusal);
+});
+
+test('a refusal survives declining another site: A, then B, then back to A', () => {
+  const fingerprint = configFingerprint(config);
+  const first = { turn: 1 };
+  const second = { turn: 2 };
+  let refusals = refuseUpload(null, 'https://a.test', fingerprint, 'text', first);
+  refusals = refuseUpload(refusals, 'https://b.test', fingerprint, 'text', second);
+  assert.equal(refusalFor(refusals, 'https://a.test', fingerprint, 'text'), first);
+  assert.equal(refusalFor(refusals, 'https://b.test', fingerprint, 'text'), second);
+  // A refusal for another receiver is kept alongside, not swapped in.
+  const otherFingerprint = configFingerprint({ ...config, model: 'x' });
+  refusals = refuseUpload(refusals, 'https://a.test', otherFingerprint, 'text', second);
+  assert.equal(refusalFor(refusals, 'https://a.test', fingerprint, 'text'), first);
+  // Lifting one site leaves the other declined.
+  refusals = liftRefusal(refusals, 'https://b.test', fingerprint, 'text');
+  assert.equal(refusalFor(refusals, 'https://b.test', fingerprint, 'text'), null);
+  assert.equal(refusalFor(refusals, 'https://a.test', fingerprint, 'text'), first);
 });
 
 test('the screen-reader preference accepts only known readers', () => {

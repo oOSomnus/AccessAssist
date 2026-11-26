@@ -2,7 +2,7 @@ import { normalizeConfig, requestTurn, REQUEST_TIMEOUT_MS } from './ai.js';
 import { consentRound } from './consent-round.js';
 import { createDebugLog } from './debug-log.js';
 import { closeChoiceSet, createChoiceSet, formatChoices, parseChoiceNumber, resolveChoice } from './protocol.js';
-import { keyBinding, keyForBinding, configFingerprint, configOrigin, DEFAULT_API_CONFIG, grantUpload, needsUpload, normalizeScreenReader, uploadConsentFor } from './settings.js';
+import { keyBinding, keyForBinding, configFingerprint, configOrigin, DEFAULT_API_CONFIG, grantUpload, liftRefusal, needsUpload, normalizeScreenReader, refusalFor, refuseUpload, uploadConsentFor } from './settings.js';
 import { Speech, spokenSites, voiceSetupView } from './speech.js';
 import { detectPlatform, guideFor, GUIDES, readerChoices, resolveReader } from './screen-reader-guide.js';
 import { createTurns } from './turn.js';
@@ -81,7 +81,14 @@ const SYSTEM_PROMPT = [
   '15. A hover, blur, drag, screenshot point, double, right, held, or modified click is proposed alone. After a focus change or scroll, observe again before a screenshot point action; an earlier screenshot no longer maps to the page. A DOM drag uses the mouse and cannot carry files.',
   '16. If a new page opens, the user may choose to continue there. After switching, observe the new page first; earlier snapshots belong to the previous page and will fail.',
   '17. When the user asks how to do something, give every step in one reply, in order. Never split instructions across turns or ask whether to continue; the user can replay the conversation.',
+  '18. When the user declines or cancels a question, accept it. Do not ask again, retry, or try another way to get the same thing in this request; say briefly what was not done and stop. A declined page or screenshot stays declined for this site: set ask_again only when the user\'s newest message explicitly asks you to read or look at the page.',
 ].join('\n');
+
+// Tool results for refusals. The "did not allow" wording is what the model and
+// the scripted test model both key on; the rest tells the model to stop asking.
+const TEXT_REFUSED = 'The user did not allow page text upload: they declined to share this page with the AI service. Do not ask for it again or try another tool to read it. Answer only from what the user said, or say you cannot see the page. Only if the user explicitly asks in a new message to read or look at this page, call the tool again with ask_again true.';
+const IMAGE_REFUSED = 'The user did not allow screenshot upload: they declined to share pixels of this page with the AI service. Do not ask again in this request.';
+const DECLINED_EARLIER = 'Not asked: the user declined a question earlier in this request. Do not ask again or try another way; say briefly what was not done and stop.';
 
 const state = {
   tab: null,
@@ -105,8 +112,12 @@ const state = {
   busy: false,
   callsThisTurn: 0,
   uploadConsent: null,
+  uploadRefusal: null,
   frameConsent: new Set(),
   frameSkipped: new Set(),
+  // Embedded sites the user explicitly declined, origin to { turn }. Unlike
+  // frameSkipped, which lasts one request, these last the conversation.
+  frameRefused: new Map(),
   visionLimited: false,
   apiSessionId: uid(),
   listening: null,
@@ -129,6 +140,13 @@ const state = {
   actionContext: null,
   confirming: false,
   refreshSeq: 0,
+  // Bumped only when the bound page actually changes; a refresh that finds the
+  // same tab and document leaves it alone, so an open question stays valid.
+  pageEpoch: 0,
+  // Bumped by an explicit stop, so a command still waiting to start is dropped.
+  requestSeq: 0,
+  unreadablePage: null,
+  startFocused: false,
 };
 
 // Session-scoped: cleared when the panel closes or reloads, kept across
@@ -269,8 +287,9 @@ function reveal(element) {
 }
 
 async function send(type, payload = {}) {
-  // GET_COMMANDS fires on every focus; logging it would bury everything else.
-  const log = type !== 'GET_COMMANDS';
+  // GET_COMMANDS fires on every focus and KEEP_ALIVE every few seconds of a
+  // turn; logging them would bury everything else.
+  const log = type !== 'GET_COMMANDS' && type !== 'KEEP_ALIVE';
   if (log) debugLog.add('worker.request', { type, payload });
   const started = performance.now();
   let response;
@@ -281,7 +300,11 @@ async function send(type, payload = {}) {
     throw error;
   }
   if (log) debugLog.add('worker.response', { type, elapsedMs: Math.round(performance.now() - started), response });
-  if (response?.error) throw new Error(response.error);
+  if (response?.error) {
+    const error = new Error(response.error);
+    error.response = response;
+    throw error;
+  }
   return response ?? {};
 }
 
@@ -303,6 +326,8 @@ function consumeListen() {
   state.listenRequest = null;
   state.entrySeq += 1;
   if ($('mode-line').textContent.startsWith('Listening')) updateModeLine();
+  // A cold listen shortcut kept the panel hidden for this listen.
+  revealPanel('listen-end', { focus: true });
 }
 
 let sayToken = 0;
@@ -942,7 +967,19 @@ function choiceKeyboardHint() {
     : detectPlatform() === 'voiceover'
       ? 'Press Command plus Option plus Up or Down Arrow to cycle Chrome regions'
       : 'Use your browser region navigation to reach the assistant';
-  return `${base} once the assistant has keyboard focus. ${cycle}, then Tab into the assistant. Press Escape to cancel.`;
+  return `${base}; this works from the page too. To cancel, ${cycle.charAt(0).toLowerCase()}${cycle.slice(1)}, Tab into the assistant, and press Escape.`;
+}
+
+// Lets the page in front of the user answer with the same keys; see the
+// launcher. Null withdraws them.
+function publishChoiceKeys(set) {
+  if (SETUP_PAGE || !Number.isInteger(state.windowId)) return;
+  const numbers = set ? set.options.map((option) => String(option.number)) : [];
+  void send('SET_CHOICE_KEYS', {
+    windowId: state.windowId,
+    choiceId: set ? String(set.id) : null,
+    numbers,
+  }).catch(() => {});
 }
 
 // Programmatic focus is safe only when the user is not editing a field and no
@@ -1005,6 +1042,7 @@ function showChoice(set, sourceSites = []) {
     container.append(button);
   }
   reveal($('ask'));
+  publishChoiceKeys(set);
 }
 
 function choiceTriggerFor(element) {
@@ -1038,6 +1076,7 @@ function hideChoice() {
   sites.replaceChildren();
   sites.hidden = true;
   $('ask-options').replaceChildren();
+  publishChoiceKeys(null);
 }
 
 // Number keys act within the nearest data-number-scope group. Without one,
@@ -1079,7 +1118,16 @@ function defaultNumberScope(key) {
   if (numberTarget('voice', key)) return 'voice';
   if (choiceNumberAvailable(key)) return 'choice';
   if (numberTarget('composer', key)) return 'composer';
+  if (numberTarget('settings', key)) return 'settings';
   return null;
+}
+
+// What a number does in one group: answer the open question, or press a
+// control. Null when that group has nothing on the number.
+function numberAction(scope, key) {
+  if (scope === 'choice') return choiceNumberAvailable(key) ? { choice: true } : null;
+  const element = scope ? numberTarget(scope, key) : null;
+  return element ? { element } : null;
 }
 
 // Never bind any of these on their own. Control by itself silences speech in
@@ -1102,10 +1150,10 @@ function handleNumberShortcut(event) {
   if (!match) return;
   const key = match[1];
   const target = event.target;
-  // Native selects keep their own type-ahead.
-  if (target instanceof HTMLElement && target.matches('select')) return;
-  // A text field has no own number group, so an open question stays answerable
-  // from a settings field; other focused groups keep their own numbers.
+  // A select's type-ahead never sees Control+Shift digits, so the shortcut
+  // works there too. A text field has no own number group, so an open question
+  // stays answerable from a settings field; other focused groups keep their
+  // own numbers first.
   const editable = target instanceof HTMLElement && (
     target.matches('textarea, [contenteditable="true"]')
     || (target.matches('input') && !target.matches('input[type="radio"], input[type="checkbox"], input[type="button"], input[type="submit"]'))
@@ -1117,17 +1165,44 @@ function handleNumberShortcut(event) {
   if (deferred && scope === 'composer' && choiceNumberAvailable(key) && !numberTarget('voice', key)) {
     scope = 'choice';
   }
-  if (!scope) return;
-  if (scope === 'choice') {
-    if (!choiceNumberAvailable(key)) return;
-    event.preventDefault();
+  // Wherever focus is in the panel, a number the focused group lacks still
+  // reaches the visible control that shows it.
+  let action = numberAction(scope, key);
+  if (!action) {
+    const fallback = defaultNumberScope(key);
+    if (fallback !== scope) action = numberAction(fallback, key);
+  }
+  event.preventDefault();
+  if (!action) {
+    // Silence would leave a screen-reader user guessing whether the key or
+    // focus is at fault.
+    void say(`Nothing uses Control plus Shift plus ${key} right now.`);
+    return;
+  }
+  if (action.choice) {
     if (!selectOption(state.choice.set.id, key)) void say('There is no such choice.');
     return;
   }
-  const element = numberTarget(scope, key);
-  if (!element) return;
-  event.preventDefault();
-  element.click();
+  action.element.click();
+}
+
+// Chrome activates a focused button, summary, checkbox, or radio when Space
+// is released, even with Control, Alt, or Meta held. The open shortcut is
+// Control+Shift+Space, so without this it would also press whatever control
+// has focus: Close, a choice answer, or Listen. The key press itself is left
+// alone so Chrome still runs the shortcut; only the release is cancelled.
+function guardModifiedSpace() {
+  let armed = false;
+  window.addEventListener('keydown', (event) => {
+    if (event.code !== 'Space') return;
+    armed = event.ctrlKey || event.altKey || event.metaKey;
+  }, true);
+  window.addEventListener('keyup', (event) => {
+    if (event.code !== 'Space' || !armed) return;
+    armed = false;
+    event.preventDefault();
+  }, true);
+  window.addEventListener('blur', () => { armed = false; });
 }
 
 function finishChoice(choiceSetId, option, reason = 'answered') {
@@ -1140,7 +1215,13 @@ function finishChoice(choiceSetId, option, reason = 'answered') {
   // not be read out after it is gone.
   speech.dropPending(choiceTag(current.set.id));
   current.set = closeChoiceSet(current.set, reason);
-  debugLog.add('choice.finish', { id: current.set.id, reason, option });
+  // An expired, replaced, or reset question is not an answer; only an explicit
+  // cancel is a refusal. A Cancel option counts only when the panel wrote it:
+  // a model's option valued "cancel" is an ordinary answer.
+  const panelCancel = current.panelOptions && option?.value === 'cancel';
+  const declined = current.declinable && (reason === 'cancelled' || panelCancel);
+  if (declined) current.turn.declined = true;
+  debugLog.add('choice.finish', { id: current.set.id, reason, option, declined });
   hideChoice();
   let feedback = null;
   if (option) {
@@ -1150,9 +1231,9 @@ function finishChoice(choiceSetId, option, reason = 'answered') {
     const ownerToken = sayToken;
     const ownerGeneration = state.voiceGeneration;
     feedback = (async () => {
-      await speech.play(option.value === 'cancel' ? 'cancel' : 'choose');
+      await speech.play(panelCancel ? 'cancel' : 'choose');
       if (sayToken !== ownerToken || state.voiceGeneration !== ownerGeneration) return;
-      await say(option.value === 'cancel'
+      await say(panelCancel
         ? 'Cancelled.'
         : `Selected option ${option.number}: ${option.label}.`);
     })();
@@ -1225,14 +1306,20 @@ function repeatChoice() {
   void announceChoice(current);
 }
 
-function presentSet(set, { timeoutMs = 0, sourceSites = [] } = {}) {
+// declinable: Cancel, Escape, or a spoken "cancel" on this question is the
+// user saying no. That marks the turn, so the turn asks nothing more.
+// panelOptions false: the options came from the model, so none of them is the
+// panel's own Cancel.
+function presentSet(set, { timeoutMs = 0, sourceSites = [], declinable = false, panelOptions = true } = {}) {
   if (state.choice) finishChoice(state.choice.set.id, null, 'replaced');
   if (state.pendingInput) {
     // A newer instruction already replaced this turn; do not ask again.
     return Promise.resolve(null);
   }
   return new Promise((resolve) => {
-    const current = { set, resolve, timer: null, sourceSites: [...sourceSites] };
+    const current = {
+      set, resolve, timer: null, sourceSites: [...sourceSites], declinable, panelOptions, turn: turns.current,
+    };
     state.choice = current;
     debugLog.add('choice.show', { set, sourceSites: current.sourceSites, timeoutMs });
     state.choiceTrigger = choiceTriggerFor(document.activeElement);
@@ -1256,7 +1343,7 @@ function presentSet(set, { timeoutMs = 0, sourceSites = [] } = {}) {
   });
 }
 
-async function askChoice({ question, options, sourceSites = [] }) {
+async function askChoice({ question, options, sourceSites = [], declinable = false }) {
   let set;
   try {
     set = createChoiceSet({ id: uid(), question, options });
@@ -1264,7 +1351,7 @@ async function askChoice({ question, options, sourceSites = [] }) {
     await say(`Cannot show choices: ${error.message}`, { urgent: true });
     return null;
   }
-  return presentSet(set, { sourceSites });
+  return presentSet(set, { sourceSites, declinable });
 }
 
 async function handleChoiceText(raw, choiceSetId) {
@@ -1303,7 +1390,7 @@ function focusListen() {
   cancelVoice();
   state.mode = 'idle';
   updateModeLine();
-  if (document.activeElement !== $('listen')) $('listen').focus();
+  if (panelFocusable() && document.activeElement !== $('listen')) $('listen').focus();
 }
 
 function setSettingsOpen(open) {
@@ -1411,6 +1498,85 @@ function stripImages() {
 
 const MAX_MODEL_CALLS_PER_TURN = 16;
 
+// What the model may know about the page before it reads it. The title and
+// address are page content too: they go only to a receiver the user allowed
+// for this site, never before the question and never after a refusal.
+function pageLineForModel() {
+  const tab = state.tab;
+  if (!tab) return 'No readable page is on screen.';
+  const fingerprint = configFingerprint(state.config);
+  if (refusalFor(state.uploadRefusal, tab.origin, fingerprint, 'text')) {
+    return 'Current page: not shared. The user declined to share this page; its title, address, and content are unavailable. Work only from what the user says.';
+  }
+  if (!needsUpload(uploadConsentFor(state.uploadConsent, tab.origin, fingerprint), 'text')) {
+    return `Current page: ${tab.title || ''}; address: ${tab.url}`;
+  }
+  return 'Current page: not shared yet. Its title, address, and content are sent only after the user allows it; call observe_page to ask.';
+}
+
+const SUPERSEDED_PAGE = 'Superseded by a newer page reading below; use only the newest reading and its target ids.';
+
+// A page reading stops mattering once a newer full reading exists, but the
+// history keeps every one, and each can be tens of thousands of tokens: one
+// grid page grew a request from 3k to 258k tokens over 15 calls. The model is
+// sent a copy where every reading but the newest is replaced by a short note;
+// state.history keeps them all. A reading continued with a cursor is a further
+// part of the same page, so it does not supersede the part before it.
+// Anthropic history stays append-only: editing earlier turns would invalidate
+// the preserved thinking that refers to them.
+function historyForModel(history, protocol) {
+  if (protocol === 'anthropic') return history;
+  const argsById = new Map();
+  for (const message of history) {
+    if (message.role !== 'assistant') continue;
+    for (const call of message.toolCalls ?? []) argsById.set(call.id, call.args ?? {});
+  }
+  const readings = [];
+  history.forEach((message, messageIndex) => {
+    if (message.role !== 'tool') return;
+    (message.results ?? []).forEach((result, resultIndex) => {
+      const kind = pageReadingKind(result);
+      if (!kind) return;
+      const continued = kind === 'observe' && Boolean(argsById.get(result.id)?.cursor);
+      readings.push({ messageIndex, resultIndex, kind, continued });
+    });
+  });
+  // The newest fresh reading supersedes everything before it.
+  let newestFresh = -1;
+  readings.forEach((reading, index) => { if (!reading.continued) newestFresh = index; });
+  if (newestFresh <= 0) return history;
+  const stale = readings.slice(0, newestFresh);
+  const copy = history.slice();
+  for (const { messageIndex, resultIndex, kind } of stale) {
+    const message = copy[messageIndex];
+    const results = message.results.slice();
+    const result = results[resultIndex];
+    results[resultIndex] = { ...result, content: supersededContent(result.content, kind) };
+    copy[messageIndex] = { ...message, results };
+  }
+  return copy;
+}
+
+// 'observe' for an observe_page result, 'action' for an action result that
+// carries the page after it, null for anything else.
+function pageReadingKind(result) {
+  if (result.isError || (result.name !== 'observe_page' && result.name !== 'propose_action')) return null;
+  let value;
+  try {
+    value = JSON.parse(result.content);
+  } catch {
+    return null;
+  }
+  if (result.name === 'observe_page') return Array.isArray(value?.targets) ? 'observe' : null;
+  return Array.isArray(value?.page?.targets) ? 'action' : null;
+}
+
+function supersededContent(content, kind) {
+  const value = JSON.parse(content);
+  if (kind === 'action') return JSON.stringify({ ...value, page: SUPERSEDED_PAGE });
+  return JSON.stringify({ title: value.title, url: value.url, superseded: SUPERSEDED_PAGE });
+}
+
 async function requestModel(turn, { retried = false } = {}) {
   if (!(await apiReady())) return null;
   if (!turn.isCurrent()) return null;
@@ -1431,8 +1597,8 @@ async function requestModel(turn, { retried = false } = {}) {
       config: state.config,
       apiKey: state.apiKey,
       sessionId: state.apiSessionId,
-      system: `${SYSTEM_PROMPT}\n${state.tab ? `Current page: ${state.tab.title || ''}; address: ${state.tab.url}` : 'Current page unknown'}`,
-      messages: state.history,
+      system: `${SYSTEM_PROMPT}\n${pageLineForModel()}`,
+      messages: historyForModel(state.history, state.config.protocol),
       signal: turn.signal,
     });
     debugLog.add('model.response', {
@@ -1583,8 +1749,15 @@ function preemptTurn() {
   syncWorking();
 }
 
+// Chrome stops an idle extension worker after about 30 seconds, and the page
+// snapshots and pending proposals live in its memory. A model call or a
+// question to the user often takes longer, after which every target id was
+// refused ("Observe the page first"). Any message resets the idle timer.
+const WORKER_KEEPALIVE_MS = 20_000;
+
 async function runTurn(text) {
   const turn = turns.next();
+  const keepAlive = setInterval(() => void send('KEEP_ALIVE').catch(() => {}), WORKER_KEEPALIVE_MS);
   state.runningTurn = turn;
   state.busy = true;
   state.audioPaused = false;
@@ -1611,6 +1784,7 @@ async function runTurn(text) {
     debugLog.add('turn.error', { error });
     if (turn.isCurrent()) await announceFailure(error);
   } finally {
+    clearInterval(keepAlive);
     debugLog.add('turn.end', {
       calls: state.callsThisTurn,
       current: turn.isCurrent(),
@@ -1636,7 +1810,18 @@ function drainTurns() {
     while (state.pendingInput) {
       const { text } = state.pendingInput;
       state.pendingInput = null;
+      // The page check awaits; a stop or a newer command in that time owns the
+      // panel, and this command must not start after it.
+      const request = state.requestSeq;
       await initialTabBind;
+      const verified = await syncVisiblePage();
+      if (request !== state.requestSeq || state.pendingInput) continue;
+      // The binding may still name a page the user left; nothing reaches the
+      // model until the page on screen is known.
+      if (!verified) {
+        await say('I could not check which page is on screen, so that request did not run. Try again.');
+        continue;
+      }
       await runTurn(text);
     }
   })();
@@ -1685,6 +1870,13 @@ async function submitMessage(raw) {
     return;
   }
   if (/^(undo|undo last step|undo last)[.!?]?$/iu.test(text)) {
+    const request = state.requestSeq;
+    const verified = await syncVisiblePage();
+    if (request !== state.requestSeq || state.pendingInput) return;
+    if (!verified) {
+      await say('I could not check which page is on screen, so nothing was undone. Try again.');
+      return;
+    }
     const turn = turns.next();
     state.runningTurn = turn;
     state.busy = true;
@@ -1712,6 +1904,7 @@ async function submitMessage(raw) {
 }
 
 async function pauseAssistant() {
+  state.requestSeq += 1;
   state.audioPaused = true;
   interruptOutput();
   cancelVoice();
@@ -1734,34 +1927,70 @@ async function discoverPageOrigins(context) {
   return listed;
 }
 
-async function ensureUploadConsent(part, question, turn) {
+// Returns true when the upload may go ahead; otherwise the tool result that
+// explains why not. A refusal is remembered for this site, so the panel never
+// asks again on its own; askAgain (the model's ask_again, honored once per
+// later turn) is the only way back to the question.
+async function ensureUploadConsent(part, question, turn, { askAgain = false } = {}) {
   const tab = state.tab;
   if (!tab?.origin || !Number.isInteger(tab.tabId)) {
     await say('This page has no usable site address.', { urgent: true });
-    return false;
+    return 'This page has no usable site address.';
   }
-  if (turn.stale) return false;
+  if (turn.stale) return 'The user interrupted.';
   const context = {
     tabId: tab.tabId,
     documentId: tab.documentId,
     url: tab.url,
     origin: tab.origin,
     fingerprint: configFingerprint(state.config),
-    refreshSeq: state.refreshSeq,
+    pageEpoch: state.pageEpoch,
   };
+  const refusedMessage = part === 'image' ? IMAGE_REFUSED : TEXT_REFUSED;
+  const refused = refusalFor(state.uploadRefusal, context.origin, context.fingerprint, part);
+  if (refused) {
+    // Asked again only for a new request that explicitly wants the page, and
+    // only once in that request.
+    if (!askAgain || refused.turn === turn || turn.askedAgain || turn.declined) return refusedMessage;
+    turn.askedAgain = true;
+  }
+  const reasking = Boolean(refused);
   const samePage = () => !turn.stale
-    && state.refreshSeq === context.refreshSeq
+    && state.pageEpoch === context.pageEpoch
     && state.tab?.tabId === context.tabId
     && state.tab?.documentId === context.documentId
     && state.tab?.url === context.url
     && state.tab?.origin === context.origin;
+  // Only an explicit decline is remembered; an expired or replaced question
+  // is not an answer and may be asked again.
+  const refuse = () => {
+    if (!turn.declined) {
+      return `The user did not allow ${part === 'image' ? 'screenshot' : 'page text'} upload: the question was not answered.`;
+    }
+    state.uploadRefusal = refuseUpload(state.uploadRefusal, context.origin, context.fingerprint, part, { turn });
+    return refusedMessage;
+  };
+  const allow = () => {
+    state.uploadRefusal = liftRefusal(state.uploadRefusal, context.origin, context.fingerprint, part);
+    return true;
+  };
   let frameOrigins = [];
   if (part === 'text') {
     const listed = await discoverPageOrigins(context).catch(() => null);
-    if (!samePage()) return false;
+    if (!samePage()) return 'The page changed; observe it again.';
     if (listed) {
+      const unasked = (origin) => !state.frameConsent.has(origin) && !state.frameSkipped.has(origin);
+      // A declined embedded site is listed again only when the user explicitly
+      // asks for the page again (ask_again), once per request.
+      const refusedFrames = listed.frameOrigins.filter((origin) => unasked(origin) && state.frameRefused.has(origin));
+      let reaskFrames = reasking;
+      if (!reaskFrames && askAgain && refusedFrames.length && !turn.askedAgain && !turn.declined
+        && refusedFrames.every((origin) => state.frameRefused.get(origin).turn !== turn)) {
+        turn.askedAgain = true;
+        reaskFrames = true;
+      }
       frameOrigins = listed.frameOrigins.filter((origin) => (
-        !state.frameConsent.has(origin) && !state.frameSkipped.has(origin)
+        unasked(origin) && (reaskFrames || !state.frameRefused.has(origin))
       ));
     }
   }
@@ -1769,17 +1998,20 @@ async function ensureUploadConsent(part, question, turn) {
   const receiver = spokenSites([configOrigin(state.config)])[0];
   if (part === 'image') {
     if (!needsUpload(consent, 'image')) return true;
+    if (turn.declined) return DECLINED_EARLIER;
     const choice = await askChoice({
       question: `${question} The receiver is ${receiver}.`,
       options: [{ label: 'Allow', value: 'allow' }, { label: 'Cancel', value: 'cancel' }],
+      declinable: true,
     });
-    if (!samePage()) return false;
-    if (choice?.value !== 'allow') return false;
+    if (!samePage()) return 'The page changed before the user answered.';
+    if (choice?.value !== 'allow') return refuse();
     state.uploadConsent = grantUpload(state.uploadConsent, context.origin, context.fingerprint, 'image');
-    return true;
+    return allow();
   }
   const textNeeded = needsUpload(consent, 'text');
   if (!textNeeded && !frameOrigins.length) return true;
+  if (turn.declined) return DECLINED_EARLIER;
   const sourceSites = [...(textNeeded ? [context.origin] : []), ...frameOrigins];
   const options = textNeeded && frameOrigins.length
     ? [
@@ -1798,42 +2030,94 @@ async function ensureUploadConsent(part, question, turn) {
     question: `Reading page text from the listed sites sends it to ${receiver}. Allow these sources for this page?`,
     options,
     sourceSites,
+    declinable: true,
   });
-  if (!samePage()) return false;
+  if (!samePage()) return 'The page changed before the user answered.';
   if (choice?.value === 'allow' || choice?.value === 'allow-all') {
     if (textNeeded) state.uploadConsent = grantUpload(state.uploadConsent, context.origin, context.fingerprint, 'text');
-    for (const origin of frameOrigins) state.frameConsent.add(origin);
-    return true;
+    for (const origin of frameOrigins) {
+      state.frameConsent.add(origin);
+      state.frameRefused.delete(origin);
+    }
+    return allow();
   }
   if (choice?.value === 'allow-main') {
     if (textNeeded) state.uploadConsent = grantUpload(state.uploadConsent, context.origin, context.fingerprint, 'text');
     for (const origin of frameOrigins) state.frameSkipped.add(origin);
-    return true;
+    return allow();
   }
   if (choice?.value === 'skip-sites') {
     for (const origin of frameOrigins) state.frameSkipped.add(origin);
     return true;
   }
-  return false;
+  // An explicit decline covers every listed embedded site too, and lasts the
+  // conversation like the page's own refusal.
+  if (turn.declined) for (const origin of frameOrigins) state.frameRefused.set(origin, { turn });
+  // Only the new embedded sites were in question: the page itself stays shared.
+  if (!textNeeded) {
+    if (!turn.declined) return 'The user did not allow page text upload from the listed embedded sites: the question was not answered.';
+    return 'The user did not allow page text upload from the listed embedded sites: they declined. Do not ask again; only if the user explicitly asks in a new message to read those parts, call the tool again with ask_again true.';
+  }
+  return refuse();
 }
 
+// Shrinks a target for the model without losing information the model can
+// use. Defaults the observe_page description states are left out: a target is
+// visible and on screen unless it says otherwise, its tag equals its role
+// unless given, and an empty name is no name. A label next to an unnamed
+// control keeps its text; the control's own rect already places it.
+function compactTarget(target, styleIdFor) {
+  const { styleState, near, ...rest } = target;
+  const out = { ...rest };
+  if (out.name === '') delete out.name;
+  if (out.tag === out.role) delete out.tag;
+  if (out.visible === true) delete out.visible;
+  if (out.inViewport === true) delete out.inViewport;
+  if (near && (near.above || near.left)) {
+    out.near = {};
+    if (near.above) out.near.above = near.above.text;
+    if (near.left) out.near.left = near.left.text;
+  }
+  if (styleState) out.style = styleIdFor(styleState);
+  return out;
+}
+
+// Pages repeat the same few looks across many controls (160 grid cells shared
+// 8 looks on one page), so each look is listed once in styles and targets name
+// it. Targets that share a style look alike, which often means the same state.
 function pageForModel(value) {
+  const styles = {};
+  const styleIds = new Map();
+  const styleIdFor = (styleState) => {
+    const key = JSON.stringify(styleState);
+    let id = styleIds.get(key);
+    if (!id) {
+      id = `s${styleIds.size + 1}`;
+      styleIds.set(key, id);
+      styles[id] = styleState;
+    }
+    return id;
+  };
+  const targets = Array.isArray(value.targets)
+    ? value.targets.map((target) => compactTarget(target, styleIdFor))
+    : value.targets;
   return {
     title: value.title,
     url: value.url,
     viewport: value.viewport,
     sections: value.sections,
-    targets: value.targets,
+    targets,
+    ...(styleIds.size ? { styles } : {}),
     nextCursor: value.nextCursor,
     blockedFrames: value.blockedFrames,
   };
 }
 
 // Reading the page in the panel keeps the per-origin upload consent gate.
-async function readPage(turn, cursor) {
-  const allowed = await ensureUploadConsent('text', 'Reading this page sends page text to the model service.', turn);
+async function readPage(turn, cursor, { askAgain = false } = {}) {
+  const allowed = await ensureUploadConsent('text', 'Reading this page sends page text to the model service.', turn, { askAgain });
   if (turn.stale) return { error: 'The user interrupted; the page was not read.' };
-  if (!allowed) return { error: 'The user did not allow page text upload.' };
+  if (allowed !== true) return { error: allowed };
   const observation = await send('OBSERVE_PAGE', {
     tabId: state.tab.tabId,
     expectedDocumentId: state.tab.documentId,
@@ -1845,7 +2129,8 @@ async function readPage(turn, cursor) {
 }
 
 async function toolObserve(call, ok, fail, turn) {
-  const read = await readPage(turn, call.args?.cursor);
+  const askAgain = call.args?.ask_again === true;
+  const read = await readPage(turn, call.args?.cursor, { askAgain });
   if (read.error) return fail(read.error);
   const observation = read.observation;
   const wantsVisual = call.args?.visual === true;
@@ -1860,10 +2145,11 @@ async function toolObserve(call, ok, fail, turn) {
     'image',
     'Reading this page visually sends a screenshot to the model service.',
     turn,
+    { askAgain },
   );
   if (turn.stale) return fail('The user interrupted; no screenshot was sent.');
-  if (!imageAllowed) {
-    return ok({ ...pageForModel(observation), visual: { allowed: false, reason: 'The user did not allow screenshot upload.' } });
+  if (imageAllowed !== true) {
+    return ok({ ...pageForModel(observation), visual: { allowed: false, reason: imageAllowed } });
   }
   const seen = await send('OBSERVE_PAGE', {
     tabId: state.tab.tabId,
@@ -1896,9 +2182,11 @@ async function toolObserve(call, ok, fail, turn) {
 }
 
 async function toolReadTarget(call, ok, fail, turn) {
-  const allowed = await ensureUploadConsent('text', 'Reading this part sends its text to the model service.', turn);
+  const allowed = await ensureUploadConsent('text', 'Reading this part sends its text to the model service.', turn, {
+    askAgain: call.args?.ask_again === true,
+  });
   if (turn.stale) return fail('The user interrupted; the text was not read.');
-  if (!allowed) return fail('The user did not allow page text upload.');
+  if (allowed !== true) return fail(allowed);
   const outcome = await send('READ_TARGET', {
     tabId: state.tab.tabId,
     id: call.args?.id,
@@ -1910,9 +2198,11 @@ async function toolReadTarget(call, ok, fail, turn) {
 }
 
 async function toolFocusTarget(call, ok, fail, turn) {
-  const allowed = await ensureUploadConsent('text', 'Focusing a target sends page content to the model service.', turn);
+  const allowed = await ensureUploadConsent('text', 'Focusing a target sends page content to the model service.', turn, {
+    askAgain: call.args?.ask_again === true,
+  });
   if (turn.stale) return fail('The user interrupted; focus did not change.');
-  if (!allowed) return fail('The user did not allow page text upload.');
+  if (allowed !== true) return fail(allowed);
   const outcome = await send('FOCUS_TARGET', {
     tabId: state.tab.tabId,
     id: call.args?.id,
@@ -1939,14 +2229,21 @@ async function toolAskUser(call, ok, fail, turn) {
   } catch (error) {
     return fail(`Invalid choices: ${error.message}`);
   }
-  const choice = await presentSet(set);
+  if (turn.declined) return fail(DECLINED_EARLIER);
+  const choice = await presentSet(set, { declinable: true, panelOptions: false });
   if (turn.stale) return fail('The turn was replaced before the question was answered.');
-  if (!choice) return fail('The user cancelled this choice.');
+  if (!choice) {
+    return fail(turn.declined
+      ? 'The user cancelled this choice. Do not ask again in this request; say briefly what was not done and stop.'
+      : 'The question was not answered.');
+  }
   return ok(`User choice: ${choice.label}.`);
 }
 
 async function toolDescribeImage(call, ok, fail, turn) {
+  if (turn.declined) return fail(DECLINED_EARLIER);
   const choice = await askChoice({
+    declinable: true,
     question: 'How should I describe this image?',
     options: [
       { label: 'Read it', value: 'ai' },
@@ -1955,7 +2252,9 @@ async function toolDescribeImage(call, ok, fail, turn) {
     ],
   });
   if (turn.stale) return fail('The turn was replaced before image reading started.');
-  if (!choice || choice.value === 'cancel') return fail('The user cancelled image reading.');
+  if (!choice || choice.value === 'cancel') {
+    return fail('The user cancelled image reading. Do not ask again in this request; say briefly what was not done and stop.');
+  }
   if (choice.value === 'guide') {
     await runGuide();
     return ok('The user chose system screen-reader guidance.');
@@ -1964,9 +2263,13 @@ async function toolDescribeImage(call, ok, fail, turn) {
     await say('Screenshots are unavailable in this conversation. Page text still works.');
     return ok('Visual reading is unavailable because the model service did not accept images.');
   }
-  const allowed = await ensureUploadConsent('image', 'Reading this image sends a screenshot to the model service.', turn);
+  // Choosing "Read it" just now is the user explicitly asking for AI reading,
+  // so an earlier refusal of screenshots on this site is asked about once more.
+  const allowed = await ensureUploadConsent('image', 'Reading this image sends a screenshot to the model service.', turn, {
+    askAgain: true,
+  });
   if (turn.stale) return fail('The user interrupted; no screenshot was sent.');
-  if (!allowed) return fail('The user did not allow screenshot upload.');
+  if (allowed !== true) return fail(allowed);
   const shot = await send('CAPTURE_TARGET', {
     tabId: state.tab.tabId,
     expectedDocumentId: state.tab.documentId,
@@ -2124,8 +2427,8 @@ async function handleActivated(tabId, windowId) {
     context.deferredTabId = tabId;
     return;
   }
-  const tab = await chrome.tabs.get(tabId).catch(() => null);
-  if (!tab || !/^https?:/u.test(tab.url ?? '')) return;
+  // Every tab the user brings forward is followed, web page or not: an
+  // unreadable tab releases the old page instead of leaving it as a hidden target.
   if (windowId !== boundWindow) return;
   if (tabId === state.tab?.tabId) return;
   await refreshTab({ announce: true, windowId: boundWindow });
@@ -2137,7 +2440,7 @@ async function handleRemoved(tabId) {
   }
   if (state.tab?.tabId !== tabId) return;
   state.tab = null;
-  resetConversation();
+  resetConversation({ keepQueued: true });
   await refreshTab({ windowId: state.windowId });
 }
 
@@ -2147,7 +2450,9 @@ async function restoreOriginalPage(opened) {
   const deferred = context.deferredTabId;
   if (!Number.isInteger(deferred) || !opened.some((tab) => tab.tabId === deferred)) return;
   if (!Number.isInteger(context.sourceTabId)) return;
-  await send('ACTIVATE_TAB', { tabId: context.sourceTabId, windowId: context.windowId }).catch(() => {});
+  await send('ACTIVATE_TAB', {
+    tabId: context.sourceTabId, windowId: context.windowId, expectedActiveTabId: deferred,
+  }).catch(() => {});
 }
 
 // Only pages opened by this action, and only after the user chooses one, are
@@ -2260,12 +2565,16 @@ async function followOpenedPages(report, turn) {
   state.pendingMessages = [];
   state.frameConsent = new Set();
   state.frameSkipped = new Set();
+  state.pageEpoch += 1;
+  // Consent is per site and starts over on a new one; refusals are keyed by
+  // site already and last until the conversation resets.
   if (previousOrigin !== adopted.origin) state.uploadConsent = null;
   return 'Switched to the page the user chose. Observe it again before acting; earlier snapshots no longer work.';
 }
 
 async function toolProposeAction(call, ok, fail, turn) {
   // The spoken result needs one more model call, and one more when the page cannot be attached; never say "Confirming." without them.
+  if (turn.declined) return fail(DECLINED_EARLIER);
   if (MAX_MODEL_CALLS_PER_TURN - state.callsThisTurn < 2) {
     return fail('Not run: this turn has too few model calls left to confirm the result. Ask the user to give the instruction again.');
   }
@@ -2284,10 +2593,13 @@ async function toolProposeAction(call, ok, fail, turn) {
       ? await autoRunProposal(proposed, turn)
       : await consentForProposal(proposed, turn);
     if (turn.stale) return ok('The turn was replaced before this action was confirmed.');
+    if (state.actionContext && consent.report) {
+      state.actionContext.openedTabIds = consent.report.openedTabIds ?? [];
+    }
     if (consent.cancelled) {
       return ok(consent.stale
         ? 'The turn was replaced before this action was confirmed.'
-        : 'The user cancelled this action.');
+        : 'The user cancelled this action. Do not propose it again or try another way in this request; say briefly what was not done and stop.');
     }
     const finished = await finishProposal(consent.report, turn);
     if (turn.stale) return ok(finished);
@@ -2298,7 +2610,24 @@ async function toolProposeAction(call, ok, fail, turn) {
     if (after.observation) return ok({ outcome, page: pageForModel(after.observation) });
     return ok(`${outcome} The page could not be read afterwards (${after.error}); call observe_page before describing the result.`);
   } finally {
+    // A tab the user switched to while the action ran was only deferred; it
+    // owns the panel now, so the finished action must not read the page left behind.
+    const context = state.actionContext;
+    const deferred = context?.deferredTabId;
     endActionContext();
+    if (Number.isInteger(deferred) && deferred !== state.tab?.tabId) {
+      // A page the action opened, that the user did not choose (one that never
+      // loaded, say), is not their switch: put the page they were working on
+      // back in front so the screen and the panel agree again.
+      if (context.openedTabIds?.includes(deferred) && Number.isInteger(context.sourceTabId)
+        && context.sourceTabId === state.tab?.tabId) {
+        // Only while that page is still in front: a tab the user picked since stays.
+        await send('ACTIVATE_TAB', {
+          tabId: context.sourceTabId, windowId: context.windowId, expectedActiveTabId: deferred,
+        }).catch(() => {});
+      }
+      await refreshTab({ announce: true });
+    }
   }
 }
 
@@ -2310,6 +2639,9 @@ async function handleToolCall(call, turn) {
     isError: false,
   });
   const fail = (message) => ({ id: call.id, name: call.name, content: String(message), isError: true });
+  if (!state.tab && call.name !== 'ask_user') {
+    return fail('No readable page is on screen: the user is on a tab that cannot be read or operated.');
+  }
   try {
     switch (call.name) {
       case 'observe_page': return await toolObserve(call, ok, fail, turn);
@@ -2337,6 +2669,8 @@ async function handleToolCall(call, turn) {
       default: return fail(`Unknown tool: ${call.name}`);
     }
   } catch (error) {
+    // The worker refused a page that left the screen; follow the user there.
+    if (/no longer on screen/u.test(error?.message ?? '')) void refreshTab({ announce: true });
     return fail(error?.message ?? 'Tool execution failed');
   }
 }
@@ -2393,7 +2727,11 @@ async function runGuide() {
   await say(text);
 }
 
-async function refreshTab({ announce = false, reason = '', windowId = null } = {}) {
+// Resolves 'bound' (a web page), 'unbound' (a verified tab that is not a web
+// page), 'failed' (the lookup itself failed; the old binding is unverified) or
+// 'stale' (a newer refresh owns the binding). entry, when given, is a Listen
+// entry's ownership token: this refresh's own voice cancel carries it forward.
+async function refreshTab({ announce = false, reason = '', windowId = null, entry = null } = {}) {
   const seq = ++state.refreshSeq;
   let info;
   try {
@@ -2401,19 +2739,17 @@ async function refreshTab({ announce = false, reason = '', windowId = null } = {
       windowId: windowId ?? state.windowId ?? undefined,
     });
   } catch (error) {
-    if (seq !== state.refreshSeq) return false;
-    $('page-line').textContent = 'Page unavailable';
-    if (announce) await say(`Page unavailable: ${error.message}`, { urgent: true });
-    return false;
+    if (seq !== state.refreshSeq) return 'stale';
+    if (!error?.response) {
+      $('page-line').textContent = 'Page unavailable';
+      if (announce) await say(`Page unavailable: ${error.message}`, { urgent: true });
+      return 'failed';
+    }
+    info = error.response;
   }
   // A slower query must not overwrite a newer page binding.
-  if (seq !== state.refreshSeq) return false;
-  if (info.error || !info.tabId) {
-    state.tab = null;
-    $('page-line').textContent = 'No readable page';
-    if (announce) await say(info.error ?? 'No readable page.');
-    return false;
-  }
+  if (seq !== state.refreshSeq) return 'stale';
+  if (info.error || !info.tabId) return unbindPage(info, { announce, seq, entry });
   const previous = state.tab;
   const changed = previous?.tabId !== info.tabId || previous?.url !== info.url
     || Boolean(previous?.documentId && previous.documentId !== info.documentId);
@@ -2422,34 +2758,88 @@ async function refreshTab({ announce = false, reason = '', windowId = null } = {
     cancelVoice();
   }
   state.tab = info;
+  state.unreadablePage = null;
   const pageName = spokenSites([info.title || info.url || 'Unknown'])[0];
   $('page-line').textContent = `Current page: ${pageName}${info.readable ? '' : ' (unreadable)'}`;
   if (changed) {
-    cancelVoice();
-    resetConversation();
+    state.pageEpoch += 1;
+    cancelVoiceFor(entry);
+    resetConversation({ keepQueued: true });
     if (previous?.tabId) await send('RESET_SESSION', { tabId: previous.tabId }).catch(() => {});
-    if (seq !== state.refreshSeq) return false;
+    if (seq !== state.refreshSeq) return 'stale';
     if (announce) {
       await say(`${reason ? `${reason}. ` : ''}Current page: ${pageName}.`);
     }
   }
-  return true;
+  return 'bound';
 }
 
-function resetConversation() {
-  debugLog.add('conversation.reset');
+// A rebind ends any voice session, but the Listen entry that asked for the
+// rebind keeps its ownership.
+function cancelVoiceFor(entry) {
+  const owned = entry && entry.seq === state.entrySeq;
+  cancelVoice();
+  if (owned) entry.seq = state.entrySeq;
+}
+
+// The tab on screen is not a web page (a new tab page, browser settings, a
+// file). The page the user left is out of sight, so it is released rather than
+// kept as a hidden target, and the user hears which page cannot be used.
+async function unbindPage(info, { announce, seq, entry = null }) {
+  const previous = state.tab;
+  const shown = info.title ? spokenSites([info.title])[0] : '';
+  const changed = Boolean(previous) || state.unreadablePage !== shown;
+  state.tab = null;
+  state.unreadablePage = shown;
+  $('page-line').textContent = shown ? `Current page: ${shown} (unreadable)` : 'No readable page';
+  if (previous) {
+    state.pageEpoch += 1;
+    cancelVoiceFor(entry);
+    resetConversation({ keepQueued: true });
+    await send('RESET_SESSION', { tabId: previous.tabId }).catch(() => {});
+    if (seq !== state.refreshSeq) return 'stale';
+  }
+  if (announce && changed) {
+    await say(shown
+      ? `Current page: ${shown}. This tab is not a regular web page, so I cannot read or operate it.`
+      : (info.error ?? 'No readable page.'));
+  }
+  return 'unbound';
+}
+
+// Every request the user makes belongs to the page on screen when they make
+// it. Tab events normally keep the binding current; this re-checks at the
+// moment of the request, so a missed event can never aim a command at a page
+// the user has left. Resolves true once the tab on screen is known (a verified
+// non-web tab included), false when the lookup failed and the binding may be
+// stale. A refresh overtaken by a newer one is retried.
+async function syncVisiblePage({ entry = null } = {}) {
+  for (let attempt = 0; attempt < 3; attempt += 1) {
+    const outcome = await refreshTab({ announce: true, entry });
+    if (outcome !== 'stale') return outcome !== 'failed';
+  }
+  return false;
+}
+
+// keepQueued: a page-binding change resets what belongs to the old page, but a
+// newer command waiting in the queue is the user's and runs on the page now on
+// screen. Explicit cancel and close clear the queue themselves.
+function resetConversation({ keepQueued = false } = {}) {
+  debugLog.add('conversation.reset', { keepQueued });
   interruptOutput();
   state.deferChoiceFocus = false;
   turns.next();
-  state.pendingInput = null;
+  if (!keepQueued) state.pendingInput = null;
   state.actionContext = null;
   if (state.choice) finishChoice(state.choice.set.id, null, 'reset');
   state.history = [];
   state.pendingMessages = [];
   state.callsThisTurn = 0;
   state.uploadConsent = null;
+  state.uploadRefusal = null;
   state.frameConsent = new Set();
   state.frameSkipped = new Set();
+  state.frameRefused = new Map();
   state.visionLimited = false;
   state.audioPaused = false;
   speech.clearStatus();
@@ -2467,7 +2857,7 @@ function focusEntryTarget({ requestWindowFocus = true } = {}) {
   if (target !== $('listen')) {
     state.mode = 'idle';
     updateModeLine();
-    if (document.activeElement !== target) target.focus();
+    if (panelFocusable() && document.activeElement !== target) target.focus();
     return;
   }
   focusListen();
@@ -2487,7 +2877,7 @@ function entryControl() {
 function focusEntryControl() {
   window.focus();
   const target = entryControl();
-  if (document.activeElement !== target) target.focus();
+  if (panelFocusable() && document.activeElement !== target) target.focus();
 }
 
 // Both entry shortcuts are explicit requests for the panel, so both take focus
@@ -2496,7 +2886,7 @@ function focusesBeforeClaim(intent) {
   return intent.source === 'command' && (intent.mode === 'open' || intent.mode === 'voice');
 }
 
-async function handleEntryIntent(intent) {
+async function handleEntryIntent(intent, { cold = false } = {}) {
   // A new entry owns the panel; any older preparation, output, or await is
   // stale from here on.
   state.deferChoiceFocus = false;
@@ -2515,13 +2905,25 @@ async function handleEntryIntent(intent) {
   // A warm entry-shortcut notification already transferred keyboard focus
   // before the serialized claim; asking the window again would repeat its
   // announcement.
-  const notified = focusesBeforeClaim(intent) && state.requestedIntents.has(intent.id);
+  // A cold entry was already given window focus when the panel started.
+  const notified = (focusesBeforeClaim(intent) && state.requestedIntents.has(intent.id))
+    || (cold && state.startFocused);
+  // cancelVoice above ended any cold listen without its end callback, which
+  // is what would have revealed the panel; any entry but another listen
+  // shortcut shows it now, so focus can land.
+  if (!isColdListen(intent)) exposeForEntry('entry');
   focusEntryTarget({ requestWindowFocus: !notified });
   state.audioPaused = false;
   state.voiceRetry = false;
+  // The shortcut was pressed on the page in front of the user; bind to it
+  // before anything is heard or done. A cancel, the Listen button or another
+  // entry during that check bumps entrySeq and takes this entry's place.
+  const entry = { seq: state.entrySeq };
+  if (intent.mode === 'open' || intent.mode === 'voice') await syncVisiblePage({ entry });
   if (intent.mode === 'open') {
     return;
   }
+  if (entry.seq !== state.entrySeq) return;
   if (intent.mode === 'intro') {
     updateModeLine();
     await speech.play('choose');
@@ -2541,8 +2943,12 @@ async function handleEntryIntent(intent) {
   if (state.busy && !state.choice) preemptTurn();
   const seq = ++state.entrySeq;
   state.listenRequest = intent.id;
-  if (!state.voiceReady && !(await prepareEntry(seq))) return;
-  await listenOnce(intent.id, seq);
+  // A listen that cannot start shows the panel that explains why.
+  if (!state.voiceReady && !(await prepareEntry(seq))) {
+    revealPanel('listen-unavailable', { focus: true });
+    return;
+  }
+  if (!(await listenOnce(intent.id, seq))) revealPanel('listen-unavailable', { focus: true });
 }
 
 // Entry-driven preparation keeps the single-use listen authorization alive only
@@ -2684,6 +3090,8 @@ async function exportDebugLog() {
       uploadConsent: state.uploadConsent,
       frameConsent: state.frameConsent,
       frameSkipped: state.frameSkipped,
+      uploadRefusal: state.uploadRefusal,
+      frameRefused: [...state.frameRefused.keys()],
       choice: state.choice?.set ?? null,
     },
     systemPrompt: SYSTEM_PROMPT,
@@ -2777,6 +3185,7 @@ function bindEvents() {
   $('export-log').addEventListener('click', () => void exportDebugLog());
   $('settings-form').addEventListener('submit', (event) => void saveSettings(event));
   $('protocol').addEventListener('change', toggleAnthropicFields);
+  guardModifiedSpace();
   document.addEventListener('keydown', handleNumberShortcut);
   document.addEventListener('keydown', (event) => {
     if (event.key !== 'Escape') return;
@@ -2793,6 +3202,8 @@ function bindEvents() {
   window.addEventListener('beforeunload', () => {
     interruptOutput();
     cancelVoice();
+    // The pages stop answering a question that closes with the panel.
+    if (state.choice) publishChoiceKeys(null);
     stopLocalWatch();
     speech.stopWorking();
     turns.current.cancel();
@@ -2802,10 +3213,17 @@ function bindEvents() {
   });
   chrome.tabs.onActivated.addListener(({ tabId, windowId }) => { void handleActivated(tabId, windowId); });
   chrome.tabs.onRemoved.addListener((tabId) => { void handleRemoved(tabId); });
-  chrome.tabs.onUpdated.addListener((tabId, info) => {
-    if (info.status === 'complete' && tabId === state.tab?.tabId) {
+  chrome.tabs.onUpdated.addListener((tabId, info, tab) => {
+    if (info.status !== 'complete') return;
+    if (tabId === state.tab?.tabId) {
       void refreshTab({ announce: Boolean(state.tab), reason: 'Page updated' });
+      return;
     }
+    // Another tab finished loading while on screen, such as a new tab the user
+    // typed an address into: that is now the page in front of them.
+    const boundWindow = state.tab?.windowId ?? state.windowId;
+    if (!tab?.active || tab.windowId !== boundWindow || state.actionContext) return;
+    void refreshTab({ announce: true, windowId: boundWindow });
   });
   chrome.webNavigation.onHistoryStateUpdated.addListener((details) => {
     if (details.frameId === 0 && details.tabId === state.tab?.tabId) {
@@ -2854,6 +3272,7 @@ async function cancelFromButton() {
     finishChoice(state.choice.set.id, null, 'cancelled');
     return;
   }
+  state.requestSeq += 1;
   state.audioPaused = false;
   state.pendingInput = null;
   if (state.busy) {
@@ -2877,6 +3296,13 @@ async function undoFromButton() {
   state.audioPaused = false;
   if (state.busy) preemptTurn();
   else interruptOutput();
+  const request = state.requestSeq;
+  const verified = await syncVisiblePage();
+  if (request !== state.requestSeq || state.pendingInput) return;
+  if (!verified) {
+    await say('I could not check which page is on screen, so nothing was undone. Try again.');
+    return;
+  }
   const turn = turns.next();
   await state.turnTask;
   if (!turn.isCurrent()) return;
@@ -2914,6 +3340,7 @@ async function restoreLauncherFocus() {
 }
 
 function preparePanelClose() {
+  state.requestSeq += 1;
   interruptOutput();
   cancelVoice();
   stopLocalWatch();
@@ -2995,20 +3422,135 @@ function receiveEntryIntent(intent) {
   // storage would leave keyboard focus on the page, and a reader arriving late
   // talks over "Listening.". Cold-start handling in handleEntryIntent still
   // focuses again after initialization.
-  if (focusesBeforeClaim(intent)) focusEntryControl();
+  if (focusesBeforeClaim(intent)) {
+    // Before init decides what to expose, the startup path handles it.
+    if (state.ready && !isColdListen(intent)) exposeForEntry('entry-notice');
+    focusEntryControl();
+  }
   claimEntry(intent.id);
 }
 
+// How long after Listen is exposed the rest stays hidden when nothing reveals
+// it sooner. Long enough for a reader's load-time reading of the one exposed
+// control to finish; short enough that a reader user exploring by reader
+// commands alone, which moves no focus, soon finds the whole panel.
+const QUIET_LOAD_MS = 1500;
+// A cold listen shortcut keeps the panel hidden until listening ends; this
+// only covers a listen that never reports an end.
+const QUIET_LISTEN_BACKSTOP_MS = 30_000;
+// 'all': everything but the live region is hidden from screen readers, and
+// nothing in the panel takes DOM focus (Chrome would drop aria-hidden from a
+// focused control). 'listen': only Listen is exposed, and focused. 'none':
+// the whole panel is exposed.
+let quietStage = 'all';
+let quietTimer = null;
+
+// The panel may not move DOM focus while it is wholly hidden.
+function panelFocusable() {
+  return quietStage !== 'all';
+}
+
+// A listen shortcut that opened the panel: the user wants the microphone, not
+// the panel read to them.
+function isColdListen(intent) {
+  return intent?.source === 'command' && intent.mode === 'voice';
+}
+
+function focusSnapshot() {
+  const active = document.activeElement;
+  return {
+    atMs: Math.round(performance.now()),
+    readyState: document.readyState,
+    hasFocus: document.hasFocus(),
+    active: active?.id || active?.tagName || null,
+  };
+}
+
+function exposeElement(element) {
+  element.removeAttribute('aria-hidden');
+  element.removeAttribute('data-quiet-load');
+}
+
+// Exposes and focuses Listen alone, then the rest shortly after. A reader's
+// load-time reading finds that one control.
+function exposeListen(cause) {
+  if (quietStage !== 'all') return;
+  quietStage = 'listen';
+  clearTimeout(quietTimer);
+  exposeElement($('listen'));
+  $('listen').focus({ preventScroll: true });
+  document.body.dataset.quiet = 'listen';
+  debugLog.add('panel.expose-listen', { cause, ...focusSnapshot() });
+  quietTimer = setTimeout(() => revealPanel('timer'), QUIET_LOAD_MS);
+}
+
+// An entry that arrives while the panel is wholly hidden (a cold listen still
+// running) exposes it the same way an ordinary opening does.
+function exposeForEntry(cause) {
+  if (quietStage !== 'all') return;
+  if (entryControl() === $('listen')) exposeListen(cause);
+  else revealPanel(cause);
+}
+
+// Exposes everything marked data-quiet-load in sidepanel.html. Called once.
+// With focus, Listen takes focus only if nothing in the panel has it.
+function revealPanel(cause, { focus = false } = {}) {
+  if (quietStage === 'none') return;
+  quietStage = 'none';
+  clearTimeout(quietTimer);
+  quietTimer = null;
+  for (const element of document.querySelectorAll('[data-quiet-load]')) exposeElement(element);
+  document.body.dataset.quiet = 'none';
+  document.body.dataset.revealed = 'true';
+  const active = document.activeElement;
+  if (focus && (!active || active === document.body)) $('listen').focus({ preventScroll: true });
+  debugLog.add('panel.reveal', { cause, ...focusSnapshot() });
+}
+
+// A reader that auto-reads a freshly loaded document (VoiceOver's "speak web
+// page") reads only what is exposed when loading ends, and keeps reading
+// whatever is exposed while it reads. So the panel loads with nothing exposed
+// but the live region; initializePanel decides what to expose once it knows
+// why the panel opened. A key press, a click, or a focus move to another
+// control reveals everything first, so focus never lands inside a hidden region.
+function watchQuietLoad() {
+  document.body.dataset.quiet = 'all';
+  debugLog.add('panel.focus', { at: 'script', ...focusSnapshot() });
+  const onInput = (event) => revealPanel(event.type);
+  document.addEventListener('keydown', onInput, { capture: true, once: true });
+  document.addEventListener('pointerdown', onInput, { capture: true, once: true });
+  document.addEventListener('focusin', (event) => {
+    if (quietStage === 'all' || event.target !== $('listen')) revealPanel('focusin');
+  }, true);
+  document.addEventListener('DOMContentLoaded', () => {
+    debugLog.add('panel.focus', { at: 'DOMContentLoaded', ...focusSnapshot() });
+  }, { once: true });
+  window.addEventListener('focus', () => {
+    debugLog.add('panel.focus', { at: 'window-focus', ...focusSnapshot() });
+  }, { once: true });
+  const afterLoad = () => {
+    debugLog.add('panel.focus', { at: 'load', ...focusSnapshot() });
+  };
+  if (document.readyState === 'complete') afterLoad();
+  else window.addEventListener('load', afterLoad, { once: true });
+}
+
 async function initializePanel() {
+  watchQuietLoad();
   if (SETUP_PAGE) {
+    revealPanel('setup');
     await initializeSetupPage();
     return;
   }
-  // A reader that enters a document with nothing focused reads it from the top
-  // (VoiceOver's auto-speak, NVDA and JAWS say-all on load). Settle focus on a
-  // named control before the first await, and so before the load event, so the
-  // first thing a reader says is that control. Entries may retarget it later.
-  $('listen').focus({ preventScroll: true });
+  // A side panel opens without keyboard focus, which stays in the page. Every
+  // way it opens (toolbar, shortcut, the page's Assistant button, setup) is the
+  // user asking for it, so the panel takes window focus before the first
+  // await. DOM focus waits: the panel is still hidden from screen readers, and
+  // initializePanel exposes and focuses Listen below unless a cold listen
+  // shortcut keeps it hidden until listening ends.
+  if (!document.hasFocus()) window.focus();
+  state.startFocused = true;
+  debugLog.add('panel.focus', { at: 'init', ...focusSnapshot() });
   const self = await chrome.tabs.getCurrent().catch(() => null);
   state.windowId = self?.windowId ?? (await chrome.windows.getCurrent().catch(() => ({}))).id ?? null;
   bindEvents();
@@ -3043,9 +3585,20 @@ async function initializePanel() {
   intent = latestIntent(intent, state.pendingIntent);
   state.pendingIntent = null;
   if (!isForThisWindow(intent)) intent = null;
-  if (intent && !state.consumedIntents.has(intent.id)) {
-    state.consumedIntents.add(intent.id);
-    await handleEntryIntent(intent);
+  const entry = intent && !state.consumedIntents.has(intent.id) ? intent : null;
+  // A cold listen shortcut stays silent to screen readers until listening
+  // ends, so the reader says "Listening." and nothing else over the tone and
+  // the open microphone. Every other opening names Listen first.
+  if (isColdListen(entry)) {
+    clearTimeout(quietTimer);
+    quietTimer = setTimeout(() => revealPanel('backstop', { focus: true }), QUIET_LISTEN_BACKSTOP_MS);
+    debugLog.add('panel.quiet-listen', focusSnapshot());
+  } else {
+    exposeListen(entry ? 'entry' : 'open');
+  }
+  if (entry) {
+    state.consumedIntents.add(entry.id);
+    await handleEntryIntent(entry, { cold: true });
   }
 }
 
@@ -3062,6 +3615,7 @@ async function initializeSetupPage() {
   speech.attach({ liveEl: $('sr-status') });
   $('start-using').addEventListener('click', () => void startPreparation({ setup: true, force: true }));
   $('return-assistant').addEventListener('click', () => void returnToAssistant());
+  guardModifiedSpace();
   document.addEventListener('keydown', handleNumberShortcut);
   const status = await refreshVoiceStatus();
   if (status.local !== 'available') ensureLocalWatch();
@@ -3113,6 +3667,19 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
       ? message.error
       : 'The side panel did not close.';
     void say(`Could not close the assistant. ${detail}`, { urgent: true });
+    return;
+  }
+  if (message?.type === 'CHOICE_KEY') {
+    // Only the worker relays a page's key, after checking the page; the
+    // launcher's own broadcast of the same message carries a tab and is ignored.
+    if (SETUP_PAGE) return;
+    if (sender?.id !== chrome.runtime.id || sender.tab) return;
+    if (!Number.isInteger(state.windowId) || message.windowId !== state.windowId) return;
+    const current = state.choice;
+    if (!current || $('ask').hidden || String(current.set.id) !== message.choiceId) return;
+    debugLog.add('choice.page-key', { key: message.key });
+    state.deferChoiceFocus = false;
+    if (!selectOption(current.set.id, message.key)) void say('There is no such choice.');
     return;
   }
   if (message?.type !== 'ENTRY_INTENT') return;

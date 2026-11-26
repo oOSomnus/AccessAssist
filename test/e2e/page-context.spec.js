@@ -1,5 +1,6 @@
 import { test, expect } from '@playwright/test';
 import {
+  announcementEntries,
   answer,
   answerWhen,
   launch,
@@ -8,6 +9,7 @@ import {
   openPanel,
   PAGE_BASE,
   resetMock,
+  sendIntent,
   sendText,
 } from './helpers.js';
 
@@ -285,6 +287,199 @@ test('cancelling the page choice keeps both pages and the original binding', asy
       const [tab] = await chrome.tabs.query({ active: true, lastFocusedWindow: true });
       return tab?.url ?? '';
     })).toBe(`${PAGE_BASE}/action-pages`);
+  } finally {
+    await context.close();
+  }
+});
+
+test('the panel follows the tab on screen and the next command reads that page', async () => {
+  const { context, extensionId } = await launch();
+  try {
+    await resetMock();
+    await openFixture(context, '/article');
+    const panel = await openPanel(context, extensionId);
+    await expect(panel.locator('#page-line')).toContainText('Event schedule');
+
+    await openFixture(context, '/images');
+    await expect(panel.locator('#page-line')).toContainText('Image test');
+    await expect.poll(async () => (await announcementEntries(panel)).some((text) => text.includes('Current page: Image test')))
+      .toBe(true);
+
+    await sendText(panel, 'Refusal check');
+    await answerWhen(panel, 'page text', 0);
+    await expect(panel.locator('#transcript')).toContainText('I read Image test.');
+    const bodies = JSON.stringify((await mockRequests()).map((request) => request.body));
+    expect(bodies).not.toContain('Event schedule');
+  } finally {
+    await context.close();
+  }
+});
+
+test('a tab that is not a web page releases the page left behind', async () => {
+  const { context, extensionId } = await launch();
+  try {
+    await resetMock();
+    await openFixture(context, '/article');
+    const panel = await openPanel(context, extensionId);
+    await expect(panel.locator('#page-line')).toContainText('Event schedule');
+
+    const blank = await context.newPage();
+    await blank.bringToFront();
+    await expect(panel.locator('#page-line')).toContainText(/unreadable|No readable page/u);
+
+    await sendText(panel, 'Refusal check');
+    await expect(panel.locator('#transcript')).toContainText('I could not read this page.');
+    expect((await announcementEntries(panel)).some((text) => text.includes('page text'))).toBe(false);
+    const bodies = JSON.stringify((await mockRequests()).map((request) => request.body));
+    expect(bodies).not.toContain('Event schedule');
+    expect(bodies).toContain('No readable page is on screen');
+  } finally {
+    await context.close();
+  }
+});
+
+test('switching tabs while an action waits for confirmation runs nothing out of sight', async () => {
+  const { context, extensionId } = await launch();
+  try {
+    await resetMock();
+    const page = await openFixture(context, '/article');
+    const panel = await openPanel(context, extensionId);
+    await sendText(panel, 'Submit the form.');
+    await answerWhen(panel, 'page text', 0);
+    await expect(panel.locator('#ask-question')).toContainText('Run this?');
+
+    await openFixture(context, '/images');
+    await panel.waitForTimeout(250);
+    await answer(panel, 0);
+
+    await expect(panel.locator('#page-line')).toContainText('Image test');
+    await expect(panel.locator('#ask')).toBeHidden();
+    await expect(page.locator('#submits')).toHaveText('0');
+  } finally {
+    await context.close();
+  }
+});
+
+test('a declined page sends nothing about it and is not asked about again', async () => {
+  const { context, extensionId } = await launch();
+  const consentQuestions = async (panel) => (await announcementEntries(panel))
+    .filter((text) => text.includes('Allow these sources')).length;
+  try {
+    await resetMock();
+    await openFixture(context, '/article');
+    const panel = await openPanel(context, extensionId);
+    await expect(panel.locator('#page-line')).toContainText('Event schedule');
+
+    await sendText(panel, 'Refusal check');
+    await expect(panel.locator('#ask-question')).toContainText('page text');
+    await panel.locator('#ask-options button', { hasText: 'Cancel' }).click();
+    await expect(panel.locator('#transcript')).toContainText('I could not read this page.');
+    // The model retried in the same request; the panel answered it without asking.
+    expect(await consentQuestions(panel)).toBe(1);
+
+    // A new request does not bring the question back on its own.
+    await expect(panel.locator('#transcript')).toHaveAttribute('aria-busy', 'false', { timeout: 30_000 });
+    await sendText(panel, 'Refusal check');
+    await expect.poll(async () => (await panel.locator('#transcript').textContent())
+      .split('I could not read this page.').length - 1).toBe(2);
+    expect(await consentQuestions(panel)).toBe(1);
+
+    // Nothing about the page reached the AI service: no title, no address.
+    let bodies = JSON.stringify((await mockRequests()).map((request) => request.body));
+    expect(bodies).not.toContain('Event schedule');
+    expect(bodies).not.toContain(`${PAGE_BASE}/article`);
+    expect(bodies).toContain('The user declined to share this page');
+
+    // An explicit request to read the page asks once more.
+    await expect(panel.locator('#transcript')).toHaveAttribute('aria-busy', 'false', { timeout: 30_000 });
+    await sendText(panel, 'Refusal check, read this page again');
+    await answerWhen(panel, 'page text', 0);
+    await expect(panel.locator('#transcript')).toContainText('I read Event schedule.');
+    expect(await consentQuestions(panel)).toBe(2);
+    bodies = JSON.stringify((await mockRequests()).map((request) => request.body));
+    expect(bodies).toContain('Current page: Event schedule');
+  } finally {
+    await context.close();
+  }
+});
+
+test('a declined embedded site stays declined in later requests', async () => {
+  const { context, extensionId } = await launch();
+  const consentQuestions = async (panel) => (await announcementEntries(panel))
+    .filter((text) => text.includes('Allow these sources')).length;
+  try {
+    await resetMock();
+    await context.route('https://declined-source.example.test/**', (route) => route.fulfill({
+      contentType: 'text/html; charset=utf-8',
+      body: '<html lang="en"><body><p>DECLINED-SOURCE-MARKER</p></body></html>',
+    }));
+    const page = await openFixture(context, '/article');
+    const panel = await openPanel(context, extensionId);
+    await page.evaluate(() => new Promise((resolve) => {
+      const frame = document.createElement('iframe');
+      frame.addEventListener('load', resolve, { once: true });
+      frame.src = 'https://declined-source.example.test/frame';
+      document.body.append(frame);
+    }));
+
+    // Share the page itself, leaving the embedded site out for this request.
+    await sendText(panel, 'Refusal check');
+    await expect(panel.locator('#ask-question')).toContainText('page text');
+    await panel.locator('#ask-options button', { hasText: 'Current site only' }).click();
+    await expect(panel.locator('#transcript')).toContainText('I read Event schedule.');
+
+    // The next request lists the embedded site again; the user declines it.
+    await expect(panel.locator('#transcript')).toHaveAttribute('aria-busy', 'false', { timeout: 30_000 });
+    await sendText(panel, 'Refusal check');
+    await expect(panel.locator('#ask-question')).toContainText('page text');
+    await panel.locator('#ask-options button', { hasText: 'Cancel' }).click();
+    await expect.poll(async () => (await panel.locator('#transcript').textContent())
+      .split('I read Event schedule.').length - 1).toBe(2);
+
+    // A later request does not ask about it again, and its text is never sent.
+    await expect(panel.locator('#transcript')).toHaveAttribute('aria-busy', 'false', { timeout: 30_000 });
+    await sendText(panel, 'Refusal check');
+    await expect.poll(async () => (await panel.locator('#transcript').textContent())
+      .split('I read Event schedule.').length - 1).toBe(3);
+    expect(await consentQuestions(panel)).toBe(2);
+    const bodies = JSON.stringify((await mockRequests()).map((request) => request.body));
+    expect(bodies).not.toContain('DECLINED-SOURCE-MARKER');
+  } finally {
+    await context.close();
+  }
+});
+
+test('an open shortcut during a page text question keeps the question answerable', async () => {
+  const { context, extensionId, worker } = await launch();
+  try {
+    await resetMock();
+    await openFixture(context, '/article');
+    const panel = await openPanel(context, extensionId);
+    await sendText(panel, 'Refusal check');
+    await expect(panel.locator('#ask-question')).toContainText('page text');
+
+    // The shortcut re-checks the page on screen; finding the same page must not
+    // invalidate the open question. Count the page lookups the panel finishes,
+    // so the answer waits for that re-check, not the notification's earlier
+    // focus change.
+    await panel.evaluate(() => {
+      const original = chrome.runtime.sendMessage.bind(chrome.runtime);
+      window.__tabInfoDone = 0;
+      chrome.runtime.sendMessage = (message, ...rest) => {
+        const reply = original(message, ...rest);
+        if (message?.type === 'GET_TAB_INFO') {
+          const done = () => { window.__tabInfoDone += 1; };
+          reply.then(done, done);
+        }
+        return reply;
+      };
+    });
+    await sendIntent(worker, { id: 'open-during-consent', mode: 'open', source: 'command', tabId: 0 });
+    await expect(panel.locator('#ask-options button').first()).toBeFocused();
+    await expect.poll(() => panel.evaluate(() => window.__tabInfoDone)).toBeGreaterThan(0);
+    await expect(panel.locator('#ask-question')).toContainText('page text');
+    await answer(panel, 0);
+    await expect(panel.locator('#transcript')).toContainText('I read Event schedule.');
   } finally {
     await context.close();
   }

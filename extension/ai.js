@@ -192,11 +192,19 @@ function anthropicMessages(messages) {
   return output;
 }
 
-export function buildBody(config, { system, messages, tools = TOOLS, maxTokens = 4096 }) {
+// No output cap of our own. Reasoning counts against the output limit, so a
+// fixed cap cuts off a reply that is still thinking (finish_reason "length"
+// with nothing said). OpenAI-compatible requests leave max_tokens out, so the
+// provider's own maximum applies. Anthropic requires the field, so it gets
+// the largest output current Claude models allow; an older model that allows
+// less names its cap in the 400, and requestTurn retries once with it.
+export const ANTHROPIC_MAX_OUTPUT_TOKENS = 128_000;
+
+export function buildBody(config, { system, messages, tools = TOOLS, maxTokens = null }) {
   if (config.protocol === 'anthropic') {
     return {
       model: config.model,
-      max_tokens: maxTokens,
+      max_tokens: maxTokens ?? ANTHROPIC_MAX_OUTPUT_TOKENS,
       system,
       messages: anthropicMessages(messages),
       tools: tools.map((tool) => ({
@@ -215,7 +223,7 @@ export function buildBody(config, { system, messages, tools = TOOLS, maxTokens =
       type: 'function',
       function: { name: tool.name, description: tool.description, parameters: tool.parameters },
     })),
-    max_tokens: maxTokens,
+    ...(maxTokens ? { max_tokens: maxTokens } : {}),
     stream: false,
     ...(config.effort && config.effort !== 'default' ? { reasoning_effort: config.effort } : {}),
   };
@@ -364,6 +372,18 @@ export function mapHttpError(status, body) {
 
 export const REQUEST_TIMEOUT_MS = 180_000;
 
+// Output caps Anthropic reported for models that allow less than
+// ANTHROPIC_MAX_OUTPUT_TOKENS, by endpoint and model, for this session.
+const anthropicOutputCaps = new Map();
+
+// "max_tokens: 128000 > 64000, which is the maximum allowed number of output
+// tokens for ..." -> 64000. Null when the 400 is about something else.
+export function reportedOutputCap(body) {
+  const match = /max_tokens\D{0,20}\d+\s*>\s*(\d+)/u.exec(String(body ?? ''));
+  const cap = match ? Number(match[1]) : NaN;
+  return Number.isSafeInteger(cap) && cap > 0 ? cap : null;
+}
+
 export async function requestTurn({
   config,
   apiKey,
@@ -374,7 +394,7 @@ export async function requestTurn({
   signal,
   fetchImpl = globalThis.fetch,
   timeoutMs = REQUEST_TIMEOUT_MS,
-  maxTokens = 4096,
+  maxTokens = null,
 }) {
   const normalized = normalizeConfig(config);
   if (normalized.errors.length) throw new ApiError('config', normalized.errors.join('; '));
@@ -386,14 +406,28 @@ export async function requestTurn({
   if (signal?.aborted) abort();
   else signal?.addEventListener('abort', abort, { once: true });
   const started = Date.now();
+  const capKey = `${settings.baseUrl} ${settings.model}`;
+  const send = (tokens) => fetchImpl(endpointFor(settings), {
+    method: 'POST',
+    headers: buildHeaders(settings, apiKey, sessionId),
+    body: JSON.stringify(buildBody(settings, { system, messages, tools, maxTokens: tokens })),
+    signal: controller.signal,
+  });
   try {
-    const response = await fetchImpl(endpointFor(settings), {
-      method: 'POST',
-      headers: buildHeaders(settings, apiKey, sessionId),
-      body: JSON.stringify(buildBody(settings, { system, messages, tools, maxTokens })),
-      signal: controller.signal,
-    });
-    const bodyText = await response.text();
+    let tokens = maxTokens;
+    if (tokens == null && settings.protocol === 'anthropic') {
+      tokens = anthropicOutputCaps.get(capKey) ?? ANTHROPIC_MAX_OUTPUT_TOKENS;
+    }
+    let response = await send(tokens);
+    let bodyText = await response.text();
+    if (response.status === 400 && maxTokens == null && settings.protocol === 'anthropic') {
+      const cap = reportedOutputCap(bodyText);
+      if (cap && cap < tokens) {
+        anthropicOutputCaps.set(capKey, cap);
+        response = await send(cap);
+        bodyText = await response.text();
+      }
+    }
     if (!response.ok) throw mapHttpError(response.status, bodyText);
     let json;
     try {
