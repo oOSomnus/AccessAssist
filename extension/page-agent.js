@@ -17,6 +17,9 @@
   const CURSORS = new Set(['pointer', 'move', 'grab', 'grabbing']);
   const MAX_NEAR_CHARS = 80;
   let visualNodeId = null;
+  // Set only while observe runs. Observation is synchronous, so the page
+  // cannot change under these memos; single-target calls stay uncached.
+  let pass = null;
 
   function clean(text) {
     return String(text ?? '').replace(/[\u200b-\u200d\ufeff]/gu, '').replace(/\s+/gu, ' ').trim();
@@ -39,17 +42,31 @@
   // ARIA hiding and inert apply through flattened ancestors, which CSS
   // checkVisibility cannot see across a shadow boundary.
   function composedHidden(element) {
+    const memo = pass?.hidden;
+    // Ancestors walked on the way up share the answer, so a pass visits each once.
+    const walked = [];
     let node = element;
     let guard = 0;
+    let hidden = false;
     while (node && guard < 10_000) {
       guard += 1;
-      if (node.getAttribute?.('aria-hidden') === 'true' || node.hasAttribute?.('inert')) return true;
+      const known = memo?.get(node);
+      if (known !== undefined) {
+        hidden = known;
+        break;
+      }
+      walked.push(node);
+      if (node.getAttribute?.('aria-hidden') === 'true' || node.hasAttribute?.('inert')) {
+        hidden = true;
+        break;
+      }
       node = node.parentElement ?? node.getRootNode?.()?.host ?? null;
     }
-    return false;
+    if (memo) for (const seen of walked) memo.set(seen, hidden);
+    return hidden;
   }
 
-  function visible(element) {
+  function visibleNow(element) {
     if (!element.isConnected) return false;
     if (composedHidden(element)) return false;
     try {
@@ -59,6 +76,16 @@
     } catch {
       return element.getClientRects().length > 0;
     }
+  }
+
+  function visible(element) {
+    if (!pass) return visibleNow(element);
+    let shown = pass.visible.get(element);
+    if (shown === undefined) {
+      shown = visibleNow(element);
+      pass.visible.set(element, shown);
+    }
+    return shown;
   }
 
   function rectOf(element) {
@@ -96,6 +123,16 @@
   }
 
   function nameOf(element) {
+    if (!pass) return computeName(element);
+    let name = pass.names.get(element);
+    if (name === undefined) {
+      name = computeName(element);
+      pass.names.set(element, name);
+    }
+    return name;
+  }
+
+  function computeName(element) {
     const labelledBy = clean(element.getAttribute('aria-labelledby'));
     if (labelledBy) {
       const text = labelledBy.split(/\s+/u)
@@ -271,13 +308,10 @@
     return a.left < b.right && a.right > b.left && a.top < b.bottom && a.bottom > b.top;
   }
 
-  function textLines(box, excluded = new Set()) {
+  function textLines(box, excluded, scan) {
     const lines = [];
     if (!document.body) return lines;
-    const roots = [document.body];
-    for (const element of deepElements()) {
-      if (element.shadowRoot && !isLauncher(element)) roots.push(element.shadowRoot);
-    }
+    const roots = [document.body, ...scan.shadowRoots];
     const shown = new Map();
     const parentShown = (parent) => {
       if (!shown.has(parent)) {
@@ -521,12 +555,13 @@
   function columnLabelsOf(grid, bounds, lines) {
     const pitch = pitchOf(grid.columns, grid.cellWidth);
     let labelTop = bounds.top;
+    // Only lines in the band above the grid can label a column; filter once.
+    const band = lines.filter((line) => line.bottom <= bounds.top + 2 && line.bottom >= bounds.top - 100);
     const labels = grid.columns.map((center) => {
       const left = center - pitch / 2;
       const right = center + pitch / 2;
-      const candidates = lines
-        .filter((line) => line.bottom <= bounds.top + 2 && line.bottom >= bounds.top - 100
-          && line.cx >= left && line.cx <= right
+      const candidates = band
+        .filter((line) => line.cx >= left && line.cx <= right
           && line.left >= left - pitch / 2 && line.right <= right + pitch / 2)
         .sort((a, b) => b.bottom - a.bottom);
       const stack = [];
@@ -549,12 +584,13 @@
     const joined = [];
     for (const line of [...lines].sort((a, b) => a.left - b.left)) {
       const gapLimit = Math.max(6, line.height * 0.6);
-      const host = joined.find((other) => Math.abs(other.cy - line.cy) <= Math.max(2, Math.min(other.height, line.height) / 2)
+      const hostIndex = joined.findIndex((other) => Math.abs(other.cy - line.cy) <= Math.max(2, Math.min(other.height, line.height) / 2)
         && line.left - other.right >= -2 && line.left - other.right <= gapLimit);
-      if (!host) {
+      if (hostIndex < 0) {
         joined.push(line);
         continue;
       }
+      const host = joined[hostIndex];
       const left = Math.min(host.left, line.left);
       const right = Math.max(host.right, line.right);
       const top = Math.min(host.top, line.top);
@@ -564,7 +600,7 @@
       const merged = lineBox({ left, right, top, bottom, width: right - left, height: bottom - top }, text);
       merged.spaceBefore = host.spaceBefore;
       merged.spaceAfter = line.spaceAfter;
-      joined[joined.indexOf(host)] = merged;
+      joined[hostIndex] = merged;
     }
     return joined;
   }
@@ -651,6 +687,7 @@
     const editable = tag === 'textarea' || element.isContentEditable
       || (tag === 'input' && TEXTUAL.has(type || 'text'));
     const selectable = tag === 'select';
+    const shown = visible(element);
     return {
       docToken,
       tag,
@@ -658,7 +695,7 @@
       role,
       name: nameOf(element).slice(0, 200),
       disabled: disabled(element),
-      visible: visible(element),
+      visible: shown,
       inViewport: inViewport(rect),
       editable,
       readOnly: readOnlyOf(element),
@@ -666,7 +703,8 @@
       checkable,
       selectable,
       submits: submitsForm(element),
-      focusable: focusableOf(element),
+      // Same rule as focusableOf, reusing the visibility read above.
+      focusable: element.tabIndex >= 0 && !element.disabled && shown,
       focused: focusedOf(element),
       link: linkOf(element),
       alt: tag === 'img' ? { present: element.hasAttribute('alt'), value: element.getAttribute('alt') ?? '' } : null,
@@ -738,19 +776,6 @@
     return host?.isConnected ? host : null;
   }
 
-  function isLauncher(element) {
-    const host = launcherHost();
-    if (!host) return false;
-    let node = element;
-    let guard = 0;
-    while (node && guard < 10_000) {
-      guard += 1;
-      if (node === host) return true;
-      node = node.parentElement ?? node.getRootNode?.()?.host ?? null;
-    }
-    return false;
-  }
-
   function decorativeImage(element) {
     return element.tagName === 'IMG' && element.hasAttribute('alt')
       && element.getAttribute('alt') === ''
@@ -762,13 +787,14 @@
     return rect.width >= 40 && rect.height >= 40;
   }
 
-  function collectItems() {
+  function collectItems(scan) {
     const items = [];
     const visit = (parent) => {
       const children = [...(parent.children ?? [])];
       if (parent.shadowRoot) children.push(...parent.shadowRoot.children);
       for (const element of children) {
-        if (SKIP_TAGS.has(element.tagName) || isLauncher(element)) continue;
+        // Top-down, so skipping the host skips everything inside the launcher.
+        if (SKIP_TAGS.has(element.tagName) || element === scan.host) continue;
         if (!visible(element)) continue;
         if (TEXT_BLOCKS.has(element.tagName) || ['heading', 'paragraph', 'listitem'].includes(element.getAttribute('role') ?? '')) {
           const text = clean(element.innerText);
@@ -783,7 +809,7 @@
           }
           continue;
         }
-        if (element.matches(INTERACTIVE)) {
+        if (scan.interactive.has(element)) {
           const text = textOf(element);
           const name = nameOf(element).slice(0, 200);
           if (name || text) {
@@ -807,6 +833,35 @@
     };
     if (document.body) visit(document.body);
     return items;
+  }
+
+  // Every element of the document and its open shadow roots, in document
+  // order, as one walk for a whole observation. The launcher's subtree is left
+  // out where it is met instead of testing each element's ancestors, and each
+  // element records whether it or an ancestor in its own tree is interactive
+  // (what closest(INTERACTIVE) answers, which stops at a shadow root).
+  function scanElements() {
+    const host = launcherHost();
+    const elements = [];
+    const shadowRoots = [];
+    const interactive = new Set();
+    const insideInteractive = new Set();
+    const walk = (root, inside) => {
+      for (const element of root.children ?? []) {
+        if (element === host) continue;
+        elements.push(element);
+        const matches = element.matches(INTERACTIVE);
+        if (matches) interactive.add(element);
+        if (inside) insideInteractive.add(element);
+        if (element.shadowRoot) {
+          shadowRoots.push(element.shadowRoot);
+          walk(element.shadowRoot, false);
+        }
+        walk(element, inside || matches);
+      }
+    };
+    walk(document, false);
+    return { host, elements, shadowRoots, interactive, insideInteractive };
   }
 
   function deepElements() {
@@ -833,7 +888,7 @@
       || Boolean(element.closest?.('[aria-readonly="true"]'));
   }
 
-  function capabilitiesOf(element) {
+  function capabilitiesOf(element, focusable = focusableOf(element)) {
     let cursor = 'auto';
     let overflowX = 'visible';
     let overflowY = 'visible';
@@ -852,16 +907,16 @@
         || element.hasAttribute('onpointerover'),
       drag: element.hasAttribute('draggable') || element.hasAttribute('ondragstart')
         || element.hasAttribute('onpointermove') || element.hasAttribute('onmousemove'),
-      focus: focusableOf(element),
+      focus: focusable,
       cursor,
       scrollX: scrollable(overflowX, element.scrollWidth, element.clientWidth),
       scrollY: scrollable(overflowY, element.scrollHeight, element.clientHeight),
     };
   }
 
-  function pointerCandidate(element) {
-    if (isLauncher(element) || SKIP_TAGS.has(element.tagName)) return false;
-    if (element.matches(INTERACTIVE) || element.closest(INTERACTIVE)) return false;
+  function pointerCandidate(element, scan) {
+    if (SKIP_TAGS.has(element.tagName)) return false;
+    if (scan.interactive.has(element) || scan.insideInteractive.has(element)) return false;
     const rect = element.getBoundingClientRect();
     if (rect.width < 8 || rect.height < 8) return false;
     if (!visible(element)) return false;
@@ -880,23 +935,24 @@
   }
 
   function describeTarget(element, extra = {}) {
-    const target = { ...stateOf(element), ...extra };
-    target.capabilities = capabilitiesOf(element);
+    const state = stateOf(element);
+    const target = { ...state, ...extra };
+    target.capabilities = capabilitiesOf(element, state.focusable);
     return target;
   }
 
-  function collectTargets() {
+  function collectTargets(scan) {
     const targets = [];
     const seen = new Set();
-    const selector = `${INTERACTIVE},${IMAGES}`;
-    const elements = deepElements();
+    const { elements, interactive } = scan;
+    const closestInteractive = (element) => interactive.has(element) || scan.insideInteractive.has(element);
     for (const element of elements) {
-      if (!element.matches(selector)) continue;
-      if (isLauncher(element) || SKIP_TAGS.has(element.tagName)) continue;
+      if (!interactive.has(element) && !element.matches(IMAGES)) continue;
+      if (SKIP_TAGS.has(element.tagName)) continue;
       if (element.tagName === 'INPUT' && (element.getAttribute('type') ?? '').toLowerCase() === 'hidden') continue;
       if (!visible(element)) continue;
-      if (element.tagName === 'SVG' && element.closest(INTERACTIVE)) continue;
-      if (isImage(element) && !element.matches(INTERACTIVE) && (!largeImage(element) || decorativeImage(element))) continue;
+      if (element.tagName === 'SVG' && closestInteractive(element)) continue;
+      if (isImage(element) && !interactive.has(element) && (!largeImage(element) || decorativeImage(element))) continue;
       const nodeId = idFor(element);
       const kind = isImage(element) ? 'image' : isNativeControl(element) ? 'native-control' : 'custom-control';
       targets.push({ nodeId, ...describeTarget(element, { kind }) });
@@ -905,7 +961,10 @@
     let extraCount = 0;
     for (const element of elements) {
       if (extraCount >= 80) break;
-      if (element.matches(INTERACTIVE)) continue;
+      if (interactive.has(element)) continue;
+      // Scrolling needs content larger than the box; most elements fail this
+      // cheap test before any computed style is read.
+      if (element.scrollHeight <= element.clientHeight + 1 && element.scrollWidth <= element.clientWidth + 1) continue;
       const capabilities = capabilitiesOf(element);
       if (!capabilities.scrollX && !capabilities.scrollY) continue;
       if (!inViewport(rectOf(element))) continue;
@@ -921,7 +980,7 @@
     let pointerCount = 0;
     for (const element of elements) {
       if (extraCount + pointerCount >= 80) break;
-      if (!pointerCandidate(element)) continue;
+      if (!pointerCandidate(element, scan)) continue;
       const nodeId = idFor(element);
       if (seen.has(nodeId)) continue;
       pointerCount += 1;
@@ -947,9 +1006,19 @@
     return sections;
   }
 
-  function observe({ cursor, visual = false } = {}) {
-    const allItems = collectItems();
-    const allTargets = collectTargets();
+  function observe(options = {}) {
+    pass = { hidden: new Map(), visible: new Map(), names: new Map() };
+    try {
+      return observeOnce(options);
+    } finally {
+      pass = null;
+    }
+  }
+
+  function observeOnce({ cursor, visual = false } = {}) {
+    const scan = scanElements();
+    const allItems = collectItems(scan);
+    const allTargets = collectTargets(scan);
     const start = Math.max(0, Number(cursor) || 0);
     const slice = [];
     let used = 0;
@@ -995,7 +1064,7 @@
         around.top = Math.min(around.top, bounds.top - 120);
         around.bottom = Math.max(around.bottom, bounds.bottom + 20);
       }
-      const lines = textLines(around, excluded);
+      const lines = textLines(around, excluded, scan);
       for (const target of unnamed) {
         const element = nodes.get(target.nodeId);
         if (element) target.near = nearLabels(element, lines);
