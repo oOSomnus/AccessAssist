@@ -1,6 +1,6 @@
 # Contributing
 
-Tests and packaging need Node and npm; the end-to-end tests use Playwright's bundled Chromium.
+Node 20.6 or later and npm are needed for the tests, the live checks, and packaging. End-to-end tests use Playwright's Chromium.
 
 ## Tests
 
@@ -11,9 +11,13 @@ npm run test:unit
 npm run test:e2e
 ```
 
-On Linux hosts that lack browser system libraries, use `npx playwright install --with-deps chromium`.
+On Linux hosts that lack browser system libraries, install them with:
 
-`npm run test:e2e` starts local fixture pages and a scripted API, then loads the real extension in Chromium. It uses scripted speech, microphone, and audio boundaries, so it cannot prove native side-panel placement, audible cues, or real microphone behavior.
+```bash
+npx playwright install --with-deps chromium
+```
+
+`npm run test:unit` runs the Node test suite. `npm run test:e2e` starts the fixture pages and the scripted model API from `test/serve-fixtures.mjs`, then loads the real extension in Chromium. Speech recognition, the microphone, and cue audio are stubbed, so the tests cannot prove OS shortcut registration, native side-panel focus or closure, audible cues, real microphone behavior, or real screen-reader output. They do check the order in which the panel delivers announcements.
 
 ## Live AI check
 
@@ -21,9 +25,15 @@ On Linux hosts that lack browser system libraries, use `npx playwright install -
 npm run smoke:ai        # needs OPENCODE_ACCESS_KEY in .env
 ```
 
-The check calls OpenCode Go with `deepseek-v4.1-flash` only. It covers one tool round trip, a PNG pixel round trip, and screenshot grounding for both API formats, and reports the Go billing source. Images are synthetic; no page or audio is uploaded.
+By default the command loads `.env` and calls OpenCode Go with `deepseek-v4.1-flash` only. For each Go endpoint (OpenAI-compatible and Anthropic-compatible), it runs one tool round trip, a synthetic-PNG OCR round trip, and screenshot grounding. It reports the Go billing source. No real page or audio is uploaded.
 
-The ChatGPT plan format runs too when `.env` sets `CHATGPT_ACCESS_TOKEN` and `CHATGPT_MODEL` (and optionally `CHATGPT_EFFORT`). To get a token, sign in with ChatGPT in the extension, then run `(await chrome.storage.session.get('chatgptAccess')).chatgptAccess.token` in the service worker's DevTools console. The token lasts an hour. Use `ONLY_PROTOCOL=chatgpt` to run just that check without an OpenCode key.
+The ChatGPT plan check also runs when `.env` sets `CHATGPT_ACCESS_TOKEN` and `CHATGPT_MODEL`; `CHATGPT_EFFORT` is optional. To get a token, sign in with ChatGPT in the extension, then run this in the service worker's DevTools console:
+
+```js
+(await chrome.storage.session.get('chatgptAccess')).chatgptAccess.token
+```
+
+The access token expires in about an hour. Use `ONLY_PROTOCOL=chatgpt` to run just that check without an OpenCode key; `ONLY_PROTOCOL=openai` or `ONLY_PROTOCOL=anthropic` selects one Go endpoint.
 
 ## Packaging
 
@@ -31,4 +41,6 @@ The ChatGPT plan format runs too when `.env` sets `CHATGPT_ACCESS_TOKEN` and `CH
 npm run package
 ```
 
-Writes `accessassist.zip` with `manifest.json` at the archive root. The script needs the system `zip` and packs only `extension/`; `.env`, tests, and `node_modules` are outside it. Extract the archive and load the folder containing `manifest.json`. The `icons` entry ships as `extension/icons/icon-{16,32,48,128}.png`, rendered from `icon.svg`.
+This writes `accessassist.zip` with `manifest.json` at the archive root. The system `zip` command is required. The script packs only `extension/`, so `.env`, tests, and `node_modules` are not included. Extract the archive and load the folder containing `manifest.json`.
+
+The archive contains the icons as `icons/icon-{16,32,48,128}.png`; their sources are in `extension/icons/`.
